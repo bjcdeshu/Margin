@@ -2,6 +2,9 @@
 
 **Margin** 是一款 100% 从零自研（Clean-Room）、轻量克制的 Chrome Manifest V3 双语阅读与全场景 AI 翻译扩展。
 
+- **仓库主页**：<https://github.com/bjcdeshu/Margin>
+- **历史版本归档**：旧版维护分支（`myAItranslate 1.29.1-maint.2`）已完整归档保留于远端分支 [`v1-maint`](https://github.com/bjcdeshu/Margin/tree/v1-maint) 与标签 [`v1.29.1-maint.2`](https://github.com/bjcdeshu/Margin/releases/tag/v1.29.1-maint.2)。
+
 它采用 **Quiet Paper / Unbow Warm Editorial** 暖纸墨色设计体系，彻底告别传统翻译扩展 ~30MB 混淆包与重型本地 OCR WASM 膨胀，剔除页面悬浮球与冗余侧边栏干扰，专注于**网页受控富文本对照翻译、输入框三击空格极速译写、YouTube 字幕时间轴修复与原生双语画中画（Document PiP）、无页数上限双栏 PDF 精读、以及防盗链多模态图片翻译**。
 
 ---
