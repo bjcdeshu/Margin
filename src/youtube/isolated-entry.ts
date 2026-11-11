@@ -21,15 +21,14 @@ import {
   SubtitleBatchScheduler,
 } from './batching';
 import {
-  extractYoutubeVideoId,
-  type YoutubeExtendedBridgeMessage,
-} from './main-entry';
-import {
+  buildSourceTrackFingerprint,
   clampFontSizePercent,
+  extractYoutubeVideoId,
   normalizeActiveCueState,
   PIP_CLEAR_DELAY_MS,
   resolveRenderedCueLines,
-} from './pip-player';
+  type YoutubeExtendedBridgeMessage,
+} from './shared';
 import {
   extractTextTrackCues,
   findActiveCueIndex,
@@ -93,6 +92,7 @@ export function createSubtitleIsolatedController(
   let config: MarginConfig = createDefaultMarginConfig();
   let sessionEnabledOverride: boolean | null = null;
   let currentVideoKey = '';
+  let activeSourceTrackFingerprint = '';
   let currentPlayheadMs = 0;
   let activeCueState: MarginActiveCueState = normalizeActiveCueState();
   let renderedCueState: MarginActiveCueState = normalizeActiveCueState();
@@ -431,6 +431,7 @@ export function createSubtitleIsolatedController(
       if (typeof msg.currentTimeMs !== 'number') return;
       if (msg.videoId && currentVideoKey && msg.videoId !== currentVideoKey) {
         currentVideoKey = msg.videoId;
+        activeSourceTrackFingerprint = '';
         scheduler.loadCues(msg.videoId, [], msg.currentTimeMs);
       }
       currentPlayheadMs = msg.currentTimeMs;
@@ -462,9 +463,35 @@ export function createSubtitleIsolatedController(
         return;
       }
 
+      const nextFingerprint = buildSourceTrackFingerprint(
+        videoId,
+        msg.langCode ?? 'auto',
+        normalized,
+      );
+
+      // Idempotent replay guard: preserve existing `cue.trans` & in-flight batches on config/toggle sync
+      if (
+        currentVideoKey === videoId &&
+        activeSourceTrackFingerprint === nextFingerprint &&
+        existingCues.length > 0
+      ) {
+        if (isSubtitlesEnabledForSite()) {
+          syncSchedulerConfig();
+          scheduler.updatePlayhead(currentPlayheadMs);
+        } else {
+          scheduler.cancelAll();
+        }
+        refreshActiveCueFromPlayhead();
+        return;
+      }
+
+      if (currentVideoKey !== videoId) {
+        activeSourceTrackFingerprint = '';
+      }
       currentVideoKey = videoId;
-      syncSchedulerConfig();
       if (isSubtitlesEnabledForSite()) {
+        syncSchedulerConfig();
+        activeSourceTrackFingerprint = nextFingerprint;
         scheduler.loadCues(videoId, normalized, currentPlayheadMs);
       } else {
         scheduler.cancelAll();
@@ -616,7 +643,11 @@ export function createSubtitleIsolatedController(
     unsubConfig = subscribeConfig((nextCfg) => {
       config = nextCfg;
       sessionEnabledOverride = null;
-      syncSchedulerConfig();
+      if (isSubtitlesEnabledForSite()) {
+        syncSchedulerConfig();
+      } else {
+        scheduler.cancelAll();
+      }
       broadcastSubtitleConfig();
       if (!isYoutube) {
         bindGenericHtml5Video();

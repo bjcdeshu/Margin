@@ -1,11 +1,30 @@
-import { BRAND } from '@shared/brand';
 import { SHADOW_HOST_RESET_CSS } from '@shared/shadow-styles';
 import type { MarginActiveCueState, SubtitleSettings } from '@shared/types';
+import {
+  clampFontSizePercent,
+  clampSeekTime,
+  cleanPipCueText,
+  computePipDimensions,
+  normalizeActiveCueState,
+  PIP_BUTTON_ID,
+  PIP_CLEAR_DELAY_MS,
+  PIP_NOTICE_DURATION_MS,
+  PIP_NOTICE_HOST_ID,
+  resolveRenderedCueLines,
+} from './shared';
 
-export const PIP_BUTTON_ID = `${BRAND.cssPrefix}-youtube-pip-button`;
-export const PIP_NOTICE_HOST_ID = `${BRAND.cssPrefix}-youtube-pip-notice-host`;
-export const PIP_CLEAR_DELAY_MS = 120;
-export const PIP_NOTICE_DURATION_MS = 4_200;
+export {
+  clampFontSizePercent,
+  clampSeekTime,
+  cleanPipCueText,
+  computePipDimensions,
+  normalizeActiveCueState,
+  PIP_BUTTON_ID,
+  PIP_CLEAR_DELAY_MS,
+  PIP_NOTICE_DURATION_MS,
+  PIP_NOTICE_HOST_ID,
+  resolveRenderedCueLines,
+};
 
 export interface DocumentPictureInPictureOptions {
   width?: number;
@@ -102,129 +121,6 @@ function getPipStrings(langHint?: string): PipUiStrings {
       'Document PiP is unavailable; opened native video PiP instead (native PiP cannot render custom bilingual subtitle overlays).',
     openFailed: 'Could not open Picture-in-Picture',
   };
-}
-
-/**
- * Cleans subtitle cue text while preserving intentional internal line breaks.
- */
-export function cleanPipCueText(value: unknown): string {
-  if (value === null || value === undefined) return '';
-  return String(value)
-    .replace(/[\u200B-\u200D\uFEFF]/g, '')
-    .replace(/\r\n?/g, '\n')
-    .split('\n')
-    .map((line) => line.replace(/[\t\f\v ]+/g, ' ').trim())
-    .filter(Boolean)
-    .join('\n')
-    .trim();
-}
-
-function toFiniteOrNull(value: unknown): number | null {
-  if (value === null || value === undefined || value === '') return null;
-  const num = Number(value);
-  return Number.isFinite(num) ? num : null;
-}
-
-export function clampFontSizePercent(value: unknown, fallback = 70): number {
-  const num = Number(value);
-  if (!Number.isFinite(num) || num <= 0) return fallback;
-  return Math.min(160, Math.max(40, Math.round(num)));
-}
-
-/**
- * Normalizes `MarginActiveCueState` and suppresses duplicate `translated === original`.
- */
-export function normalizeActiveCueState(
-  input?: Partial<MarginActiveCueState> | null,
-): MarginActiveCueState {
-  const original = cleanPipCueText(input?.original);
-  let translated = cleanPipCueText(input?.translated);
-
-  if (translated && translated === original) {
-    translated = '';
-  }
-
-  const startMs = toFiniteOrNull(input?.startMs);
-  const rawEndMs = toFiniteOrNull(input?.endMs);
-  const endMs =
-    rawEndMs !== null && startMs !== null && rawEndMs > startMs ? rawEndMs : null;
-
-  const mode: MarginActiveCueState['mode'] =
-    input?.mode === 'target-only' || input?.mode === 'source-only'
-      ? input.mode
-      : 'bilingual';
-
-  const position: MarginActiveCueState['position'] =
-    input?.position === 'top' ? 'top' : 'bottom';
-
-  const fontSizePercent = clampFontSizePercent(input?.fontSizePercent, 70);
-
-  return {
-    original,
-    translated,
-    startMs,
-    endMs,
-    mode,
-    fontSizePercent,
-    position,
-  };
-}
-
-/**
- * Resolves visible original/translated lines for the active display mode.
- */
-export function resolveRenderedCueLines(cue: MarginActiveCueState): {
-  originalLine: string;
-  translatedLine: string;
-} {
-  if (cue.mode === 'source-only') {
-    return { originalLine: cue.original, translatedLine: '' };
-  }
-  if (cue.mode === 'target-only') {
-    return { originalLine: '', translatedLine: cue.translated };
-  }
-  return {
-    originalLine: cue.original,
-    translatedLine: cue.translated,
-  };
-}
-
-/**
- * Computes proportional PiP dimensions clamped to `[320, 720]` width (and `[240, 720]` height)
- * preserving video aspect ratio (`0.6..3.0`, fallback `16:9`).
- */
-export function computePipDimensions(
-  videoWidth: number,
-  videoHeight: number,
-  preferredWidth = 560,
-): { width: number; height: number } {
-  const width = Math.min(
-    720,
-    Math.max(320, Math.round(Number(preferredWidth) || 560)),
-  );
-  const rawW = Number(videoWidth);
-  const rawH = Number(videoHeight);
-  const ratio = rawW > 0 && rawH > 0 ? rawW / rawH : 16 / 9;
-  const safeRatio = Math.min(3, Math.max(0.6, ratio));
-  const height = Math.min(720, Math.max(240, Math.round(width / safeRatio)));
-  return { width, height };
-}
-
-/**
- * Clamps video seek target within `[0, duration]`.
- */
-export function clampSeekTime(
-  currentTime: number,
-  deltaSeconds: number,
-  duration: number,
-): number {
-  const current = toFiniteOrNull(currentTime) ?? 0;
-  const delta = toFiniteOrNull(deltaSeconds) ?? 0;
-  const next = current + delta;
-  if (Number.isFinite(duration) && duration >= 0) {
-    return Math.min(duration, Math.max(0, next));
-  }
-  return Math.max(0, next);
 }
 
 /**

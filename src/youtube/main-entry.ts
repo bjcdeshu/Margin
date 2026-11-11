@@ -4,59 +4,30 @@ import type {
   YoutubeMainBridgeMessage,
   YoutubeRawJson3Event,
 } from '@shared/types';
+import { YoutubePipPlayer, type PipCapableVideoElement } from './pip-player';
 import {
+  extractYoutubeVideoId,
+  isTimedTextUrl,
   PIP_BUTTON_ID,
-  YoutubePipPlayer,
-  type PipCapableVideoElement,
-} from './pip-player';
+  SUBTITLE_TOGGLE_BUTTON_ID,
+  type YoutubeExtendedBridgeMessage,
+} from './shared';
 import { parseYoutubeTimedTextPayload } from './timeline';
 
-export const SUBTITLE_TOGGLE_BUTTON_ID = `${BRAND.cssPrefix}-youtube-subtitle-button`;
-const MAIN_CONTROLLER_KEY = '__marginYoutubeMainControllerV2__';
+export {
+  extractYoutubeVideoId,
+  isTimedTextUrl,
+  SUBTITLE_TOGGLE_BUTTON_ID,
+  type YoutubeExtendedBridgeMessage,
+};
 
-export type YoutubeExtendedBridgeMessage =
-  | YoutubeMainBridgeMessage
-  | {
-      source: typeof BRAND.ytBridgeSourceMain;
-      type: 'subtitle-toggle-request';
-      enabled: boolean;
-    };
+const MAIN_CONTROLLER_KEY = '__marginYoutubeMainControllerV2__';
 
 interface CapturedTrackRecord {
   videoId: string;
   langCode: string;
   trackUrl: string;
   events: YoutubeRawJson3Event[];
-}
-
-export function extractYoutubeVideoId(urlLike: string): string {
-  if (!urlLike) return '';
-  try {
-    const parsed = new URL(urlLike, 'https://www.youtube.com');
-    const vParam = parsed.searchParams.get('v');
-    if (vParam) return vParam;
-
-    const pathMatch = /^\/(?:live|shorts|embed)\/([A-Za-z0-9_-]{6,})/.exec(
-      parsed.pathname,
-    );
-    if (pathMatch?.[1]) return pathMatch[1];
-  } catch {
-    // Ignore malformed URLs
-  }
-  return '';
-}
-
-export function isTimedTextUrl(urlLike: string): boolean {
-  if (!urlLike) return false;
-  try {
-    const parsed = new URL(urlLike, 'https://www.youtube.com');
-    return (
-      parsed.pathname.includes('/api/timedtext') ||
-      parsed.pathname.endsWith('/timedtext')
-    );
-  } catch {
-    return urlLike.includes('/api/timedtext');
-  }
 }
 
 function extractLangFromTimedTextUrl(trackUrl: string): string {
@@ -728,12 +699,22 @@ export function createYoutubeMainController(
   };
 }
 
-function shouldAutoBootMainEntry(): boolean {
-  if (typeof window === 'undefined' || typeof document === 'undefined') {
+export function shouldAutoBootMainEntry(
+  win: Window | undefined = typeof window !== 'undefined' ? window : undefined,
+  chromeRef: { runtime?: { id?: string } } | undefined = typeof globalThis.chrome !==
+  'undefined'
+    ? globalThis.chrome
+    : undefined,
+): boolean {
+  if (!win || typeof document === 'undefined') {
     return false;
   }
-  if (window.top !== window) return false;
-  const host = window.location?.hostname?.toLowerCase() ?? '';
+  // Never auto-boot MAIN-world controller inside ISOLATED content-script world
+  if (Boolean(chromeRef?.runtime?.id)) {
+    return false;
+  }
+  if (win.top !== win) return false;
+  const host = win.location?.hostname?.toLowerCase() ?? '';
   return host === 'youtube.com' || host.endsWith('.youtube.com');
 }
 

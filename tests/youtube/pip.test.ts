@@ -1,10 +1,14 @@
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { BRAND } from '@shared/brand';
 import { createDefaultMarginConfig } from '@shared/constants';
-import type { YoutubeMainBridgeMessage } from '@shared/types';
+import type { MarginConfig, YoutubeMainBridgeMessage } from '@shared/types';
 import { createSubtitleIsolatedController, SUBTITLE_OVERLAY_HOST_ID } from '../../src/youtube/isolated-entry';
 import {
   createYoutubeMainController,
+  shouldAutoBootMainEntry,
   SUBTITLE_TOGGLE_BUTTON_ID,
 } from '../../src/youtube/main-entry';
 import {
@@ -548,5 +552,165 @@ describe('YouTube Bilingual Document PiP & Guardrail 2 Fallback', () => {
     mainCtrl.destroy();
     XMLHttpRequest.prototype.send = origSend;
     window.removeEventListener('message', onMsg);
+  });
+
+  it('prevents cross-world YoutubeMainController auto-boot in ISOLATED world and keeps isolated-entry import graph pure (Defect 1)', () => {
+    const happyWin = window as unknown as {
+      happyDOM?: { setURL: (url: string) => void };
+    };
+    happyWin.happyDOM?.setURL('https://www.youtube.com/watch?v=guardTest');
+
+    // In MAIN world on YouTube (no chrome.runtime.id) -> true
+    expect(shouldAutoBootMainEntry(window, undefined)).toBe(true);
+    expect(shouldAutoBootMainEntry(window, { runtime: {} })).toBe(true);
+
+    // In ISOLATED content-script world (chrome.runtime.id present) -> strictly false!
+    expect(
+      shouldAutoBootMainEntry(window, {
+        runtime: { id: BRAND.pinnedExtensionId },
+      }),
+    ).toBe(false);
+
+    // Static dependency graph check: isolated-entry (subtitles.js) and its imports never pull in main-entry or pip-player
+    const here = path.dirname(fileURLToPath(import.meta.url));
+    const youtubeSrcDir = path.resolve(here, '../../src/youtube');
+    for (const file of ['isolated-entry.ts', 'shared.ts', 'batching.ts', 'timeline.ts']) {
+      const source = fs.readFileSync(path.join(youtubeSrcDir, file), 'utf8');
+      expect(source).not.toMatch(/from\s+['"]\.\/main-entry['"]/);
+      expect(source).not.toMatch(/from\s+['"]\.\/pip-player['"]/);
+    }
+  });
+
+  it('preserves translated cues and avoids duplicate LLM batches when subtitle-config-update replays caption-track-captured (Defect 2)', async () => {
+    vi.useRealTimers();
+    const happyWin = window as unknown as {
+      happyDOM?: { setURL: (url: string) => void };
+    };
+    happyWin.happyDOM?.setURL('https://www.youtube.com/watch?v=replaySafe01');
+
+    const playerEl = document.createElement('div');
+    playerEl.id = 'movie_player';
+    playerEl.className = 'html5-video-player';
+    const rightControls = document.createElement('div');
+    rightControls.className = 'ytp-right-controls';
+    const video = createMockVideo();
+    video.currentTime = 0.5;
+    playerEl.append(video, rightControls);
+    document.body.appendChild(playerEl);
+
+    window.fetch = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          events: [
+            { tStartMs: 0, dDurationMs: 3000, segs: [{ utf8: 'Stay curious' }] },
+          ],
+        }),
+        { status: 200 },
+      ),
+    );
+
+    let currentCfg: MarginConfig = createDefaultMarginConfig();
+    const cfgListeners: Array<(cfg: MarginConfig) => void> = [];
+    const translateSpy = vi.fn(async (req: { requestId: string; items: Array<{ id: number }> }) => ({
+      ok: true,
+      requestId: req.requestId,
+      providerId: 'google-free',
+      model: 'gtx',
+      items: req.items.map((item) => ({ id: item.id, trans: '保持好奇' })),
+      diagnostic: {
+        schemaVersion: 1 as const,
+        product: BRAND.name,
+        version: BRAND.version,
+        time: new Date().toISOString(),
+        scene: 'subtitle' as const,
+        codec: 'single-text' as const,
+        provider: {
+          id: 'google-free',
+          preset: 'google-free' as const,
+          protocol: 'google-web' as const,
+          endpointOrigin: 'https://translate.googleapis.com',
+          endpointPath: '/translate_a/single',
+          model: 'gtx',
+        },
+        parameters: {
+          temperatureTrace: 'omitted-default' as const,
+          thinkingMode: 'provider-default' as const,
+          stream: false,
+        },
+        kind: 'ok' as const,
+        retryable: false,
+        attempts: 1,
+        latencyMs: 25,
+      },
+    }));
+
+    const mainCtrl = createYoutubeMainController();
+    const isolatedCtrl = createSubtitleIsolatedController({
+      loadConfig: async () => currentCfg,
+      subscribeConfig: (listener) => {
+        cfgListeners.push(listener);
+        return () => {
+          const idx = cfgListeners.indexOf(listener);
+          if (idx >= 0) cfgListeners.splice(idx, 1);
+        };
+      },
+      translateBatch: translateSpy,
+    });
+
+    mainCtrl.start();
+    await isolatedCtrl.start();
+    await new Promise((r) => setTimeout(r, 25));
+
+    await window.fetch(
+      'https://www.youtube.com/api/timedtext?v=replaySafe01&lang=en&fmt=json3',
+    );
+    window.postMessage(
+      {
+        source: BRAND.ytBridgeSourceMain,
+        type: 'playhead-tick',
+        videoId: 'replaySafe01',
+        currentTimeMs: 500,
+        paused: false,
+      } satisfies YoutubeMainBridgeMessage,
+      '*',
+    );
+    await new Promise((r) => setTimeout(r, 40));
+
+    expect(translateSpy).toHaveBeenCalledTimes(1);
+    expect(isolatedCtrl.getCues()[0]?.trans).toBe('保持好奇');
+
+    // 1. Change UI/subtitle style settings -> triggers subtitle-config-update -> caption-track-captured replay
+    currentCfg = {
+      ...currentCfg,
+      uiColorMode: 'night',
+      subtitles: {
+        ...currentCfg.subtitles,
+        fontSizePercent: 85,
+        displayMode: 'target-only',
+      },
+    };
+    cfgListeners.forEach((fn) => fn(currentCfg));
+    await new Promise((r) => setTimeout(r, 40));
+
+    expect(translateSpy).toHaveBeenCalledTimes(1);
+    expect(isolatedCtrl.getCues()[0]?.trans).toBe('保持好奇');
+    expect(mainCtrl.getPipPlayer().getCueState()).toMatchObject({
+      translated: '保持好奇',
+      mode: 'target-only',
+      fontSizePercent: 85,
+    });
+
+    // 2. Toggle player subtitle button OFF then ON -> preserves translated cue without duplicate LLM calls!
+    const toggleBtn = document.getElementById(SUBTITLE_TOGGLE_BUTTON_ID) as HTMLButtonElement;
+    toggleBtn.click(); // OFF
+    await new Promise((r) => setTimeout(r, 25));
+    toggleBtn.click(); // ON
+    await new Promise((r) => setTimeout(r, 40));
+
+    expect(translateSpy).toHaveBeenCalledTimes(1);
+    expect(isolatedCtrl.getCues()[0]?.trans).toBe('保持好奇');
+
+    isolatedCtrl.destroy();
+    mainCtrl.destroy();
   });
 });
