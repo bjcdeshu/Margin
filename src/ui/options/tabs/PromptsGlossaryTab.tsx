@@ -239,7 +239,7 @@ export function PromptsGlossaryTab({ draft, onMutate }: PromptsGlossaryTabProps)
               <input
                 type="text"
                 class="mp-input"
-                style={{ minWidth: '260px' }}
+                style={{ minWidth: '340px' }}
                 value={assistant.name}
                 onInput={(e) => {
                   const val = (e.currentTarget as HTMLInputElement).value;
@@ -463,13 +463,17 @@ export function PromptsGlossaryTab({ draft, onMutate }: PromptsGlossaryTabProps)
                     >
                       {envKey}
                     </span>
-                    <input
-                      type="text"
-                      class="mp-input mp-input--mono"
-                      style={{ flex: 1 }}
+                    <textarea
+                      class="mp-textarea mp-textarea--mono"
+                      rows={envVal.includes('\n') ? Math.min(4, envVal.split('\n').length) : 1}
+                      style={{
+                        flex: 1,
+                        minHeight: envVal.includes('\n') ? '64px' : '34px',
+                        padding: '6px 10px',
+                      }}
                       value={envVal}
                       onInput={(e) => {
-                        const nextV = (e.currentTarget as HTMLInputElement).value;
+                        const nextV = (e.currentTarget as HTMLTextAreaElement).value;
                         updateAssistant((ast) => {
                           ast.env[envKey] = nextV;
                         });

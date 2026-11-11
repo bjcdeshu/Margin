@@ -626,6 +626,7 @@ export function ProvidersTab({
                     <input
                       type="text"
                       class="mp-input mp-input--mono"
+                      style={{ minWidth: '240px' }}
                       placeholder={lang === 'en' ? 'Add model tag (e.g. gpt-6-luna)' : '添加常用模型标签 (如 gpt-6-luna)'}
                       value={customModelInput}
                       onInput={(e) => setCustomModelInput((e.currentTarget as HTMLInputElement).value)}

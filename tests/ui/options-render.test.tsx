@@ -156,6 +156,12 @@ describe('Quiet Paper 5-Tab Settings Studio (OptionsApp)', () => {
     });
     await flushMicrotasks();
 
+    // Multi-line YAML macro `imt_yaml_item` renders inside a <textarea> preserving newlines
+    const envTextareas = Array.from(container.querySelectorAll('textarea'));
+    expect(envTextareas.some((ta) => ta.value.includes('- id: {{id}}\n  src: |-'))).toBe(
+      true,
+    );
+
     const resetBtn = container.querySelector(
       '[data-testid="reset-aloxaf-yaml-btn"]',
     ) as HTMLButtonElement;

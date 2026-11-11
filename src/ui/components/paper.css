@@ -498,6 +498,8 @@ body {
   border: 1px solid var(--rule);
   background: var(--paper-soft);
   color: var(--muted);
+  white-space: nowrap;
+  flex-shrink: 0;
 }
 
 .mp-pill--accent {
@@ -612,6 +614,11 @@ body {
   gap: 8px;
   padding-bottom: 10px;
   border-bottom: 1px solid var(--rule);
+}
+
+.mp-popup-header .mp-segmented-btn {
+  padding: 4px 8px;
+  font-size: 12px;
 }
 
 .mp-popup-primary {

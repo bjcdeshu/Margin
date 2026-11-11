@@ -42,6 +42,34 @@ describe('PDF Paragraph Extractor & Quiet Paper PDF Studio', () => {
     expect(scannedPage.isLikelyScanned).toBe(true);
   });
 
+  it('separates 13pt numbered academic section headings from 11pt body paragraphs', () => {
+    const academicPage = extractParagraphsFromTextItems([
+      {
+        str: '1. Editorial Typography and Cognitive Calm',
+        transform: [1, 0, 0, 13, 72, 720],
+        height: 13,
+        hasEOL: true,
+      },
+      {
+        str: 'Warm paper surfaces with subtle contrast reduce visual fatigue across long',
+        transform: [1, 0, 0, 11, 72, 700],
+        height: 11,
+        hasEOL: true,
+      },
+      {
+        str: 'technical papers and bilingual reading sessions.',
+        transform: [1, 0, 0, 11, 72, 685],
+        height: 11,
+        hasEOL: true,
+      },
+    ]);
+
+    expect(academicPage.paragraphs).toEqual([
+      '1. Editorial Typography and Cognitive Calm',
+      'Warm paper surfaces with subtle contrast reduce visual fatigue across long technical papers and bilingual reading sessions.',
+    ]);
+  });
+
   it('renders Quiet Paper PDF Reader dropzone, mask toggle, and local/URL controls without loading pdfjs eagerly', async () => {
     const container = document.createElement('div');
     document.body.appendChild(container);

@@ -216,17 +216,29 @@ export function extractParagraphsFromTextItems(
 
     const verticalDrop = hasRealCoords ? Math.abs(prevLine.y - line.y) : line.height * 1.2;
     const refHeight = Math.max(prevLine.height, line.height, 10);
-    const fontJump = Math.abs(prevLine.height - line.height) > refHeight * 0.24;
+    const fontJump = Math.abs(prevLine.height - line.height) > refHeight * 0.14;
     const largeGap = verticalDrop > refHeight * 1.62;
     const standaloneEquation =
       looksLikeFormulaText(line.text) &&
       line.text.length < 90 &&
       Math.abs(line.minX - prevLine.minX) > refHeight * 1.5;
 
-    const prevEndedSentence = /[.!?。！？:：]$/.test(prevLine.text.trim());
+    const prevTrimmed = prevLine.text.trim();
+    const prevEndedSentence = /[.!?。！？:：]$/.test(prevTrimmed);
+    const prevIsHeading =
+      /^(?:\d+(?:\.\d+)*[.)]?|[IVX]+\.)\s+\S/.test(prevTrimmed) &&
+      !/[.!?。！？]$/.test(prevTrimmed) &&
+      prevTrimmed.length < 96;
     const bulletStart = /^(?:[-•*▪]|\d+[.)]|\([a-z0-9]+\))\s+/i.test(line.text);
 
-    if (largeGap || fontJump || bulletStart || standaloneEquation || (prevEndedSentence && verticalDrop > refHeight * 1.35)) {
+    if (
+      largeGap ||
+      fontJump ||
+      prevIsHeading ||
+      bulletStart ||
+      standaloneEquation ||
+      (prevEndedSentence && verticalDrop > refHeight * 1.35)
+    ) {
       if (currentPara.trim()) {
         paragraphs.push(currentPara.trim());
       }
