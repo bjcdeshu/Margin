@@ -1,0 +1,145 @@
+/* Quiet Paper Two-Column Bilingual PDF Studio */
+
+.mp-pdf-shell {
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+
+.mp-pdf-topbar {
+  position: sticky;
+  top: 0;
+  z-index: 30;
+  background: color-mix(in srgb, var(--paper) 95%, transparent);
+  backdrop-filter: blur(8px);
+  border-bottom: 1px solid var(--rule);
+  padding: 12px 24px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  flex-wrap: wrap;
+}
+
+.mp-pdf-dropzone-wrap {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 40px 24px;
+}
+
+.mp-pdf-dropzone {
+  max-width: 620px;
+  width: 100%;
+  padding: 44px 36px;
+  border: 1px dashed var(--rule-strong);
+  border-radius: var(--radius-modal);
+  background: color-mix(in srgb, var(--paper-soft) 55%, var(--paper));
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  gap: 14px;
+  transition: border-color var(--motion-fast), background-color var(--motion-fast);
+}
+
+.mp-pdf-dropzone--dragging {
+  border-color: var(--action-solid);
+  background: color-mix(in srgb, var(--accent-soft) 45%, var(--paper));
+}
+
+.mp-pdf-stream {
+  max-width: 1440px;
+  width: 100%;
+  margin: 0 auto;
+  padding: 24px 24px 72px;
+  display: flex;
+  flex-direction: column;
+  gap: 28px;
+}
+
+.mp-pdf-page-row {
+  display: grid;
+  grid-template-columns: minmax(320px, 1fr) minmax(320px, 1fr);
+  gap: 28px;
+  padding-bottom: 28px;
+  border-bottom: 1px solid var(--rule);
+  align-items: start;
+}
+
+.mp-pdf-canvas-pane {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  background: var(--paper-soft);
+  border: 1px solid var(--image-border);
+  border-radius: var(--radius-frame);
+  padding: 12px;
+  overflow-x: auto;
+}
+
+.mp-pdf-canvas {
+  max-width: 100%;
+  height: auto;
+  display: block;
+  background: #ffffff;
+  border: 1px solid var(--rule);
+}
+
+.mp-pdf-reading-pane {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.mp-pdf-page-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--rule);
+  flex-wrap: wrap;
+}
+
+.mp-pdf-para {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--rule-soft);
+}
+
+.mp-pdf-para:last-child {
+  border-bottom: none;
+}
+
+.mp-pdf-para-src {
+  font-size: 13px;
+  line-height: 1.62;
+  color: var(--muted);
+}
+
+.mp-pdf-para-trans {
+  font-size: 14.5px;
+  line-height: 1.72;
+  color: var(--ink);
+  transition: filter var(--motion-standard) var(--ease-standard);
+}
+
+.mp-pdf-para-trans--mask {
+  filter: blur(5px);
+}
+
+.mp-pdf-para-trans--mask:hover,
+.mp-pdf-para-trans--mask:focus-within {
+  filter: none;
+}
+
+@media (max-width: 960px) {
+  .mp-pdf-page-row {
+    grid-template-columns: 1fr;
+  }
+}
