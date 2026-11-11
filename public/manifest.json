@@ -1,0 +1,136 @@
+{
+  "manifest_version": 3,
+  "name": "Margin",
+  "version": "2.0.0",
+  "version_name": "2.0.0",
+  "description": "Quiet editorial AI translation for web pages, input boxes, YouTube bilingual PiP, PDFs, and images.",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAvKcQxx9iJR5rxocZ0vnHv7F8SXYZQc0GOREGtTOSqwX7WK3Y5Mr4GNWeTAcTGkesJWU2piQVvTvSoBM0sY+202E3/lbyPvpwY7i+8FraTRGfo5iRNrOQxVbxZmUEw7zw8yqOaWoAUBF1GII2YrxyDTHtr/B8amb9bitkscBoe5JZm8CButl/fcdYgSP3H3RlLIzIJBUUiKjR+DUNbPal9kgYXnMO7+94w15SwqHkOvCiixo0ez9MnfGB5Zmg65N5w5ADwlaRt2fpR5ne/PoLcluC4BbMXhtCpgj+QgSTBaJXA7TP7sZJv0yQH3HIqFh+TC9jFf+iJ905wV5vuAr0YQIDAQAB",
+  "icons": {
+    "16": "icons/16.png",
+    "32": "icons/32.png",
+    "48": "icons/48.png",
+    "128": "icons/128.png"
+  },
+  "action": {
+    "default_title": "Margin",
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icons/16.png",
+      "32": "icons/32.png",
+      "48": "icons/48.png",
+      "128": "icons/128.png"
+    }
+  },
+  "options_ui": {
+    "page": "options.html",
+    "open_in_tab": true
+  },
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "permissions": [
+    "storage",
+    "activeTab",
+    "contextMenus",
+    "declarativeNetRequest",
+    "declarativeNetRequestWithHostAccess"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "declarative_net_request": {
+    "rule_resources": [
+      {
+        "id": "margin_static_rules",
+        "enabled": true,
+        "path": "rules/net-rules.json"
+      }
+    ]
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "<all_urls>"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_idle",
+      "all_frames": false
+    },
+    {
+      "matches": [
+        "<all_urls>"
+      ],
+      "js": [
+        "subtitles.js"
+      ],
+      "run_at": "document_start",
+      "all_frames": false
+    },
+    {
+      "matches": [
+        "*://*.youtube.com/*"
+      ],
+      "js": [
+        "youtube-main.js"
+      ],
+      "run_at": "document_start",
+      "all_frames": false,
+      "world": "MAIN"
+    },
+    {
+      "matches": [
+        "<all_urls>"
+      ],
+      "js": [
+        "image-translate.js"
+      ],
+      "run_at": "document_idle",
+      "all_frames": false
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "pdf.html",
+        "pdf.worker.min.mjs",
+        "assets/*",
+        "icons/*"
+      ],
+      "matches": [
+        "<all_urls>"
+      ]
+    }
+  ],
+  "commands": {
+    "toggleTranslatePage": {
+      "suggested_key": {
+        "default": "Alt+A"
+      },
+      "description": "Toggle bilingual translation on current page"
+    },
+    "toggleTranslateWholePage": {
+      "suggested_key": {
+        "default": "Alt+W"
+      },
+      "description": "Translate entire page immediately"
+    },
+    "toggleTranslationMask": {
+      "suggested_key": {
+        "default": "Alt+M"
+      },
+      "description": "Toggle blur mask reveal on translated text"
+    },
+    "translateInputBox": {
+      "suggested_key": {
+        "default": "Alt+I"
+      },
+      "description": "Quick-translate active input box"
+    }
+  },
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'self'"
+  }
+}
