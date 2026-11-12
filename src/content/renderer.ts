@@ -21,6 +21,7 @@ import { resolveThemeForUrl } from '@shared/url-match';
 import {
   extractPageContext,
   extractParagraphBlocks,
+  findClosestParagraphBlock,
   findFirstDirectBlockBoundaryChild,
 } from './dom-walker';
 import {
@@ -689,6 +690,8 @@ export class WebpageRenderer {
   private readonly mountedMeta = new WeakMap<HTMLElement, MountedBlockMeta>();
   private readonly unclampedStyles = new WeakMap<HTMLElement, SavedUnclampStyle>();
   private readonly pendingViewportQueue = new Map<HTMLElement, TranslationScene>();
+  private readonly ownedInjectedNodes = new Set<Element>();
+  private readonly ownedOrigWrappers = new Set<Element>();
 
   private sessionTotalBlocks = 0;
   private sessionDoneBlocks = 0;
@@ -728,6 +731,14 @@ export class WebpageRenderer {
     return this.active;
   }
 
+  isPageTranslationActive(): boolean {
+    return this.active;
+  }
+
+  invalidatePageContextCache(): void {
+    this.pageContextCache = null;
+  }
+
   get isMaskRevealed(): boolean {
     return this.maskRevealedGlobally;
   }
@@ -752,10 +763,19 @@ export class WebpageRenderer {
   }
 
   private runInternalDomMutation<T>(fn: () => T): T {
+    if (this.internalDomDepth === 0 && this.active && this.mutationObserver) {
+      const pendingExternal = this.mutationObserver.takeRecords();
+      if (pendingExternal.length > 0) {
+        this.processSpaMutations(pendingExternal);
+      }
+    }
     this.internalDomDepth += 1;
     try {
       return fn();
     } finally {
+      if (this.internalDomDepth === 1 && this.mutationObserver) {
+        this.mutationObserver.takeRecords();
+      }
       this.internalDomDepth -= 1;
     }
   }
@@ -1256,6 +1276,7 @@ export class WebpageRenderer {
         this.config.interfaceLang === 'en' ? 'Translating…' : '正在翻译…';
 
       loading.append(spinner, label);
+      this.ownedInjectedNodes.add(loading);
       this.insertInjectedIntoBlock(blockEl, loading);
       this.unclampForInjectedNode(blockEl, loading);
     });
@@ -1308,10 +1329,12 @@ export class WebpageRenderer {
           this.failedBlockTasks.clear();
           this.lastError = undefined;
           if (failed.length > 0) {
-            for (const task of failed) {
-              this.clearBlockInjectedElements(task.block);
-              this.mountBlockLoadingIndicator(task.block);
-            }
+            this.runInternalDomMutation(() => {
+              for (const task of failed) {
+                this.clearBlockInjectedElements(task.block);
+                this.mountBlockLoadingIndicator(task.block);
+              }
+            });
             this.sessionTotalBlocks += failed.length;
             this.refreshStatusPill();
             void this.executeBatch(failed);
@@ -1488,6 +1511,7 @@ export class WebpageRenderer {
       wrapper.appendChild(node);
     }
 
+    this.ownedOrigWrappers.add(wrapper);
     blockEl.insertBefore(wrapper, blockEl.firstChild);
   }
 
@@ -1504,6 +1528,7 @@ export class WebpageRenderer {
     while (wrapper.firstChild) {
       blockEl.insertBefore(wrapper.firstChild, wrapper);
     }
+    this.ownedOrigWrappers.delete(wrapper);
     wrapper.remove();
   }
 
@@ -1516,6 +1541,7 @@ export class WebpageRenderer {
       }
     }
     for (const el of toRemove) {
+      this.ownedInjectedNodes.delete(el);
       el.remove();
     }
   }
@@ -1598,6 +1624,7 @@ export class WebpageRenderer {
         }
       });
 
+      this.ownedInjectedNodes.add(span);
       this.insertInjectedIntoBlock(blockEl, span);
       this.unclampForInjectedNode(blockEl, span);
       blockEl.setAttribute('data-margin-translated', 'true');
@@ -1660,6 +1687,7 @@ export class WebpageRenderer {
           ev.stopPropagation();
           retryBatch();
         });
+        this.ownedInjectedNodes.add(btn);
         this.insertInjectedIntoBlock(task.block, btn);
         this.unclampForInjectedNode(task.block, btn);
       }
@@ -1728,6 +1756,8 @@ export class WebpageRenderer {
       context: this.getPageContext(scene),
     };
 
+    const staleMidFlightBlocks = new Set<HTMLElement>();
+
     const applyOutputItem = (item: BatchItemOutput) => {
       if (abortController.signal.aborted) return;
       const task = slotMap.get(item.id);
@@ -1741,6 +1771,47 @@ export class WebpageRenderer {
 
       const isFirstRenderForSlot = prevTrans === undefined;
       renderedTransBySlot.set(item.id, item.trans);
+
+      if (!task.block.isConnected) {
+        this.cache.set(task.cacheKey, {
+          trans: item.trans,
+          fallbackPlain: Boolean(item.fallbackPlain),
+        });
+        if (isFirstRenderForSlot && scene === 'webpage') {
+          this.sessionDoneBlocks += 1;
+          this.inFlightBlockSet.delete(task.block);
+          this.refreshStatusPill();
+        }
+        return;
+      }
+
+      if (scene === 'webpage') {
+        const latestPrepared = this.prepareBlockTask(task.block, scene);
+        if (
+          !latestPrepared ||
+          latestPrepared.tokenized.text.trim() !== task.tokenized.text.trim()
+        ) {
+          this.cache.set(task.cacheKey, {
+            trans: item.trans,
+            fallbackPlain: Boolean(item.fallbackPlain),
+          });
+          this.runInternalDomMutation(() => {
+            if (!this.hasMountedTranslation(task.block)) {
+              this.clearBlockInjectedElements(task.block);
+              this.restoreUnclampedForBlock(task.block);
+            }
+          });
+          if (latestPrepared) {
+            staleMidFlightBlocks.add(task.block);
+          }
+          if (isFirstRenderForSlot) {
+            this.sessionDoneBlocks += 1;
+            this.inFlightBlockSet.delete(task.block);
+            this.refreshStatusPill();
+          }
+          return;
+        }
+      }
 
       const { fallbackPlain } = this.mountBlockTranslation(
         task.block,
@@ -1802,17 +1873,21 @@ export class WebpageRenderer {
       }
     } catch (err) {
       if (abortController.signal.aborted) {
-        for (const task of batchTasks) {
-          if (!renderedTransBySlot.has(
-            requestItems.find((it) => slotMap.get(it.id) === task)?.id ?? -1,
-          )) {
-            this.observedBlocks.delete(task.block);
-            if (!this.hasMountedTranslation(task.block)) {
-              this.clearBlockInjectedElements(task.block);
-              this.restoreUnclampedForBlock(task.block);
+        this.runInternalDomMutation(() => {
+          for (const task of batchTasks) {
+            if (
+              !renderedTransBySlot.has(
+                requestItems.find((it) => slotMap.get(it.id) === task)?.id ?? -1,
+              )
+            ) {
+              this.observedBlocks.delete(task.block);
+              if (!this.hasMountedTranslation(task.block)) {
+                this.clearBlockInjectedElements(task.block);
+                this.restoreUnclampedForBlock(task.block);
+              }
             }
           }
-        }
+        });
         return;
       }
       const msg = err instanceof Error ? err.message : String(err);
@@ -1828,6 +1903,9 @@ export class WebpageRenderer {
       }
       if (scene === 'webpage') {
         this.refreshStatusPill();
+        if (this.active && staleMidFlightBlocks.size > 0) {
+          this.scanAndRegisterSpaRoots(Array.from(staleMidFlightBlocks));
+        }
       }
     }
   }
@@ -1873,6 +1951,9 @@ export class WebpageRenderer {
 
     for (const block of blocks) {
       if (!block.isConnected) continue;
+      if (scene === 'webpage') {
+        this.syncStaleBlockBeforeRegister(block, false);
+      }
       if (this.hasMountedTranslation(block) || this.inFlightBlocks.has(block)) {
         continue;
       }
@@ -1968,7 +2049,8 @@ export class WebpageRenderer {
           this.intersectionObserver?.unobserve(target);
           if (
             !this.hasMountedTranslation(target) &&
-            !this.inFlightBlocks.has(target)
+            !this.inFlightBlocks.has(target) &&
+            !this.failedBlockTasks.has(target)
           ) {
             this.pendingViewportQueue.set(target, 'webpage');
             this.mountBlockLoadingIndicator(target);
@@ -2002,12 +2084,73 @@ export class WebpageRenderer {
     }
   }
 
-  private registerBlocksForViewport(blocks: readonly HTMLElement[]): void {
+  private syncStaleBlockBeforeRegister(
+    block: HTMLElement,
+    fromSpaRescan: boolean,
+  ): void {
+    if (this.hasMountedTranslation(block)) {
+      const currentSource =
+        this.prepareBlockTask(block, 'webpage')?.tokenized.text.trim() ?? '';
+      const prevSource = this.mountedMeta.get(block)?.sourceText.trim() ?? '';
+      if (!currentSource || currentSource !== prevSource) {
+        this.removeBlockTranslation(block);
+        this.observedBlocks.delete(block);
+        this.intersectionObserver?.unobserve(block);
+        this.failedBlockTasks.delete(block);
+      }
+      return;
+    }
+
+    if (
+      this.mountedMeta.has(block) ||
+      block.getAttribute('data-margin-translated') === 'true'
+    ) {
+      this.removeBlockTranslation(block);
+      this.observedBlocks.delete(block);
+      this.intersectionObserver?.unobserve(block);
+    }
+
+    const failedTask = this.failedBlockTasks.get(block);
+    if (failedTask) {
+      const currentSource =
+        this.prepareBlockTask(block, 'webpage')?.tokenized.text.trim() ?? '';
+      if (!currentSource || currentSource !== failedTask.tokenized.text.trim()) {
+        this.failedBlockTasks.delete(block);
+        this.observedBlocks.delete(block);
+        this.intersectionObserver?.unobserve(block);
+        this.runInternalDomMutation(() => {
+          this.clearBlockInjectedElements(block);
+          this.restoreUnclampedForBlock(block);
+        });
+      }
+      return;
+    }
+
+    if (
+      fromSpaRescan &&
+      !this.inFlightBlocks.has(block) &&
+      !this.pendingViewportQueue.has(block) &&
+      this.observedBlocks.has(block)
+    ) {
+      this.observedBlocks.delete(block);
+      this.intersectionObserver?.unobserve(block);
+    }
+  }
+
+  private registerBlocksForViewport(
+    blocks: readonly HTMLElement[],
+    options: { fromSpaRescan?: boolean } = {},
+  ): void {
     const missesForObserver: HTMLElement[] = [];
     let queuedImmediate = false;
+    const fromSpaRescan = Boolean(options.fromSpaRescan);
 
     for (const block of blocks) {
-      if (!block.isConnected || this.hasMountedTranslation(block)) continue;
+      if (!block.isConnected) continue;
+      this.syncStaleBlockBeforeRegister(block, fromSpaRescan);
+      if (this.hasMountedTranslation(block) || this.failedBlockTasks.has(block)) {
+        continue;
+      }
 
       const prepared = this.prepareBlockTask(block, 'webpage');
       if (!prepared) continue;
@@ -2060,62 +2203,212 @@ export class WebpageRenderer {
     );
   }
 
+  private isInsideMarginInjectedOrHost(node: Node | null): boolean {
+    let curr: Node | null = node;
+    while (curr) {
+      if (curr.nodeType === Node.ELEMENT_NODE) {
+        const el = curr as Element;
+        if (
+          el.hasAttribute('data-margin-injected') ||
+          el.hasAttribute('data-margin-host')
+        ) {
+          return true;
+        }
+      }
+      curr = curr.parentNode;
+    }
+    return false;
+  }
+
+  private scanAndRegisterSpaRoots(roots: readonly ParentNode[]): void {
+    const discovered = new Set<HTMLElement>();
+    const staleCheckCandidates = new Set<HTMLElement>();
+
+    for (const r of roots) {
+      if (r instanceof Node && !r.isConnected) continue;
+
+      if (r instanceof Element) {
+        const enclosingTranslated = r.closest<HTMLElement>(
+          '[data-margin-translated="true"]',
+        );
+        if (enclosingTranslated) {
+          staleCheckCandidates.add(enclosingTranslated);
+        }
+        const descTranslated = r.querySelectorAll<HTMLElement>(
+          '[data-margin-translated="true"]',
+        );
+        for (let i = 0; i < descTranslated.length; i++) {
+          staleCheckCandidates.add(descTranslated[i]);
+        }
+      } else if (typeof r.querySelectorAll === 'function') {
+        const descTranslated = r.querySelectorAll<HTMLElement>(
+          '[data-margin-translated="true"]',
+        );
+        for (let i = 0; i < descTranslated.length; i++) {
+          staleCheckCandidates.add(descTranslated[i]);
+        }
+      }
+
+      for (const blk of staleCheckCandidates) {
+        if (blk.isConnected) {
+          this.syncStaleBlockBeforeRegister(blk, true);
+        }
+      }
+      staleCheckCandidates.clear();
+
+      for (const blk of extractParagraphBlocks(r, {
+        targetLang: this.config.targetLang,
+      })) {
+        discovered.add(blk);
+      }
+
+      if (r instanceof Node) {
+        const enclosing = findClosestParagraphBlock(r, {
+          targetLang: this.config.targetLang,
+        });
+        if (enclosing) {
+          discovered.add(enclosing);
+        }
+      }
+    }
+
+    if (discovered.size > 0) {
+      this.registerBlocksForViewport(Array.from(discovered), {
+        fromSpaRescan: true,
+      });
+    }
+  }
+
+  /**
+   * Re-scans `root` (defaulting to `doc.body`) during SPA navigations (`yt-navigate-finish`,
+   * `popstate`, `hashchange`) to invalidate recycled blocks and queue newly hydrated prose.
+   */
+  rescanSubtree(root?: ParentNode | null): void {
+    if (!this.active) return;
+    const targetRoot = root ?? this.doc.body;
+    if (!targetRoot) return;
+    this.scanAndRegisterSpaRoots([targetRoot]);
+  }
+
+  private processSpaMutations(mutations: readonly MutationRecord[]): void {
+    if (!this.active || this.internalDomDepth > 0) return;
+
+    let hasExternalMutation = false;
+
+    for (const m of mutations) {
+      if (this.isInsideMarginInjectedOrHost(m.target)) continue;
+
+      if (m.type === 'childList') {
+        const rawTargetEl = m.target instanceof Element ? m.target : null;
+        const effectiveTargetEl =
+          rawTargetEl?.getAttribute('data-margin-orig-wrap') === 'true'
+            ? rawTargetEl.parentElement
+            : rawTargetEl;
+        if (effectiveTargetEl && this.isMarginInternalNode(effectiveTargetEl)) {
+          continue;
+        }
+
+        for (let i = 0; i < m.addedNodes.length; i++) {
+          const added = m.addedNodes[i];
+          if (this.isMarginInternalNode(added)) continue;
+          if (added.nodeType === Node.ELEMENT_NODE) {
+            this.pendingSpaRoots.add(
+              rawTargetEl !== effectiveTargetEl && effectiveTargetEl
+                ? effectiveTargetEl
+                : (added as Element),
+            );
+            hasExternalMutation = true;
+          } else if (
+            added.nodeType === Node.TEXT_NODE &&
+            added.nodeValue?.trim() &&
+            effectiveTargetEl
+          ) {
+            this.pendingSpaRoots.add(effectiveTargetEl);
+            hasExternalMutation = true;
+          }
+        }
+
+        if (m.removedNodes.length > 0 && effectiveTargetEl) {
+          for (let i = 0; i < m.removedNodes.length; i++) {
+            const removed = m.removedNodes[i];
+            if (
+              removed.nodeType === Node.ELEMENT_NODE &&
+              (removed as Element).getAttribute('data-margin-injected') ===
+                'true'
+            ) {
+              this.pendingSpaRoots.add(effectiveTargetEl);
+              hasExternalMutation = true;
+              break;
+            }
+            if (
+              effectiveTargetEl.closest('[data-margin-translated="true"]') !==
+              null
+            ) {
+              this.pendingSpaRoots.add(effectiveTargetEl);
+              hasExternalMutation = true;
+              break;
+            }
+          }
+        }
+      } else if (m.type === 'characterData') {
+        const rawParent = m.target.parentElement;
+        const targetEl =
+          rawParent?.getAttribute('data-margin-orig-wrap') === 'true'
+            ? rawParent.parentElement
+            : rawParent;
+        if (
+          targetEl &&
+          !this.isMarginInternalNode(targetEl) &&
+          (m.target.nodeValue?.trim() ||
+            targetEl.closest('[data-margin-translated="true"]') !== null)
+        ) {
+          this.pendingSpaRoots.add(targetEl);
+          hasExternalMutation = true;
+        }
+      } else if (m.type === 'attributes') {
+        if (
+          !(m.target instanceof Element) ||
+          this.isMarginInternalNode(m.target)
+        ) {
+          continue;
+        }
+        const attrName = m.attributeName;
+        if (
+          (attrName === 'is-empty' || attrName === 'hidden') &&
+          !m.target.hasAttribute(attrName)
+        ) {
+          this.pendingSpaRoots.add(m.target);
+          hasExternalMutation = true;
+        }
+      }
+    }
+
+    if (hasExternalMutation && this.spaMutationTimer === null) {
+      this.spaMutationTimer = setTimeout(() => {
+        this.spaMutationTimer = null;
+        if (!this.active || this.pendingSpaRoots.size === 0) return;
+        const roots = Array.from(this.pendingSpaRoots);
+        this.pendingSpaRoots.clear();
+        this.scanAndRegisterSpaRoots(roots);
+      }, 80);
+    }
+  }
+
   private ensureSpaMutationObserver(): void {
     if (this.mutationObserver || typeof MutationObserver === 'undefined') return;
     const root = this.doc.body;
     if (!root) return;
 
     this.mutationObserver = new MutationObserver((mutations) => {
-      if (!this.active || this.internalDomDepth > 0) return;
-
-      for (const m of mutations) {
-        if (m.type !== 'childList' || m.addedNodes.length === 0) continue;
-        if (this.isMarginInternalNode(m.target)) continue;
-
-        let hasExternalAddition = false;
-        for (let i = 0; i < m.addedNodes.length; i++) {
-          const added = m.addedNodes[i];
-          if (this.isMarginInternalNode(added)) continue;
-          if (added.nodeType === Node.ELEMENT_NODE) {
-            this.pendingSpaRoots.add(added as Element);
-            hasExternalAddition = true;
-          } else if (
-            added.nodeType === Node.TEXT_NODE &&
-            added.nodeValue?.trim() &&
-            m.target instanceof Element
-          ) {
-            this.pendingSpaRoots.add(m.target);
-            hasExternalAddition = true;
-          }
-        }
-
-        if (hasExternalAddition && this.spaMutationTimer === null) {
-          this.spaMutationTimer = setTimeout(() => {
-            this.spaMutationTimer = null;
-            if (!this.active || this.pendingSpaRoots.size === 0) return;
-            const roots = Array.from(this.pendingSpaRoots);
-            this.pendingSpaRoots.clear();
-
-            const discovered = new Set<HTMLElement>();
-            for (const r of roots) {
-              if (r instanceof Node && !r.isConnected) continue;
-              for (const blk of extractParagraphBlocks(r, {
-                targetLang: this.config.targetLang,
-              })) {
-                discovered.add(blk);
-              }
-            }
-            if (discovered.size > 0) {
-              this.registerBlocksForViewport(Array.from(discovered));
-            }
-          }, 80);
-        }
-      }
+      this.processSpaMutations(mutations);
     });
 
     this.mutationObserver.observe(root, {
       childList: true,
       subtree: true,
+      characterData: true,
+      attributes: true,
+      attributeFilter: ['is-empty', 'hidden'],
     });
   }
 
@@ -2141,6 +2434,7 @@ export class WebpageRenderer {
   async translateWholePage(): Promise<void> {
     this.active = true;
     this.lastError = undefined;
+    this.failedBlockTasks.clear();
     this.sessionTotalBlocks = 0;
     this.sessionDoneBlocks = 0;
     this.ensureStylesInjected();
@@ -2155,7 +2449,16 @@ export class WebpageRenderer {
    * Disables webpage translation and cleanly restores the exact original DOM
    * (including unwrapping `target-only` blocks) with zero page reload.
    */
-  restorePage(): void {
+  restorePage(options: { onlyOwnedNodes?: boolean } = {}): void {
+    const onlyOwned = Boolean(options.onlyOwnedNodes);
+    const ownedBlocksSnapshot = new Set<HTMLElement>(this.translatedBlockSet);
+    for (const blk of this.failedBlockTasks.keys()) {
+      ownedBlocksSnapshot.add(blk);
+    }
+    for (const blk of this.inFlightBlockSet) {
+      ownedBlocksSnapshot.add(blk);
+    }
+
     this.active = false;
 
     if (this.flushTimer !== null) {
@@ -2191,13 +2494,44 @@ export class WebpageRenderer {
     this.hideStatusPill();
 
     this.runInternalDomMutation(() => {
+      if (onlyOwned) {
+        for (const node of Array.from(this.ownedInjectedNodes)) {
+          this.ownedInjectedNodes.delete(node);
+          node.remove();
+        }
+
+        const wrappedBlocks = new Set<HTMLElement>();
+        for (const w of Array.from(this.ownedOrigWrappers)) {
+          this.ownedOrigWrappers.delete(w);
+          if (w.parentElement instanceof HTMLElement) {
+            wrappedBlocks.add(w.parentElement);
+          } else {
+            w.remove();
+          }
+        }
+        for (const blk of wrappedBlocks) {
+          this.unwrapOriginalContent(blk);
+        }
+
+        for (const blk of ownedBlocksSnapshot) {
+          this.mountedMeta.delete(blk);
+          if (!this.hasMountedTranslation(blk)) {
+            blk.removeAttribute('data-margin-translated');
+          }
+          this.restoreUnclampedForBlock(blk);
+        }
+        return;
+      }
+
       const injectedNodes = Array.from(
         this.doc.querySelectorAll('[data-margin-injected="true"]'),
       );
       for (const node of injectedNodes) {
         if (node.id === STYLE_ELEMENT_ID) continue;
+        this.ownedInjectedNodes.delete(node);
         node.remove();
       }
+      this.ownedInjectedNodes.clear();
 
       const wrappedBlocks = new Set<HTMLElement>();
       const wrappers = Array.from(
@@ -2211,6 +2545,7 @@ export class WebpageRenderer {
       for (const blk of wrappedBlocks) {
         this.unwrapOriginalContent(blk);
       }
+      this.ownedOrigWrappers.clear();
 
       const markedBlocks = Array.from(
         this.doc.querySelectorAll<HTMLElement>('[data-margin-translated="true"]'),
@@ -2348,8 +2683,9 @@ export class WebpageRenderer {
     });
   }
 
-  destroy(): void {
-    this.restorePage();
+  destroy(options: { contextInvalidated?: boolean } = {}): void {
+    const contextInvalidated = Boolean(options.contextInvalidated);
+    this.restorePage({ onlyOwnedNodes: contextInvalidated });
     this.clearStatusHideTimer();
     this.statusHost?.remove();
     this.statusHost = null;
@@ -2361,6 +2697,13 @@ export class WebpageRenderer {
     this.statusCloseBtn = null;
     this.fullscreenCleanup?.();
     this.fullscreenCleanup = null;
-    this.doc.getElementById(STYLE_ELEMENT_ID)?.remove();
+    if (
+      !contextInvalidated ||
+      !this.doc.querySelector(
+        '.margin-trans-root, .margin-trans-loading, .margin-inline-retry',
+      )
+    ) {
+      this.doc.getElementById(STYLE_ELEMENT_ID)?.remove();
+    }
   }
 }

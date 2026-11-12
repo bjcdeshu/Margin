@@ -1,3 +1,4 @@
+import { isExtensionContextValid } from '@shared/messaging';
 import type { HoverModifierKey, MarginConfig } from '@shared/types';
 import { findClosestParagraphBlock } from './dom-walker';
 import type { WebpageRenderer } from './renderer';
@@ -55,6 +56,7 @@ export class HoverTranslator {
     metaKey: false,
   };
   private comboTainted = false;
+  private hadRuntimeIdAtMount = false;
   private hoverTimer: ReturnType<typeof setTimeout> | null = null;
   private cleanupListeners: (() => void) | null = null;
 
@@ -67,9 +69,14 @@ export class HoverTranslator {
 
   mount(): void {
     if (this.cleanupListeners) return;
+    this.hadRuntimeIdAtMount = Boolean(globalThis.chrome?.runtime?.id);
     const win = this.doc.defaultView ?? window;
 
     const onPointerMove = (ev: PointerEvent | MouseEvent) => {
+      if (!isExtensionContextValid(this.hadRuntimeIdAtMount)) {
+        this.destroy();
+        return;
+      }
       this.hoveredTarget = ev.target;
       this.modifierState = {
         ctrlKey: ev.ctrlKey,
@@ -92,6 +99,10 @@ export class HoverTranslator {
     };
 
     const onKeyDown = (ev: KeyboardEvent) => {
+      if (!isExtensionContextValid(this.hadRuntimeIdAtMount)) {
+        this.destroy();
+        return;
+      }
       this.modifierState = {
         ctrlKey: ev.ctrlKey,
         altKey: ev.altKey,
@@ -113,6 +124,10 @@ export class HoverTranslator {
     };
 
     const onKeyUp = (ev: KeyboardEvent) => {
+      if (!isExtensionContextValid(this.hadRuntimeIdAtMount)) {
+        this.destroy();
+        return;
+      }
       this.modifierState = {
         ctrlKey: ev.ctrlKey,
         altKey: ev.altKey,
@@ -135,6 +150,10 @@ export class HoverTranslator {
     };
 
     const onWindowBlur = () => {
+      if (!isExtensionContextValid(this.hadRuntimeIdAtMount)) {
+        this.destroy();
+        return;
+      }
       this.modifierState = {
         ctrlKey: false,
         altKey: false,

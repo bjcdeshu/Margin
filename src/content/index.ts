@@ -1,4 +1,5 @@
 import { BRAND } from '@shared/brand';
+import { isExtensionContextValid } from '@shared/messaging';
 import { getMarginConfig, onMarginConfigChanged } from '@shared/storage';
 import type {
   AnyTabMessage,
@@ -56,6 +57,8 @@ export class MarginContentController {
 
   private manuallyEnabled = false;
   private mounted = false;
+  private hadRuntimeIdAtMount = false;
+  private spaFollowUpTimer: ReturnType<typeof setTimeout> | null = null;
   private unsubscribeStorage: (() => void) | null = null;
   private cleanupRuntimeMessage: (() => void) | null = null;
   private cleanupDomListeners: (() => void) | null = null;
@@ -130,6 +133,50 @@ export class MarginContentController {
     );
   }
 
+  private clearSpaFollowUpTimer(): void {
+    if (this.spaFollowUpTimer !== null) {
+      clearTimeout(this.spaFollowUpTimer);
+      this.spaFollowUpTimer = null;
+    }
+  }
+
+  dispatchRuntimeMessage(
+    message: unknown,
+    sendResponse: (response?: unknown) => void,
+  ): boolean | undefined {
+    if (!message || typeof message !== 'object') return undefined;
+    const cmd = message as Partial<AnyTabMessage>;
+    if (cmd.type === 'margin:cmd:get-page-state') {
+      sendResponse(this.renderer.getPageState());
+      return false;
+    }
+    if (cmd.type === 'margin:cmd:clear-page-cache') {
+      this.renderer.clearCache();
+      sendResponse({ ok: true });
+      return false;
+    }
+    if (
+      cmd.type === 'margin:cmd:toggle-page' ||
+      cmd.type === 'margin:cmd:translate-whole-page' ||
+      cmd.type === 'margin:cmd:toggle-mask' ||
+      cmd.type === 'margin:cmd:translate-input'
+    ) {
+      void this.handleCommand(
+        { type: cmd.type } as TabCommandMessage,
+        'cmd',
+      ).then((res) => {
+        sendResponse({
+          ok: true,
+          result: res,
+          state: this.renderer.getPageState(),
+        });
+      });
+      return true;
+    }
+    // Leave `margin:cmd:translate-context-image` untouched for `image-entry.ts`
+    return undefined;
+  }
+
   mount(): void {
     if (this.mounted) return;
     const currentUrl = this.getUrl();
@@ -138,6 +185,7 @@ export class MarginContentController {
     }
 
     this.mounted = true;
+    this.hadRuntimeIdAtMount = Boolean(globalThis.chrome?.runtime?.id);
 
     this.inputTranslator.mount();
     this.hoverTranslator.mount();
@@ -161,43 +209,15 @@ export class MarginContentController {
         message: unknown,
         _sender: chrome.runtime.MessageSender,
         sendResponse: (response?: unknown) => void,
-      ): boolean | undefined => {
-        if (!message || typeof message !== 'object') return undefined;
-        const cmd = message as Partial<AnyTabMessage>;
-        if (cmd.type === 'margin:cmd:get-page-state') {
-          sendResponse(this.renderer.getPageState());
-          return false;
-        }
-        if (cmd.type === 'margin:cmd:clear-page-cache') {
-          this.renderer.clearCache();
-          sendResponse({ ok: true });
-          return false;
-        }
-        if (
-          cmd.type === 'margin:cmd:toggle-page' ||
-          cmd.type === 'margin:cmd:translate-whole-page' ||
-          cmd.type === 'margin:cmd:toggle-mask' ||
-          cmd.type === 'margin:cmd:translate-input'
-        ) {
-          void this.handleCommand(
-            { type: cmd.type } as TabCommandMessage,
-            'cmd',
-          ).then((res) => {
-            sendResponse({
-              ok: true,
-              result: res,
-              state: this.renderer.getPageState(),
-            });
-          });
-          return true;
-        }
-        // Leave `margin:cmd:translate-context-image` untouched for `image-entry.ts`
-        return undefined;
-      };
+      ): boolean | undefined => this.dispatchRuntimeMessage(message, sendResponse);
 
       chrome.runtime.onMessage.addListener(runtimeListener);
       this.cleanupRuntimeMessage = () => {
-        chrome.runtime.onMessage.removeListener(runtimeListener);
+        try {
+          chrome.runtime.onMessage.removeListener(runtimeListener);
+        } catch {
+          // Ignore removal errors when extension context is invalidated
+        }
       };
     }
 
@@ -205,6 +225,11 @@ export class MarginContentController {
     const win = this.doc.defaultView ?? window;
 
     const onKeyDown = (ev: KeyboardEvent) => {
+      if (!isExtensionContextValid(this.hadRuntimeIdAtMount)) {
+        this.destroy({ contextInvalidated: true });
+        return;
+      }
+
       if (
         !ev.altKey ||
         ev.ctrlKey ||
@@ -235,26 +260,59 @@ export class MarginContentController {
     };
 
     const onUrlChange = () => {
+      if (!isExtensionContextValid(this.hadRuntimeIdAtMount)) {
+        this.destroy({ contextInvalidated: true });
+        return;
+      }
+
+      this.renderer.invalidatePageContextCache();
       this.renderer.updateConfig(this.config);
+
       if (
         !this.manuallyEnabled &&
-        this.renderer.isActive &&
+        this.renderer.isPageTranslationActive() &&
         this.isCurrentUrlExcluded()
       ) {
+        this.clearSpaFollowUpTimer();
         this.renderer.restorePage();
-      } else if (!this.renderer.isActive && this.shouldAutoTranslateCurrentUrl()) {
+        return;
+      }
+
+      if (
+        !this.renderer.isPageTranslationActive() &&
+        this.shouldAutoTranslateCurrentUrl()
+      ) {
         this.renderer.enablePageTranslation();
+      }
+
+      if (this.renderer.isPageTranslationActive()) {
+        this.renderer.rescanSubtree(this.doc.body);
+        this.clearSpaFollowUpTimer();
+        this.spaFollowUpTimer = setTimeout(() => {
+          this.spaFollowUpTimer = null;
+          if (!this.mounted || !this.renderer.isPageTranslationActive()) return;
+          if (!isExtensionContextValid(this.hadRuntimeIdAtMount)) {
+            this.destroy({ contextInvalidated: true });
+            return;
+          }
+          this.renderer.invalidatePageContextCache();
+          this.renderer.rescanSubtree(this.doc.body);
+        }, 250);
       }
     };
 
     win.addEventListener('keydown', onKeyDown, false);
     win.addEventListener('popstate', onUrlChange);
     win.addEventListener('hashchange', onUrlChange);
+    win.addEventListener('yt-navigate-finish', onUrlChange);
+    this.doc.addEventListener('yt-navigate-finish', onUrlChange);
 
     this.cleanupDomListeners = () => {
       win.removeEventListener('keydown', onKeyDown, false);
       win.removeEventListener('popstate', onUrlChange);
       win.removeEventListener('hashchange', onUrlChange);
+      win.removeEventListener('yt-navigate-finish', onUrlChange);
+      this.doc.removeEventListener('yt-navigate-finish', onUrlChange);
     };
   }
 
@@ -340,11 +398,20 @@ export class MarginContentController {
     }
   }
 
-  destroy(): void {
+  destroy(options: { contextInvalidated?: boolean } = {}): void {
     this.mounted = false;
-    this.unsubscribeStorage?.();
+    this.clearSpaFollowUpTimer();
+    try {
+      this.unsubscribeStorage?.();
+    } catch {
+      // Ignore storage unsubscribe errors when extension context is invalidated
+    }
     this.unsubscribeStorage = null;
-    this.cleanupRuntimeMessage?.();
+    try {
+      this.cleanupRuntimeMessage?.();
+    } catch {
+      // Ignore runtime message cleanup errors when extension context is invalidated
+    }
     this.cleanupRuntimeMessage = null;
     this.cleanupDomListeners?.();
     this.cleanupDomListeners = null;
@@ -352,15 +419,26 @@ export class MarginContentController {
     this.hoverTranslator.destroy();
     this.inputTranslator.destroy();
     this.selectionPopover.destroy();
-    this.renderer.destroy();
+    this.renderer.destroy(options);
+
+    const globalBag = globalThis as Record<string, unknown>;
+    const bootstrapKey = `__${BRAND.slug}_content_controller__`;
+    if (globalBag[bootstrapKey] === this) {
+      delete globalBag[bootstrapKey];
+    }
   }
 }
 
 export async function bootstrapMarginContentScript(): Promise<MarginContentController | null> {
   const globalBag = globalThis as Record<string, unknown>;
   const bootstrapKey = `__${BRAND.slug}_content_controller__`;
+  const bootstrapPromiseKey = `__${BRAND.slug}_content_bootstrap_promise__`;
+
   if (globalBag[bootstrapKey]) {
     return globalBag[bootstrapKey] as MarginContentController;
+  }
+  if (globalBag[bootstrapPromiseKey]) {
+    return globalBag[bootstrapPromiseKey] as Promise<MarginContentController | null>;
   }
 
   const currentUrl = typeof location !== 'undefined' ? location.href : '';
@@ -368,11 +446,82 @@ export async function bootstrapMarginContentScript(): Promise<MarginContentContr
     return null;
   }
 
-  const config = await getMarginConfig();
-  const controller = new MarginContentController({ config });
-  controller.mount();
-  globalBag[bootstrapKey] = controller;
-  return controller;
+  let initPromise!: Promise<MarginContentController | null>;
+  let earlyRuntimeListener:
+    | ((
+        message: unknown,
+        sender: chrome.runtime.MessageSender,
+        sendResponse: (response?: unknown) => void,
+      ) => boolean | undefined)
+    | null = null;
+
+  if (
+    typeof globalThis.chrome !== 'undefined' &&
+    globalThis.chrome?.runtime?.onMessage
+  ) {
+    earlyRuntimeListener = (
+      message: unknown,
+      _sender: chrome.runtime.MessageSender,
+      sendResponse: (response?: unknown) => void,
+    ): boolean | undefined => {
+      if (!message || typeof message !== 'object') return undefined;
+      const cmd = message as Partial<AnyTabMessage>;
+      if (
+        cmd.type !== 'margin:cmd:get-page-state' &&
+        cmd.type !== 'margin:cmd:clear-page-cache' &&
+        cmd.type !== 'margin:cmd:toggle-page' &&
+        cmd.type !== 'margin:cmd:translate-whole-page' &&
+        cmd.type !== 'margin:cmd:toggle-mask' &&
+        cmd.type !== 'margin:cmd:translate-input'
+      ) {
+        return undefined;
+      }
+
+      void initPromise
+        .then((ctrl) => {
+          if (!ctrl) {
+            sendResponse({ ok: false });
+            return;
+          }
+          ctrl.dispatchRuntimeMessage(message, sendResponse);
+        })
+        .catch(() => {
+          sendResponse({ ok: false });
+        });
+      return true;
+    };
+    chrome.runtime.onMessage.addListener(earlyRuntimeListener);
+  }
+
+  initPromise = (async () => {
+    try {
+      const configPromise = getMarginConfig();
+      if (typeof document !== 'undefined' && document.readyState === 'loading') {
+        await new Promise<void>((resolve) => {
+          document.addEventListener('DOMContentLoaded', () => resolve(), {
+            once: true,
+          });
+        });
+      }
+      const config = await configPromise;
+      const controller = new MarginContentController({ config });
+      controller.mount();
+      globalBag[bootstrapKey] = controller;
+      return controller;
+    } finally {
+      delete globalBag[bootstrapPromiseKey];
+      if (earlyRuntimeListener && globalThis.chrome?.runtime?.onMessage) {
+        try {
+          chrome.runtime.onMessage.removeListener(earlyRuntimeListener);
+        } catch {
+          // Ignore removal errors when extension context is invalidated
+        }
+      }
+    }
+  })();
+
+  globalBag[bootstrapPromiseKey] = initPromise;
+  return initPromise;
 }
 
 // Auto-bootstrap when injected as an MV3 Chrome extension content script
@@ -381,15 +530,5 @@ if (
   Boolean(globalThis.chrome?.runtime?.id) &&
   typeof document !== 'undefined'
 ) {
-  if (document.readyState === 'loading') {
-    document.addEventListener(
-      'DOMContentLoaded',
-      () => {
-        void bootstrapMarginContentScript();
-      },
-      { once: true },
-    );
-  } else {
-    void bootstrapMarginContentScript();
-  }
+  void bootstrapMarginContentScript();
 }

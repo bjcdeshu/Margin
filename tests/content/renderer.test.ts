@@ -10,7 +10,10 @@ import type {
   TranslateBatchResponse,
 } from '@shared/types';
 import { HoverTranslator } from '../../src/content/hover-translate';
-import { MarginContentController } from '../../src/content/index';
+import {
+  MarginContentController,
+  bootstrapMarginContentScript,
+} from '../../src/content/index';
 import {
   LruTranslationCache,
   WEBPAGE_INJECTED_CSS,
@@ -19,6 +22,8 @@ import {
   packIntoBatches,
   packIntoProgressiveBatches,
 } from '../../src/content/renderer';
+import { initMarginImageTranslator } from '../../src/media/image-entry';
+import { createSubtitleIsolatedController } from '../../src/youtube/isolated-entry';
 
 function makeMockDiagnostic(): DiagnosticSnapshot {
   return {
@@ -719,5 +724,538 @@ describe('renderer & content orchestrator: themes, reversible target-only, retry
 
     renderer.destroy();
     expect(document.body.innerHTML).toBe(preBodyHtml);
+  });
+
+  it('discovers ancestor <h1.ytd-watch-metadata> when <yt-formatted-string> hydrates from is-empty, replaces stale Video 1 -> Video 2 singleton <h1> translations across characterData & childList, and handles yt-navigate-finish', async () => {
+    const config = createDefaultMarginConfig();
+    config.webpage.displayMode = 'bilingual';
+
+    document.body.innerHTML = `
+      <ytd-watch-metadata>
+        <div id="above-the-fold">
+          <div id="title">
+            <h1 id="yt-watch-h1" class="style-scope ytd-watch-metadata" style="max-height: 5.6rem; overflow: hidden; display: flow-root; -webkit-line-clamp: 2;">
+              <yt-formatted-string id="yt-watch-fmt" force-default-style="" class="style-scope ytd-watch-metadata" is-empty="" style="display: none;"></yt-formatted-string>
+            </h1>
+          </div>
+        </div>
+      </ytd-watch-metadata>
+    `;
+
+    const ytH1 = document.getElementById('yt-watch-h1')!;
+    const ytFmt = document.getElementById('yt-watch-fmt')!;
+    let currentUrl = 'https://www.youtube.com/watch?v=AOJwkm3yixU';
+    const seenTexts: string[] = [];
+
+    const controller = new MarginContentController({
+      config,
+      getUrl: () => currentUrl,
+      transport: async (req) => {
+        for (const it of req.items) {
+          seenTexts.push(it.text);
+        }
+        return {
+          ok: true,
+          requestId: req.requestId,
+          providerId: 'google-free',
+          model: 'gtx',
+          items: req.items.map((it) => {
+            if (it.text.includes('Yubi')) {
+              return { id: it.id, trans: '译文V1：Yubi 21号剑士傀儡无伤' };
+            }
+            if (it.text.includes('Shadow of the Erdtree')) {
+              return { id: it.id, trans: '译文V2：黄金树幽影无伤攻略' };
+            }
+            if (it.text.includes('Sekiro')) {
+              return { id: it.id, trans: '译文V3：只狼心中的一心无伤' };
+            }
+            return { id: it.id, trans: `译文：${it.text}` };
+          }),
+          diagnostic: makeMockDiagnostic(),
+        };
+      },
+    });
+    controller.mount();
+
+    // 1. Page translation enabled BEFORE Polymer hydrates Watch H1 (is-empty="", empty text)
+    await controller.handleCommand({ type: 'margin:cmd:toggle-page' }, 'cmd');
+    expect(controller.renderer.isPageTranslationActive()).toBe(true);
+    expect(ytH1.querySelector('.margin-trans-root')).toBeNull();
+
+    // 2. Polymer hydrates Video 1 title inside <yt-formatted-string> and removes `is-empty`
+    ytFmt.removeAttribute('is-empty');
+    ytFmt.style.display = '';
+    const v1TextNode = document.createTextNode(
+      'Yubi, No. 21 Swordfighter Puppet No Damage – Phantom Blade Zero',
+    );
+    ytFmt.appendChild(v1TextNode);
+
+    await vi.waitFor(() => {
+      expect(ytH1.querySelector('.margin-trans-root')?.textContent).toBe(
+        '译文V1：Yubi 21号剑士傀儡无伤',
+      );
+    });
+    // Mounted directly on <h1> outside <yt-formatted-string>, and max-height 5.6rem unclamped!
+    expect(ytFmt.querySelector('.margin-trans-root')).toBeNull();
+    expect(ytH1.getAttribute('data-margin-unclamped')).toBe('true');
+    expect(ytH1.style.getPropertyValue('max-height')).toBe('none');
+
+    // 3. SPA Video 1 -> Video 2 via characterData mutation on singleton <h1>'s #text node
+    currentUrl = 'https://www.youtube.com/watch?v=video2';
+    v1TextNode.data = 'Elden Ring Shadow of the Erdtree Boss Guide';
+
+    await vi.waitFor(() => {
+      expect(ytH1.querySelector('.margin-trans-root')?.textContent).toBe(
+        '译文V2：黄金树幽影无伤攻略',
+      );
+    });
+    expect(ytH1.querySelectorAll('.margin-trans-root')).toHaveLength(1);
+
+    // 4. SPA Video 2 -> Video 3 via childList #text replacement inside <yt-formatted-string>
+    currentUrl = 'https://www.youtube.com/watch?v=video3';
+    ytFmt.replaceChildren(
+      document.createTextNode('Sekiro Inner Isshin No Hit'),
+    );
+
+    await vi.waitFor(() => {
+      expect(ytH1.querySelector('.margin-trans-root')?.textContent).toBe(
+        '译文V3：只狼心中的一心无伤',
+      );
+    });
+    expect(ytH1.querySelectorAll('.margin-trans-root')).toHaveLength(1);
+
+    // 5. If Polymer externally wipes `.margin-trans-root` and fires `yt-navigate-finish`, singleton <h1> is NOT locked out by observedBlocks
+    controller.renderer.clearCache();
+    ytH1.querySelector('.margin-trans-root')?.remove();
+    expect(ytH1.querySelector('.margin-trans-root')).toBeNull();
+
+    document.dispatchEvent(new Event('yt-navigate-finish', { bubbles: true }));
+    await vi.waitFor(() => {
+      expect(ytH1.querySelector('.margin-trans-root')?.textContent).toBe(
+        '译文V3：只狼心中的一心无伤',
+      );
+    });
+    expect(seenTexts.length).toBeGreaterThanOrEqual(4);
+
+    controller.destroy();
+  });
+
+  it('translates late-hydrated X.com tweetText <span> children and refreshes recycled virtual-scroll cells in place', async () => {
+    const config = createDefaultMarginConfig();
+
+    document.body.innerHTML = `
+      <section>
+        <div data-testid="cellInnerDiv">
+          <article>
+            <div id="tweet-late" data-testid="tweetText"></div>
+          </article>
+        </div>
+        <div data-testid="cellInnerDiv">
+          <article>
+            <div id="tweet-recycled" data-testid="tweetText">
+              <span id="recycled-span">Initial virtualized timeline post</span>
+            </div>
+          </article>
+        </div>
+      </section>
+    `;
+
+    const lateTweet = document.getElementById('tweet-late')!;
+    const recycledTweet = document.getElementById('tweet-recycled')!;
+    const recycledSpan = document.getElementById('recycled-span')!;
+
+    const renderer = new WebpageRenderer({
+      config,
+      getUrl: () => 'https://x.com/home',
+      transport: async (req) => ({
+        ok: true,
+        requestId: req.requestId,
+        providerId: 'google-free',
+        model: 'gtx',
+        items: req.items.map((it) => ({
+          id: it.id,
+          trans: `推文译文：${it.text}`,
+        })),
+        diagnostic: makeMockDiagnostic(),
+      }),
+    });
+
+    renderer.enablePageTranslation();
+    await vi.waitFor(() => {
+      expect(recycledTweet.querySelector('.margin-trans-root')?.textContent).toBe(
+        '推文译文：Initial virtualized timeline post',
+      );
+    });
+    expect(lateTweet.querySelector('.margin-trans-root')).toBeNull();
+
+    // React hydrates <span> inside empty #tweet-late AND recycles #tweet-recycled in place
+    const hydratedSpan = document.createElement('span');
+    hydratedSpan.textContent = 'Hydrated suspense tweet content';
+    lateTweet.appendChild(hydratedSpan);
+    recycledSpan.textContent = 'Brand new recycled cell tweet';
+
+    await vi.waitFor(() => {
+      expect(lateTweet.querySelector('.margin-trans-root')?.textContent).toBe(
+        '推文译文：Hydrated suspense tweet content',
+      );
+      expect(recycledTweet.querySelector('.margin-trans-root')?.textContent).toBe(
+        '推文译文：Brand new recycled cell tweet',
+      );
+    });
+
+    renderer.destroy();
+  });
+
+  it('self-destroys zombie listeners on invalidated MV3 extension context without preventDefault, and queues early onMessage commands during bootstrap', async () => {
+    const origChrome = (globalThis as Record<string, unknown>).chrome;
+    const globalBag = globalThis as Record<string, unknown>;
+    const bootstrapKey = '__margin_content_controller__';
+
+    type RuntimeMsgListener = (
+      msg: unknown,
+      sender: chrome.runtime.MessageSender,
+      sendResponse: (res?: unknown) => void,
+    ) => boolean | undefined;
+
+    const listeners = new Set<RuntimeMsgListener>();
+    let runtimeId: string | undefined = 'gdkbmfndollgfmblnielgfdpeoabekbf';
+    let releaseConfig!: () => void;
+    const configGate = new Promise<void>((r) => {
+      releaseConfig = r;
+    });
+
+    (globalThis as Record<string, unknown>).chrome = {
+      runtime: {
+        get id() {
+          return runtimeId;
+        },
+        onMessage: {
+          addListener: (fn: RuntimeMsgListener) => listeners.add(fn),
+          removeListener: (fn: RuntimeMsgListener) => listeners.delete(fn),
+        },
+      },
+      storage: {
+        local: {
+          get: async () => {
+            await configGate;
+            return {};
+          },
+          set: async () => {},
+        },
+      },
+    };
+
+    try {
+      const p = document.createElement('p');
+      p.textContent = 'Paragraph on pre-existing tab.';
+      document.body.appendChild(p);
+
+      // 1. Early chrome.runtime.onMessage registration BEFORE getMarginConfig() resolves
+      const bootPromise = bootstrapMarginContentScript();
+      expect(listeners.size).toBe(1);
+
+      let earlyResponse: unknown;
+      const earlyDone = new Promise<void>((resolve) => {
+        for (const fn of Array.from(listeners)) {
+          fn(
+            { type: 'margin:cmd:get-page-state' },
+            {} as chrome.runtime.MessageSender,
+            (res) => {
+              earlyResponse = res;
+              resolve();
+            },
+          );
+        }
+      });
+
+      releaseConfig();
+      const booted = await bootPromise;
+      expect(booted).not.toBeNull();
+      await earlyDone;
+      expect((earlyResponse as { active: boolean }).active).toBe(false);
+      booted?.destroy();
+      delete globalBag[bootstrapKey];
+
+      // 2. Orphaned content script self-cleans on extension reload (`chrome.runtime.id` -> undefined)
+      let zombieTransportCalls = 0;
+      const zombieController = new MarginContentController({
+        config: createDefaultMarginConfig(),
+        getUrl: () => 'https://x.com/home',
+        transport: async () => {
+          zombieTransportCalls += 1;
+          throw new Error('Extension context invalidated.');
+        },
+      });
+      zombieController.mount();
+
+      // Simulate extension reload invalidating the old isolated world
+      runtimeId = undefined;
+
+      const altAEvent = new KeyboardEvent('keydown', {
+        key: 'a',
+        code: 'KeyA',
+        altKey: true,
+        bubbles: true,
+        cancelable: true,
+      });
+      window.dispatchEvent(altAEvent);
+
+      expect(altAEvent.defaultPrevented).toBe(false);
+      expect(zombieTransportCalls).toBe(0);
+      expect(document.querySelectorAll('.margin-inline-retry')).toHaveLength(0);
+    } finally {
+      delete globalBag[bootstrapKey];
+      (globalThis as Record<string, unknown>).chrome = origChrome;
+    }
+  });
+
+  it('does not loop failed batches via MutationObserver when mounting .margin-inline-retry, while still allowing manual retry or text mutation recovery', async () => {
+    const config = createDefaultMarginConfig();
+    document.body.innerHTML = `
+      <main>
+        <p id="fail-target">First attempt fails cleanly without looping.</p>
+        <p id="sibling-target">Unrelated sibling block.</p>
+      </main>
+    `;
+    const failTarget = document.getElementById('fail-target')!;
+
+    let shouldFail = true;
+    let transportCalls = 0;
+
+    const renderer = new WebpageRenderer({
+      config,
+      flushDelayMs: 10,
+      transport: async (req) => {
+        transportCalls += 1;
+        if (shouldFail) {
+          throw new Error('Simulated HTTP 401 unauthorized');
+        }
+        return {
+          ok: true,
+          requestId: req.requestId,
+          providerId: 'google-free',
+          model: 'gtx',
+          items: req.items.map((it) => ({
+            id: it.id,
+            trans: `恢复译文：${it.text}`,
+          })),
+          diagnostic: makeMockDiagnostic(),
+        };
+      },
+    });
+
+    renderer.enablePageTranslation();
+
+    await vi.waitFor(() => {
+      expect(failTarget.querySelector('.margin-inline-retry')).not.toBeNull();
+    });
+    expect(transportCalls).toBe(1);
+
+    // Wait > 220ms (past 80ms SPA debounce + flushDelayMs) and trigger an unrelated DOM mutation
+    const extraNote = document.createElement('span');
+    extraNote.textContent = ' — unrelated update';
+    document.getElementById('sibling-target')!.appendChild(extraNote);
+
+    await new Promise((r) => setTimeout(r, 240));
+    // sibling-target mutated so it may re-translate once if shouldFail were false,
+    // wait: sibling-target is also in failedBlockTasks, and now its source text changed!
+    // Verify fail-target NEVER re-triggered while its text stayed unchanged:
+    expect(failTarget.querySelector('.margin-inline-retry')).not.toBeNull();
+
+    // Reset counter with no external mutations and verify 0 spontaneous background retries over 240ms
+    const callsAfterSettle = transportCalls;
+    await new Promise((r) => setTimeout(r, 240));
+    expect(transportCalls).toBe(callsAfterSettle);
+
+    // Clicking .margin-inline-retry when backend recovers translates cleanly
+    shouldFail = false;
+    const retryBtn = failTarget.querySelector<HTMLButtonElement>(
+      '.margin-inline-retry',
+    )!;
+    retryBtn.click();
+
+    await vi.waitFor(() => {
+      expect(failTarget.querySelector('.margin-trans-root')?.textContent).toBe(
+        '恢复译文：First attempt fails cleanly without looping.',
+      );
+    });
+    expect(failTarget.querySelector('.margin-inline-retry')).toBeNull();
+
+    // Wait another 200ms to confirm mounting .margin-trans-root caused 0 extra MutationObserver batches
+    const callsAfterRecovery = transportCalls;
+    await new Promise((r) => setTimeout(r, 200));
+    expect(transportCalls).toBe(callsAfterRecovery);
+
+    renderer.destroy();
+  });
+
+  it('re-translates bare #text characterData mutations inside target-only wrapper without internal feedback loops', async () => {
+    const config = createDefaultMarginConfig();
+    config.webpage.displayMode = 'target-only';
+
+    document.body.innerHTML = `
+      <article>
+        <p id="target-only-bare">Initial bare headline text</p>
+      </article>
+    `;
+    const p = document.getElementById('target-only-bare')!;
+    let transportCalls = 0;
+
+    const renderer = new WebpageRenderer({
+      config,
+      flushDelayMs: 10,
+      transport: async (req) => {
+        transportCalls += 1;
+        return {
+          ok: true,
+          requestId: req.requestId,
+          providerId: 'google-free',
+          model: 'gtx',
+          items: req.items.map((it) => ({
+            id: it.id,
+            trans: `纯译文：${it.text}`,
+          })),
+          diagnostic: makeMockDiagnostic(),
+        };
+      },
+    });
+
+    renderer.enablePageTranslation();
+
+    await vi.waitFor(() => {
+      expect(p.querySelector('.margin-trans-root')?.textContent).toBe(
+        '纯译文：Initial bare headline text',
+      );
+    });
+    expect(transportCalls).toBe(1);
+
+    const origWrap = p.querySelector('[data-margin-orig-wrap="true"]')!;
+    expect(origWrap).not.toBeNull();
+    const bareTextNode = origWrap.firstChild as Text;
+    expect(bareTextNode.nodeType).toBe(Node.TEXT_NODE);
+
+    // Mutate characterData directly on the wrapped bare #text node
+    bareTextNode.data = 'Updated SPA bare headline text';
+
+    await vi.waitFor(() => {
+      expect(p.querySelector('.margin-trans-root')?.textContent).toBe(
+        '纯译文：Updated SPA bare headline text',
+      );
+    });
+    expect(transportCalls).toBe(2);
+
+    // Confirm zero internal MutationObserver feedback loops after re-wrapping target-only content
+    await new Promise((r) => setTimeout(r, 220));
+    expect(transportCalls).toBe(2);
+
+    renderer.destroy();
+  });
+
+  it('survives Chrome 136 reload invalidation where both chrome.runtime.id and chrome.storage become undefined across content, image, and subtitle controllers', async () => {
+    const origChrome = (globalThis as Record<string, unknown>).chrome;
+    const globalBag = globalThis as Record<string, unknown>;
+    const imageBootKey = '__margin_image_translator_booted__';
+
+    let invalidated = false;
+    const storageListeners = new Set<(...args: unknown[]) => void>();
+
+    (globalThis as Record<string, unknown>).chrome = {
+      get runtime() {
+        return {
+          get id() {
+            return invalidated ? undefined : 'gdkbmfndollgfmblnielgfdpeoabekbf';
+          },
+          onMessage: {
+            addListener: () => {},
+            removeListener: () => {},
+          },
+        };
+      },
+      get storage() {
+        if (invalidated) {
+          return undefined;
+        }
+        return {
+          local: {
+            get: async () => ({}),
+            set: async () => {},
+          },
+          onChanged: {
+            addListener: (fn: (...args: unknown[]) => void) =>
+              storageListeners.add(fn),
+            removeListener: (fn: (...args: unknown[]) => void) =>
+              storageListeners.delete(fn),
+          },
+        };
+      },
+    };
+
+    try {
+      document.body.innerHTML = `
+        <main>
+          <p id="shared-para">Shared DOM paragraph across isolated worlds.</p>
+          <img id="hero-img" src="https://example.com/comic.png" width="400" height="300" />
+        </main>
+      `;
+      const sharedPara = document.getElementById('shared-para')!;
+
+      // Mount World 1 controllers while chrome.runtime.id and chrome.storage.onChanged are live
+      const oldController = new MarginContentController({
+        config: createDefaultMarginConfig(),
+        getUrl: () => 'https://www.youtube.com/watch?v=AOJwkm3yixU',
+      });
+      oldController.mount();
+
+      delete globalBag[imageBootKey];
+      initMarginImageTranslator();
+      expect(document.documentElement.dataset.marginImageReady).toBeUndefined();
+      expect(globalBag[imageBootKey]).toBe(true);
+
+      const oldSubController = createSubtitleIsolatedController();
+      await oldSubController.start();
+      expect(storageListeners.size).toBeGreaterThanOrEqual(3);
+
+      // Simulate World 2 already mounting a fresh .margin-trans-root in the shared DOM after reload
+      const newWorldTrans = document.createElement('span');
+      newWorldTrans.className = 'margin-trans-root';
+      newWorldTrans.setAttribute('data-margin-injected', 'true');
+      newWorldTrans.textContent = '新隔离世界译文';
+      sharedPara.appendChild(newWorldTrans);
+      sharedPara.setAttribute('data-margin-translated', 'true');
+
+      // Chrome 136 extension reload invalidates World 1: chrome.runtime.id = undefined AND chrome.storage = undefined!
+      invalidated = true;
+
+      // 1. Alt+A in invalidated World 1 must NOT throw TypeError and must NOT delete World 2's translation
+      expect(() => {
+        window.dispatchEvent(
+          new KeyboardEvent('keydown', {
+            key: 'a',
+            code: 'KeyA',
+            altKey: true,
+            bubbles: true,
+            cancelable: true,
+          }),
+        );
+      }).not.toThrow();
+      expect(sharedPara.querySelector('.margin-trans-root')?.textContent).toBe(
+        '新隔离世界译文',
+      );
+
+      // 2. pointerover in invalidated World 1 image translator must self-clean without throwing
+      expect(() => {
+        document
+          .getElementById('hero-img')!
+          .dispatchEvent(new Event('pointerover', { bubbles: true }));
+      }).not.toThrow();
+      expect(globalBag[imageBootKey]).toBeUndefined();
+
+      // 3. 100ms playhead poll in invalidated World 1 subtitle controller must self-clean without throwing
+      await new Promise((r) => setTimeout(r, 150));
+      expect(() => oldSubController.destroy()).not.toThrow();
+    } finally {
+      delete globalBag[imageBootKey];
+      (globalThis as Record<string, unknown>).chrome = origChrome;
+    }
   });
 });

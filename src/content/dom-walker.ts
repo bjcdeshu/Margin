@@ -158,6 +158,8 @@ const EXCLUDED_ELEMENT_IDS: ReadonlySet<string> = new Set([
   'metadata-line',
   'info-strings',
   'author-text',
+  'country-code',
+  'published-time-text',
 ]);
 
 const EXCLUDED_ELEMENT_CLASSES: ReadonlySet<string> = new Set([
@@ -173,13 +175,13 @@ const EXCLUDED_ELEMENT_CLASSES: ReadonlySet<string> = new Set([
   'cm-editor',
   'monaco-editor',
   'ace_editor',
+  'x-middot-group',
   'ytp-caption-window-container',
   'ytp-chrome-controls',
-  'ytp-chrome-top',
+  'ytp-chrome-top-buttons',
 ]);
 
 const EXCLUDED_ARIA_ROLES: ReadonlySet<string> = new Set([
-  'group',
   'navigation',
   'menubar',
   'tablist',
@@ -200,22 +202,111 @@ const EXCLUDED_ARIA_ROLES: ReadonlySet<string> = new Set([
   'tooltip',
 ]);
 
-const EDITABLE_TEXT_CONTROL_SELECTOR = [
+const COMPOSER_LANDMARK_TAGS: ReadonlySet<string> = new Set([
+  'MAIN',
+  'ARTICLE',
+  'SECTION',
+  'ASIDE',
+  'HEADER',
+  'FOOTER',
+  'NAV',
+  'TABLE',
+  'UL',
+  'OL',
+  'FORM',
+]);
+
+const COMPOSER_OVERLAY_DISQUALIFYING_DESCENDANTS_SELECTOR = [
+  'article',
+  'section',
+  'main',
+  'aside',
+  'nav',
+  'header',
+  'footer',
+  'p',
+  'h1',
+  'h2',
+  'h3',
+  'h4',
+  'h5',
+  'h6',
+  'blockquote',
+  'input',
+  'textarea',
+  'button',
+  'a',
   '[contenteditable="true"]',
   '[contenteditable=""]',
   '[contenteditable="plaintext-only"]',
   '[role="textbox"]',
-  '[role="searchbox"]',
-  '[role="combobox"]',
-  'textarea',
-  'input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"])',
+  '[role="button"]',
+  '[role="link"]',
+  '[data-testid="tweetText"]',
+  '[data-testid="cellInnerDiv"]',
+  '[data-testid="primaryColumn"]',
+  '[data-testid="sidebarColumn"]',
+  'ytd-watch-metadata',
+  'ytd-rich-item-renderer',
+  'yt-lockup-view-model',
 ].join(', ');
+
+const COMPOSER_ANCESTOR_DISQUALIFYING_SELECTOR = [
+  'article',
+  'section',
+  '[data-testid="tweetText"]',
+  '[data-testid="cellInnerDiv"]',
+].join(', ');
+
+const RICH_TEXT_COMPOSER_SURFACE_SELECTOR = [
+  '[contenteditable="true"]',
+  '[contenteditable=""]',
+  '[contenteditable="plaintext-only"]',
+  '[role="textbox"]',
+  'textarea',
+].join(', ');
+
+const INPUT_PLACEHOLDER_CLASS_RE =
+  /(?:^|[-_])(?:editor|input|textarea|composer|draft|slate|lexical|tiptap)[-_]?placeholder(?:$|[-_])/i;
+
+const PLACEHOLDER_CLASS_STRUCTURAL_DESCENDANTS_SELECTOR =
+  'h1, h2, h3, h4, h5, h6, p, article, section, a, button, ytd-watch-metadata';
+
+const UI_BUTTON_STRUCTURAL_DESCENDANTS_SELECTOR = [
+  'article',
+  'section',
+  'p',
+  'h1',
+  'h2',
+  'h3',
+  'h4',
+  'h5',
+  'h6',
+  'blockquote',
+  '[data-testid="tweetText"]',
+  '[data-testid="trend"]',
+  '[data-testid="card.wrapper"]',
+  '[data-testid="news_sidebar"]',
+].join(', ');
+
+const GROUP_ROLE_CONTENT_DESCENDANTS_SELECTOR =
+  'article, section, blockquote, [data-testid="tweetText"]';
 
 const STANDALONE_INLINE_CANDIDATE_TAGS: ReadonlySet<string> = new Set([
   'SPAN',
   'LABEL',
   'A',
   'YT-FORMATTED-STRING',
+  'YT-ATTRIBUTED-STRING',
+]);
+
+const HEADING_TAGS: ReadonlySet<string> = new Set([
+  'H1',
+  'H2',
+  'H3',
+  'H4',
+  'H5',
+  'H6',
 ]);
 
 const CJK_OR_KANA_HANGUL_RE =
@@ -374,6 +465,53 @@ function hasPointerEventsNone(el: Element): boolean {
   return false;
 }
 
+function countCjkOrKanaHangulChars(text: string): number {
+  let count = 0;
+  for (const ch of text) {
+    if (CJK_OR_KANA_HANGUL_RE.test(ch)) {
+      count += 1;
+    }
+  }
+  return count;
+}
+
+function hasExplicitInputPlaceholderClass(el: Element): boolean {
+  const classList = el.classList;
+  if (!classList || classList.length === 0) {
+    return false;
+  }
+
+  let matchedToken = false;
+  for (let i = 0; i < classList.length; i++) {
+    const token = classList[i];
+    if (!token || token.includes(':')) {
+      continue;
+    }
+    if (token === 'is-editor-empty') {
+      matchedToken = true;
+      break;
+    }
+    if (!/placeholder/i.test(token)) {
+      continue;
+    }
+    const kebabToken = token.replace(/([a-z0-9])([A-Z])/g, '$1-$2');
+    if (INPUT_PLACEHOLDER_CLASS_RE.test(kebabToken)) {
+      matchedToken = true;
+      break;
+    }
+  }
+
+  if (!matchedToken) {
+    return false;
+  }
+
+  if (el.children.length > 2 || hasNestedBlockChildren(el)) {
+    return false;
+  }
+
+  return el.querySelector(PLACEHOLDER_CLASS_STRUCTURAL_DESCENDANTS_SELECTOR) === null;
+}
+
 /**
  * Detects rich-text composer placeholder overlays (e.g. Draft.js, Lexical, Slate,
  * or obfuscated React overlays using `pointer-events: none` next to a `[role="textbox"]`
@@ -382,7 +520,21 @@ function hasPointerEventsNone(el: Element): boolean {
 function isComposerPlaceholderOverlay(el: Element): boolean {
   const parent = el.parentElement;
   if (!parent) return false;
-  if (!hasPointerEventsNone(el) && !hasPointerEventsNone(parent)) {
+  if (!hasPointerEventsNone(el)) {
+    return false;
+  }
+
+  const elTag = el.tagName.toUpperCase();
+  if (COMPOSER_LANDMARK_TAGS.has(elTag)) {
+    return false;
+  }
+  if (el.children.length > 2) {
+    return false;
+  }
+  if ((el.textContent?.trim().length ?? 0) > 120) {
+    return false;
+  }
+  if (el.querySelector(COMPOSER_OVERLAY_DISQUALIFYING_DESCENDANTS_SELECTOR) !== null) {
     return false;
   }
 
@@ -390,34 +542,36 @@ function isComposerPlaceholderOverlay(el: Element): boolean {
   const docEl = el.ownerDocument?.documentElement;
   let anc: Element | null = parent;
 
-  for (let depth = 0; depth < 3 && anc; depth++) {
+  for (let depth = 0; depth <= 1 && anc; depth++) {
     if (anc === body || anc === docEl) break;
     const ancTag = anc.tagName.toUpperCase();
-    if (
-      ancTag === 'MAIN' ||
-      ancTag === 'ARTICLE' ||
-      ancTag === 'SECTION' ||
-      ancTag === 'TABLE' ||
-      ancTag === 'UL' ||
-      ancTag === 'OL'
-    ) {
+    if (COMPOSER_LANDMARK_TAGS.has(ancTag)) {
       break;
     }
-    if (anc.children.length > 8) {
+    if (anc.children.length > 4) {
       break;
     }
-    if (isContentEditableNode(anc)) {
+    if (anc.querySelector(COMPOSER_ANCESTOR_DISQUALIFYING_SELECTOR) !== null) {
+      break;
+    }
+    if (anc.isConnected && typeof anc.getBoundingClientRect === 'function') {
+      try {
+        const rect = anc.getBoundingClientRect();
+        if (rect.height > 0 && rect.height > 180) {
+          break;
+        }
+      } catch {
+        // Ignore geometry errors on detached/foreign documents
+      }
+    }
+    if (isContentEditableNode(anc) || ancTag === 'TEXTAREA') {
       return true;
     }
     const ancRole = anc.getAttribute('role')?.trim().toLowerCase();
-    if (
-      ancRole === 'textbox' ||
-      ancRole === 'searchbox' ||
-      ancRole === 'combobox'
-    ) {
+    if (ancRole === 'textbox') {
       return true;
     }
-    if (anc.querySelector(EDITABLE_TEXT_CONTROL_SELECTOR) !== null) {
+    if (anc.querySelector(RICH_TEXT_COMPOSER_SURFACE_SELECTOR) !== null) {
       return true;
     }
     anc = anc.parentElement;
@@ -431,19 +585,25 @@ function isUiButtonRoleElement(
   options: { insideParagraph?: boolean },
 ): boolean {
   const tag = el.tagName.toUpperCase();
-  if (options.insideParagraph && tag === 'A') {
+  if (options.insideParagraph && tag !== 'BUTTON') {
     return false;
   }
-  // Preserve multi-block clickable card containers (e.g. React Native Web Pressable news cards)
-  if (
-    el.querySelector(
-      'article, section, p, h1, h2, h3, h4, h5, h6, blockquote, [data-testid="tweetText"], [data-testid="trend"]',
-    )
-  ) {
+  // Preserve multi-block clickable card containers (e.g. React Native Web Pressable news/quote cards)
+  if (el.querySelector(UI_BUTTON_STRUCTURAL_DESCENDANTS_SELECTOR) !== null) {
     return false;
   }
-  if (hasNestedBlockChildren(el) && (el.textContent?.trim().length ?? 0) > 36) {
+  const normalizedText = (el.textContent ?? '').replace(/\s+/g, ' ').trim();
+  if (hasNestedBlockChildren(el) && normalizedText.length > 12) {
     return false;
+  }
+  if (tag !== 'BUTTON') {
+    const leafProse = collectTranslatableProse(el).replace(/\s+/g, ' ').trim();
+    if (
+      (leafProse.length > 24 && /\s/.test(leafProse)) ||
+      countCjkOrKanaHangulChars(leafProse) >= 10
+    ) {
+      return false;
+    }
   }
   return true;
 }
@@ -513,18 +673,17 @@ export function isExcludedElement(
     }
   }
 
-  const rawClassAttr = el.getAttribute('class');
-  if (
-    rawClassAttr &&
-    /placeholder/i.test(rawClassAttr) &&
-    !el.querySelector('article, section, table, blockquote')
-  ) {
+  if (hasExplicitInputPlaceholderClass(el)) {
     return true;
   }
 
   const role = el.getAttribute('role')?.trim().toLowerCase();
   if (role) {
-    if (EXCLUDED_ARIA_ROLES.has(role)) {
+    if (role === 'group') {
+      if (el.querySelector(GROUP_ROLE_CONTENT_DESCENDANTS_SELECTOR) === null) {
+        return true;
+      }
+    } else if (EXCLUDED_ARIA_ROLES.has(role)) {
       return true;
     }
     if (role === 'button' && isUiButtonRoleElement(el, options)) {
@@ -662,7 +821,7 @@ export function collectTranslatableProse(el: Element): string {
       if (BLOCK_BOUNDARY_TAGS.has(tag)) {
         return;
       }
-      if (isExcludedElement(elem, { insideParagraph: false })) {
+      if (isExcludedElement(elem, { insideParagraph: true })) {
         return;
       }
     }
@@ -733,9 +892,16 @@ function hasDirectBareNonWhitespaceText(el: Element): boolean {
   return false;
 }
 
-function countDirectInlineCandidateChildren(el: Element): number {
+interface DirectInlineChildSummary {
+  nonMarginElementCount: number;
+  inlineProseChildren: Element[];
+}
+
+function inspectDirectInlineChildren(el: Element): DirectInlineChildSummary {
   const sourceContainer = getBlockSourceContainer(el);
-  let count = 0;
+  let nonMarginElementCount = 0;
+  const inlineProseChildren: Element[] = [];
+
   for (let i = 0; i < sourceContainer.children.length; i++) {
     const child = sourceContainer.children[i];
     if (
@@ -745,15 +911,48 @@ function countDirectInlineCandidateChildren(el: Element): number {
     ) {
       continue;
     }
-    if (isExcludedElement(child) || isAtomicInlineElement(child, { insideParagraph: false })) {
+    nonMarginElementCount += 1;
+
+    if (
+      isExcludedElement(child) ||
+      isAtomicInlineElement(child, { insideParagraph: false })
+    ) {
       continue;
     }
     const childTag = child.tagName.toUpperCase();
     if (!BLOCK_BOUNDARY_TAGS.has(childTag) && !hasNestedBlockChildren(child)) {
-      count += 1;
+      inlineProseChildren.push(child);
     }
   }
-  return count;
+
+  return { nonMarginElementCount, inlineProseChildren };
+}
+
+function getDelegatedFlexSingleInlineChild(parentEl: Element): Element | null {
+  if (!isFlexOrGridContainer(parentEl)) return null;
+  if (hasDirectBareNonWhitespaceText(parentEl)) return null;
+
+  const { nonMarginElementCount, inlineProseChildren } =
+    inspectDirectInlineChildren(parentEl);
+  if (inlineProseChildren.length !== 1) return null;
+
+  const onlyChild = inlineProseChildren[0];
+  const childTag = onlyChild.tagName.toUpperCase();
+  if (!STANDALONE_INLINE_CANDIDATE_TAGS.has(childTag)) {
+    return null;
+  }
+
+  const parentTag = parentEl.tagName.toUpperCase();
+  if (HEADING_TAGS.has(parentTag)) {
+    // Plain single-child headings (`<h1><yt-formatted-string>Title</yt-formatted-string></h1>`)
+    // mount directly on `<h1..h6>` outside Polymer/framework inline wrappers; only delegate
+    // when the heading has sibling controls (`nonMarginElementCount >= 2`) or wraps an `<a>`.
+    if (nonMarginElementCount < 2 && childTag !== 'A') {
+      return null;
+    }
+  }
+
+  return onlyChild;
 }
 
 /**
@@ -780,11 +979,19 @@ export function isMixedInlineAndBlockContainer(
     return true;
   }
 
-  // If `el` has NO bare text nodes and exactly 1 standalone `<span>`/`<label>`/`<a>` child
+  // If `el` has NO bare text nodes and exactly 1 delegatable standalone inline child
   // alongside block children (e.g. `<div style="display:flex"><span>Card Title</span><div>Body</div></div>`),
   // let that standalone child element be extracted directly instead of the outer wrapper.
-  const inlineChildrenCount = countDirectInlineCandidateChildren(el);
-  return inlineChildrenCount > 1;
+  const { inlineProseChildren } = inspectDirectInlineChildren(el);
+  if (
+    inlineProseChildren.length === 1 &&
+    STANDALONE_INLINE_CANDIDATE_TAGS.has(
+      inlineProseChildren[0].tagName.toUpperCase(),
+    )
+  ) {
+    return false;
+  }
+  return inlineProseChildren.length >= 1;
 }
 
 function isFlexOrGridContainer(el: Element): boolean {
@@ -828,11 +1035,23 @@ function isStandaloneInlineBlockChild(
   const parent = el.parentElement;
   if (!parent) return false;
   if (hasDirectBareNonWhitespaceText(parent)) return false;
+
   const parentHasBlocks = hasNestedBlockChildren(parent);
-  const parentIsFlexSingle =
-    isFlexOrGridContainer(parent) &&
-    countDirectInlineCandidateChildren(parent) === 1;
-  if (!parentHasBlocks && !parentIsFlexSingle) return false;
+  let delegatedFromParent = false;
+  if (parentHasBlocks) {
+    const parentTag = parent.tagName.toUpperCase();
+    if (!isCandidateBlockTag(parentTag) || isExcludedElement(parent)) {
+      delegatedFromParent = true;
+    } else {
+      const { inlineProseChildren } = inspectDirectInlineChildren(parent);
+      delegatedFromParent =
+        inlineProseChildren.length === 1 && inlineProseChildren[0] === el;
+    }
+  } else {
+    delegatedFromParent = getDelegatedFlexSingleInlineChild(parent) === el;
+  }
+
+  if (!delegatedFromParent) return false;
   if (isExcludedElement(el) || isAtomicInlineElement(el, { insideParagraph: false })) {
     return false;
   }
@@ -857,24 +1076,16 @@ export function isReadableLeafBlock(
     return false;
   }
 
-  // Flex/grid card or heading row with no bare text and a single `<span>`/`<a>`/`<label>`/`<yt-formatted-string>`
-  // child alongside controls (e.g. `<div style="display:flex"><span>Card title</span><button>Open</button></div>`
-  // or `<h1 style="display:flex"><yt-formatted-string>Title</yt-formatted-string><button>Share</button></h1>`)
+  // Flex/grid card or heading row with no bare text and a single delegatable inline candidate child
+  // (`<span>`, `<a>`, `<label>`, `<yt-formatted-string>`, `<yt-attributed-string>`) alongside controls
   // delegates to that child so the block translation stacks inside the text cell instead of as a flex sibling.
   if (
     (tag === 'DIV' ||
       tag === 'SECTION' ||
       tag === 'ARTICLE' ||
       tag === 'ASIDE' ||
-      tag === 'H1' ||
-      tag === 'H2' ||
-      tag === 'H3' ||
-      tag === 'H4' ||
-      tag === 'H5' ||
-      tag === 'H6') &&
-    isFlexOrGridContainer(el) &&
-    !hasDirectBareNonWhitespaceText(el) &&
-    countDirectInlineCandidateChildren(el) === 1
+      HEADING_TAGS.has(tag)) &&
+    getDelegatedFlexSingleInlineChild(el) !== null
   ) {
     return false;
   }
@@ -953,9 +1164,12 @@ export function hasExcludedAncestor(el: Element): boolean {
 }
 
 /**
- * Finds the nearest enclosing readable paragraph block for hover targeting.
+ * Finds the nearest enclosing readable paragraph block for hover or SPA upward ancestor targeting.
  */
-export function findClosestParagraphBlock(target: Node | null): HTMLElement | null {
+export function findClosestParagraphBlock(
+  target: Node | null,
+  options?: ExtractBlocksOptions,
+): HTMLElement | null {
   if (!target) return null;
   const startEl: Element | null =
     target.nodeType === Node.ELEMENT_NODE
@@ -963,13 +1177,13 @@ export function findClosestParagraphBlock(target: Node | null): HTMLElement | nu
       : target.parentElement;
   if (!startEl) return null;
 
+  const ownerDoc = startEl.ownerDocument;
+  const body = ownerDoc?.body ?? null;
+  const docEl = ownerDoc?.documentElement ?? null;
+
   // Reject immediately if target sits anywhere inside an excluded container or Margin Shadow host
   let ancestor: Element | null = startEl;
-  while (
-    ancestor &&
-    ancestor !== document.body &&
-    ancestor !== document.documentElement
-  ) {
+  while (ancestor && ancestor !== body && ancestor !== docEl) {
     if (ancestor.hasAttribute('data-margin-host')) {
       return null;
     }
@@ -984,11 +1198,12 @@ export function findClosestParagraphBlock(target: Node | null): HTMLElement | nu
   }
 
   let curr: Element | null = startEl;
-  while (curr && curr !== document.body && curr !== document.documentElement) {
+  while (curr && curr !== body && curr !== docEl) {
     if (
       !curr.hasAttribute('data-margin-injected') &&
       !curr.hasAttribute('data-margin-orig-wrap') &&
-      (isReadableLeafBlock(curr) || isMixedInlineAndBlockContainer(curr))
+      (isReadableLeafBlock(curr, options) ||
+        isMixedInlineAndBlockContainer(curr, options))
     ) {
       return curr;
     }

@@ -1,6 +1,9 @@
 import { BRAND } from '@shared/brand';
 import { createDefaultMarginConfig } from '@shared/constants';
-import { requestImageTranslation } from '@shared/messaging';
+import {
+  isExtensionContextValid,
+  requestImageTranslation,
+} from '@shared/messaging';
 import { SHADOW_HOST_RESET_CSS } from '@shared/shadow-styles';
 import { getMarginConfig, onMarginConfigChanged } from '@shared/storage';
 import type {
@@ -64,23 +67,29 @@ function findMatchingImageOnPage(srcUrl: string): HTMLImageElement | null {
 
 export function initMarginImageTranslator(): void {
   if (typeof document === 'undefined' || !document.documentElement) return;
-  const docElRecord = document.documentElement as unknown as Record<string, unknown>;
-  if (
-    document.documentElement.dataset.marginImageReady === '1' ||
-    docElRecord.__marginImageBooted === true
-  ) {
+  const globalBag = globalThis as Record<string, unknown>;
+  const bootKey = `__${BRAND.slug}_image_translator_booted__`;
+  if (globalBag[bootKey] === true) {
     return;
   }
-  document.documentElement.dataset.marginImageReady = '1';
-  docElRecord.__marginImageBooted = true;
+  globalBag[bootKey] = true;
+  // Clear legacy v2.1.1 cross-world DOM dataset flag if present on `<html>`
+  delete document.documentElement.dataset.marginImageReady;
 
+  const hadRuntimeIdAtMount = Boolean(globalThis.chrome?.runtime?.id);
+  let destroyed = false;
   let config: MarginConfig = createDefaultMarginConfig();
   const activeOverlays = new WeakMap<HTMLImageElement, MountedImageOverlayController>();
 
-  void getMarginConfig().then((loaded) => {
-    config = loaded;
-  });
-  onMarginConfigChanged((next) => {
+  void getMarginConfig()
+    .then((loaded) => {
+      if (!destroyed) {
+        config = loaded;
+      }
+    })
+    .catch(() => {});
+  let unsubscribeConfig: (() => void) | null = onMarginConfigChanged((next) => {
+    if (destroyed) return;
     config = next;
     if (matchesAnyUrlGlob(window.location.href, next.urlRules.excludeMatches)) {
       hideHoverPill();
@@ -265,85 +274,128 @@ export function initMarginImageTranslator(): void {
     }
   };
 
-  document.addEventListener(
-    'pointerover',
-    (e: PointerEvent) => {
-      if (
-        isUnsupportedBrowserUrl(window.location.href) ||
-        matchesAnyUrlGlob(window.location.href, config.urlRules.excludeMatches)
-      ) {
-        return;
-      }
-      const target = e.target;
-      if (
-        hoverPillHost &&
-        (target === hoverPillHost ||
-          (typeof e.composedPath === 'function' && e.composedPath().includes(hoverPillHost)))
-      ) {
-        clearHoverHideTimer();
-        return;
-      }
-      if (!(target instanceof HTMLImageElement)) return;
-      if (target.closest(`[${BRAND.domAttrPrefix}-injected]`)) return;
-      if (activeOverlays.has(target)) return;
+  const onPointerOver = (e: PointerEvent) => {
+    if (!isExtensionContextValid(hadRuntimeIdAtMount)) {
+      destroyImageTranslator();
+      return;
+    }
+    if (
+      isUnsupportedBrowserUrl(window.location.href) ||
+      matchesAnyUrlGlob(window.location.href, config.urlRules.excludeMatches)
+    ) {
+      return;
+    }
+    const target = e.target;
+    if (
+      hoverPillHost &&
+      (target === hoverPillHost ||
+        (typeof e.composedPath === 'function' && e.composedPath().includes(hoverPillHost)))
+    ) {
+      clearHoverHideTimer();
+      return;
+    }
+    if (!(target instanceof HTMLImageElement)) return;
+    if (target.closest(`[${BRAND.domAttrPrefix}-injected]`)) return;
+    if (activeOverlays.has(target)) return;
 
-      const rect = target.getBoundingClientRect();
-      if (rect.width < MIN_HOVER_IMG_WIDTH || rect.height < MIN_HOVER_IMG_HEIGHT) {
-        return;
-      }
+    const rect = target.getBoundingClientRect();
+    if (rect.width < MIN_HOVER_IMG_WIDTH || rect.height < MIN_HOVER_IMG_HEIGHT) {
+      return;
+    }
 
-      const modifierHeld =
-        config.hover.modifierKey !== 'none' &&
-        matchesModifier(e, config.hover.modifierKey);
-      const allowHoverPill = config.hover.enabled
-        ? matchesModifier(e, config.hover.modifierKey)
-        : modifierHeld;
+    const modifierHeld =
+      config.hover.modifierKey !== 'none' &&
+      matchesModifier(e, config.hover.modifierKey);
+    const allowHoverPill = config.hover.enabled
+      ? matchesModifier(e, config.hover.modifierKey)
+      : modifierHeld;
 
-      if (!allowHoverPill) return;
+    if (!allowHoverPill) return;
 
-      hoveredImg = target;
-      showHoverPillAt(
-        rect.top + window.scrollY + 8,
-        Math.max(8, rect.right + window.scrollX - 126),
-        config.interfaceLang === 'en' ? 'Translate Image' : '翻译图片 · Margin',
-      );
-    },
-    { passive: true },
-  );
+    hoveredImg = target;
+    showHoverPillAt(
+      rect.top + window.scrollY + 8,
+      Math.max(8, rect.right + window.scrollX - 126),
+      config.interfaceLang === 'en' ? 'Translate Image' : '翻译图片 · Margin',
+    );
+  };
 
-  document.addEventListener(
-    'pointerout',
-    (e: PointerEvent) => {
-      if (!hoveredImg || isTranslatingImage) return;
-      if (e.target === hoveredImg) {
-        scheduleHoverPillHide();
-      }
-    },
-    { passive: true },
-  );
+  const onPointerOut = (e: PointerEvent) => {
+    if (!isExtensionContextValid(hadRuntimeIdAtMount)) {
+      destroyImageTranslator();
+      return;
+    }
+    if (!hoveredImg || isTranslatingImage) return;
+    if (e.target === hoveredImg) {
+      scheduleHoverPillHide();
+    }
+  };
 
-  // Runtime message listener for context-menu image translation
-  if (
-    typeof globalThis.chrome !== 'undefined' &&
-    chrome.runtime?.onMessage
-  ) {
-    chrome.runtime.onMessage.addListener((raw: unknown) => {
-      const msg = raw as TabCommandMessage;
-      if (msg && msg.type === 'margin:cmd:translate-context-image' && msg.srcUrl) {
-        const img = findMatchingImageOnPage(msg.srcUrl);
-        void translateTargetImage(img, msg.srcUrl);
-      }
-    });
-  }
+  const onRuntimeMessage = (raw: unknown) => {
+    if (destroyed) return;
+    const msg = raw as TabCommandMessage;
+    if (msg && msg.type === 'margin:cmd:translate-context-image' && msg.srcUrl) {
+      const img = findMatchingImageOnPage(msg.srcUrl);
+      void translateTargetImage(img, msg.srcUrl);
+    }
+  };
 
-  // Also listen for custom DOM event dispatch (handy for local integration / tests)
-  window.addEventListener('margin:cmd:translate-context-image', (ev: Event) => {
+  const onWindowTranslateCmd = (ev: Event) => {
+    if (!isExtensionContextValid(hadRuntimeIdAtMount)) {
+      destroyImageTranslator();
+      return;
+    }
     const detail = (ev as CustomEvent<{ srcUrl?: string }>).detail;
     if (detail?.srcUrl) {
       const img = findMatchingImageOnPage(detail.srcUrl);
       void translateTargetImage(img, detail.srcUrl);
     }
-  });
+  };
+
+  function destroyImageTranslator(): void {
+    if (destroyed) return;
+    destroyed = true;
+    document.removeEventListener('pointerover', onPointerOver);
+    document.removeEventListener('pointerout', onPointerOut);
+    window.removeEventListener(
+      'margin:cmd:translate-context-image',
+      onWindowTranslateCmd,
+    );
+    try {
+      unsubscribeConfig?.();
+    } catch {
+      // Ignore storage unsubscribe errors when extension context is invalidated
+    }
+    unsubscribeConfig = null;
+    try {
+      globalThis.chrome?.runtime?.onMessage?.removeListener(onRuntimeMessage);
+    } catch {
+      // Ignore runtime message cleanup errors when extension context is invalidated
+    }
+    clearHoverHideTimer();
+    hoverPillHost?.remove();
+    hoverPillHost = null;
+    pillLabelEl = null;
+    hoveredImg = null;
+    delete globalBag[bootKey];
+  }
+
+  document.addEventListener('pointerover', onPointerOver, { passive: true });
+  document.addEventListener('pointerout', onPointerOut, { passive: true });
+
+  // Runtime message listener for context-menu image translation
+  if (
+    typeof globalThis.chrome !== 'undefined' &&
+    globalThis.chrome?.runtime?.onMessage
+  ) {
+    chrome.runtime.onMessage.addListener(onRuntimeMessage);
+  }
+
+  // Also listen for custom DOM event dispatch (handy for local integration / tests)
+  window.addEventListener(
+    'margin:cmd:translate-context-image',
+    onWindowTranslateCmd,
+  );
 }
 
 // Auto-initialize in browser content-script environment (skip automatic hook in Vitest unit runner)

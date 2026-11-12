@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it } from 'vitest';
 import {
+  collectTranslatableProse,
   extractPageContext,
   extractParagraphBlocks,
   findClosestParagraphBlock,
@@ -265,5 +266,203 @@ describe('dom-walker: smart paragraph extraction & math/code protection', () => 
       'news-headline',
       'news-meta',
     ]);
+  });
+
+  it('extracts X.com timeline, Today’s News, NFL, Pressable prose cards, and Tailwind posts under React Native Web box-none (pointer-events: none) columns while excluding composer placeholders & UI buttons', () => {
+    const style = document.createElement('style');
+    style.textContent = `
+      .r-105ug2t { pointer-events: none !important; }
+      .r-1loqt21 { pointer-events: auto !important; }
+    `;
+    document.head.appendChild(style);
+
+    document.body.innerHTML = `
+      <div id="react-root">
+        <div class="css-175oi2r r-105ug2t" style="pointer-events: none;">
+          <main role="main" class="r-105ug2t" style="pointer-events: none;">
+            <!-- Primary Timeline Column with inline Draft.js Composer + Feed -->
+            <div data-testid="primaryColumn" class="r-105ug2t" style="pointer-events: none;">
+              <div class="composer-shell r-1loqt21" style="pointer-events: auto;">
+                <div class="composer-editor-box">
+                  <div id="whats-happening-ph" style="pointer-events: none;">What’s happening?</div>
+                  <div>
+                    <div data-testid="tweetTextarea_0" role="textbox" contenteditable="true"></div>
+                  </div>
+                </div>
+                <div role="button" id="post-btn">Post</div>
+              </div>
+
+              <section class="r-1loqt21" style="pointer-events: auto;">
+                <div data-testid="cellInnerDiv">
+                  <article>
+                    <div id="timeline-tweet-1" data-testid="tweetText">
+                      <span>React Native Web box-none wrappers no longer prune timeline tweets.</span>
+                    </div>
+                    <!-- Grouped quote tweet inside role="group" -->
+                    <div role="group">
+                      <div role="button" tabindex="0" data-testid="card.wrapper">
+                        <div id="quoted-tweet-1" data-testid="tweetText">
+                          <span>Quoted release notes inside grouped Pressable card.</span>
+                        </div>
+                      </div>
+                    </div>
+                    <!-- Pure metric action bar role="group" -> still excluded -->
+                    <div role="group" aria-label="120 replies, 940 reposts">
+                      <span>120</span><span>940</span>
+                    </div>
+                  </article>
+                </div>
+
+                <!-- Tailwind v4 X post with placeholder:* utility classes and .x-middot-group author header -->
+                <article class="flex flex-col gap-1 placeholder:text-gray-400 has-[:placeholder-shown]:opacity-100">
+                  <div class="x-middot-group">
+                    <a href="/OpenAI"><div id="x-tailwind-author">OpenAI</div></a>
+                  </div>
+                  <div id="tailwind-post-prose" class="placeholder:text-zinc-500">
+                    Tailwind placeholder utility variants never wipe post cards or inline <span role="button">expandable notes</span>.
+                  </div>
+                </article>
+              </section>
+            </div>
+
+            <!-- Sidebar Column with Search combobox + Today's News + NFL + Pressable cards -->
+            <div data-testid="sidebarColumn" class="r-105ug2t" style="pointer-events: none;">
+              <div class="search-wrap r-1loqt21" style="pointer-events: auto;">
+                <input data-testid="SearchBox_Search_Input" role="combobox" placeholder="Search" />
+              </div>
+
+              <aside class="r-1loqt21" style="pointer-events: auto;">
+                <h2 id="todays-news-heading">Today’s News</h2>
+
+                <!-- Short multi-block Pressable news row (< 36 chars headline) -->
+                <div role="button" tabindex="0">
+                  <div id="short-news-head">SpaceX Launches Starship Test</div>
+                  <div id="short-news-meta">Trending now · Science</div>
+                </div>
+
+                <!-- Leaf RNW Pressable prose card (no nested block children) -->
+                <div role="button" tabindex="0" id="leaf-pressable-card">
+                  <span>Developers adopt zero-latency streaming batch codecs across browser extensions</span>
+                </div>
+
+                <!-- NFL sports row -->
+                <div role="button" tabindex="0">
+                  <div id="nfl-matchup-prose">Commanders advance to conference championship game</div>
+                </div>
+
+                <!-- Compact UI buttons -> excluded -->
+                <div role="button" id="follow-btn">Follow</div>
+                <div role="button" id="subscribe-btn">Subscribe</div>
+              </aside>
+            </div>
+          </main>
+        </div>
+      </div>
+    `;
+
+    const blocks = extractParagraphBlocks(document.body, { targetLang: 'zh-CN' });
+    expect(blocks.map((b) => b.id)).toEqual([
+      'timeline-tweet-1',
+      'quoted-tweet-1',
+      'tailwind-post-prose',
+      'todays-news-heading',
+      'short-news-head',
+      'short-news-meta',
+      'leaf-pressable-card',
+      'nfl-matchup-prose',
+    ]);
+
+    // Inline role="button" span inside paragraph prose is preserved by collectTranslatableProse
+    const tailwindProseEl = document.getElementById('tailwind-post-prose')!;
+    expect(collectTranslatableProse(tailwindProseEl)).toContain('expandable notes');
+
+    // Hover upward resolution works inside .r-105ug2t box-none columns too
+    const tweetSpan = document.querySelector('#timeline-tweet-1 span')!;
+    expect(
+      findClosestParagraphBlock(tweetSpan, { targetLang: 'zh-CN' })?.id,
+    ).toBe('timeline-tweet-1');
+  });
+
+  it('prevents flex H1..H6 / DIV delegation black holes with <yt-attributed-string> & inline tags, preserves player-placeholder wrappers & in-player titles, and resolves foreign ownerDocument in findClosestParagraphBlock', () => {
+    document.body.innerHTML = `
+      <header id="masthead">
+        <span id="country-code">DE</span>
+      </header>
+
+      <div class="player-placeholder">
+        <div class="ytp-chrome-top">
+          <div class="ytp-title">
+            <div id="ytp-title-box" class="ytp-title-text">
+              <a class="ytp-title-link" href="/watch?v=AOJwkm3yixU">Full Boss Fight Walkthrough</a>
+            </div>
+          </div>
+          <div class="ytp-chrome-top-buttons">Watch later</div>
+        </div>
+      </div>
+
+      <div class="continuation-placeholder">
+        <ytd-watch-metadata>
+          <!-- Single-child flex H1 with <yt-formatted-string>: mounts directly on H1, NOT inside Polymer child -->
+          <h1 id="flex-h1-single-fmt" style="display: flex;">
+            <yt-formatted-string id="inner-yt-fmt">Single Child Flex Watch Title</yt-formatted-string>
+          </h1>
+
+          <!-- Single-child flex H1 with <yt-attributed-string>: never falls into 0-block delegation black hole -->
+          <h1 id="flex-h1-single-attr" style="display: flex;">
+            <yt-attributed-string><span>Attributed Watch Heading Title</span></yt-attributed-string>
+          </h1>
+
+          <!-- Flex H1 with sibling control <button>: delegates cleanly to <yt-attributed-string> -->
+          <h1 id="flex-h1-with-btn" style="display: flex;">
+            <yt-attributed-string id="delegated-yt-attr"><span>Heading Alongside Action Button</span></yt-attributed-string>
+            <button type="button">Share</button>
+          </h1>
+
+          <!-- Flex DIV with non-standalone inline <strong>: never delegates into rejected <strong> -->
+          <div id="flex-div-strong" style="display: flex;">
+            <strong>Pinned Creator Note</strong>
+          </div>
+        </ytd-watch-metadata>
+
+        <div id="comment-header">
+          <a id="published-time-text" href="/watch?v=AOJwkm3yixU&lc=1">1 day ago</a>
+        </div>
+      </div>
+
+      <!-- Explicit TipTap / editor placeholder classes are still excluded on leaf nodes -->
+      <p class="is-editor-empty" id="tiptap-empty">Write a comment...</p>
+      <div class="lexical-placeholder" id="lexical-empty">Add a public comment...</div>
+    `;
+
+    const blocks = extractParagraphBlocks(document.body, { targetLang: 'zh-CN' });
+    expect(blocks.map((b) => b.id)).toEqual([
+      'ytp-title-box',
+      'flex-h1-single-fmt',
+      'flex-h1-single-attr',
+      'delegated-yt-attr',
+      'flex-div-strong',
+    ]);
+
+    const innerFmt = document.getElementById('inner-yt-fmt')!;
+    expect(findClosestParagraphBlock(innerFmt, { targetLang: 'zh-CN' })?.id).toBe(
+      'flex-h1-single-fmt',
+    );
+
+    // Foreign Document support in findClosestParagraphBlock
+    const foreignDoc = document.implementation.createHTMLDocument('Foreign');
+    foreignDoc.body.innerHTML = `
+      <article>
+        <h1 id="foreign-h1"><span id="foreign-span">Foreign Document Heading</span></h1>
+        <p id="foreign-zh">这是一段无需再次翻译的纯中文段落。</p>
+      </article>
+    `;
+    const foreignSpan = foreignDoc.getElementById('foreign-span')!;
+    const foreignZh = foreignDoc.getElementById('foreign-zh')!;
+    expect(
+      findClosestParagraphBlock(foreignSpan, { targetLang: 'zh-CN' })?.id,
+    ).toBe('foreign-h1');
+    expect(
+      findClosestParagraphBlock(foreignZh, { targetLang: 'zh-CN' }),
+    ).toBeNull();
   });
 });

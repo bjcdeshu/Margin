@@ -12,10 +12,14 @@ const memoryFallback = new Map<string, unknown>();
 const memoryListeners = new Set<(config: MarginConfig) => void>();
 
 function hasChromeStorage(): boolean {
-  return (
-    typeof globalThis.chrome !== 'undefined' &&
-    Boolean(globalThis.chrome?.storage?.local)
-  );
+  try {
+    return (
+      typeof globalThis.chrome !== 'undefined' &&
+      Boolean(globalThis.chrome?.storage?.local)
+    );
+  } catch {
+    return false;
+  }
 }
 
 async function rawGet<T>(key: string): Promise<T | undefined> {
@@ -134,7 +138,13 @@ export function onMarginConfigChanged(
       }
     };
     chrome.storage.onChanged.addListener(handler);
-    return () => chrome.storage.onChanged.removeListener(handler);
+    return () => {
+      try {
+        globalThis.chrome?.storage?.onChanged?.removeListener(handler);
+      } catch {
+        // Ignore removal errors when extension context is invalidated
+      }
+    };
   }
   memoryListeners.add(listener);
   return () => {

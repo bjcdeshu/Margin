@@ -1,5 +1,6 @@
 import { resolveProviderIdForScene } from '@shared/constants';
 import {
+  isExtensionContextValid,
   requestBatchTranslation,
   streamBatchTranslation,
   type StreamBatchCallbacks,
@@ -280,6 +281,7 @@ export class SelectionPopover {
 
   private pointerDownInsideAnchor = false;
   private suppressAnchorClickUntil = 0;
+  private hadRuntimeIdAtMount = false;
 
   private cleanupListeners: (() => void) | null = null;
   private cleanupActiveDrag: (() => void) | null = null;
@@ -321,9 +323,14 @@ export class SelectionPopover {
 
   mount(): void {
     if (this.cleanupListeners) return;
+    this.hadRuntimeIdAtMount = Boolean(globalThis.chrome?.runtime?.id);
     const win = this.doc.defaultView ?? window;
 
     const onPointerDown = (ev: PointerEvent | MouseEvent) => {
+      if (!isExtensionContextValid(this.hadRuntimeIdAtMount)) {
+        this.destroy();
+        return;
+      }
       if (this.isEventFromSelf(ev)) return;
 
       this.pointerDownInsideAnchor = isNodeInsideAnchor(ev.target as Node | null);
@@ -335,11 +342,19 @@ export class SelectionPopover {
     };
 
     const onPointerUp = (ev: PointerEvent | MouseEvent) => {
+      if (!isExtensionContextValid(this.hadRuntimeIdAtMount)) {
+        this.destroy();
+        return;
+      }
       if (this.isEventFromSelf(ev)) return;
       this.evaluateBrowserSelection(ev);
     };
 
     const onClickCapture = (ev: MouseEvent) => {
+      if (!isExtensionContextValid(this.hadRuntimeIdAtMount)) {
+        this.destroy();
+        return;
+      }
       if (this.isEventFromSelf(ev)) return;
       // Suppress synthetic navigation click when user dragged to select text inside an <a href>
       if (
@@ -354,6 +369,10 @@ export class SelectionPopover {
     };
 
     const onKeyDown = (ev: KeyboardEvent) => {
+      if (!isExtensionContextValid(this.hadRuntimeIdAtMount)) {
+        this.destroy();
+        return;
+      }
       if (ev.key === 'Escape' && this.uiState !== 'closed' && !this.pinned) {
         this.close();
       }

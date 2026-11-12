@@ -1,6 +1,9 @@
 import { BRAND } from '@shared/brand';
 import { createDefaultMarginConfig } from '@shared/constants';
-import { requestBatchTranslation } from '@shared/messaging';
+import {
+  isExtensionContextValid,
+  requestBatchTranslation,
+} from '@shared/messaging';
 import { SHADOW_HOST_RESET_CSS } from '@shared/shadow-styles';
 import {
   getMarginConfig,
@@ -104,8 +107,10 @@ export function createSubtitleIsolatedController(
   let domObserver: MutationObserver | null = null;
   let playerResizeObserver: ResizeObserver | null = null;
   let observedPlayerContainer: HTMLElement | null = null;
+  let ownedOverlayHost: HTMLElement | null = null;
   let boundHtml5Video: HTMLVideoElement | null = null;
   let detachHtml5Listeners: (() => void) | null = null;
+  let hadRuntimeIdAtStart = false;
   let destroyed = false;
 
   function buildConfiguredCueDefaults(): Partial<MarginActiveCueState> {
@@ -305,6 +310,7 @@ export function createSubtitleIsolatedController(
 
       wrapper.append(origLine, transLine);
       shadow.append(style, wrapper);
+      ownedOverlayHost = host;
     }
 
     if (host.parentElement !== container) {
@@ -324,12 +330,16 @@ export function createSubtitleIsolatedController(
     return host.shadowRoot;
   }
 
-  function removeOverlayHost(): void {
+  function removeOverlayHost(options: { contextInvalidated?: boolean } = {}): void {
     playerResizeObserver?.disconnect();
     playerResizeObserver = null;
     observedPlayerContainer = null;
-    doc.getElementById(SUBTITLE_OVERLAY_HOST_ID)?.remove();
-    setNativeYoutubeCaptionSuppression(false);
+    const existingHost = doc.getElementById(SUBTITLE_OVERLAY_HOST_ID);
+    if (!options.contextInvalidated || (ownedOverlayHost && existingHost === ownedOverlayHost)) {
+      existingHost?.remove();
+      setNativeYoutubeCaptionSuppression(false);
+    }
+    ownedOverlayHost = null;
   }
 
   function applyOverlayDom(cue: MarginActiveCueState): void {
@@ -482,6 +492,10 @@ export function createSubtitleIsolatedController(
 
   function handleYoutubeBridgeMessage(event: MessageEvent): void {
     if (destroyed || !isYoutube || !isSameWindowMessage(event)) return;
+    if (!isExtensionContextValid(hadRuntimeIdAtStart)) {
+      destroy({ contextInvalidated: true });
+      return;
+    }
     const msg = event.data as Partial<YoutubeExtendedBridgeMessage> | null;
     if (!msg || typeof msg !== 'object' || msg.source !== BRAND.ytBridgeSourceMain) {
       return;
@@ -682,7 +696,12 @@ export function createSubtitleIsolatedController(
   }
 
   function tickActiveVideoPlayhead(): void {
-    if (destroyed || !isSubtitlesEnabledForSite()) return;
+    if (destroyed) return;
+    if (!isExtensionContextValid(hadRuntimeIdAtStart)) {
+      destroy({ contextInvalidated: true });
+      return;
+    }
+    if (!isSubtitlesEnabledForSite()) return;
     const video = isYoutube
       ? doc.querySelector<HTMLVideoElement>('video.html5-main-video')
       : boundHtml5Video;
@@ -698,11 +717,16 @@ export function createSubtitleIsolatedController(
 
   function handleFullscreenChange(): void {
     if (destroyed) return;
+    if (!isExtensionContextValid(hadRuntimeIdAtStart)) {
+      destroy({ contextInvalidated: true });
+      return;
+    }
     applyOverlayDom(activeCueState);
   }
 
   async function start(): Promise<void> {
     if (destroyed) return;
+    hadRuntimeIdAtStart = Boolean(globalThis.chrome?.runtime?.id);
 
     if (isYoutube) {
       win.addEventListener('message', handleYoutubeBridgeMessage);
@@ -762,7 +786,7 @@ export function createSubtitleIsolatedController(
     }
   }
 
-  function destroy(): void {
+  function destroy(cleanupOptions: { contextInvalidated?: boolean } = {}): void {
     if (destroyed) return;
     destroyed = true;
     cancelClearTimer();
@@ -774,7 +798,11 @@ export function createSubtitleIsolatedController(
       win.removeEventListener('message', handleYoutubeBridgeMessage);
     }
     doc.removeEventListener('fullscreenchange', handleFullscreenChange);
-    unsubConfig?.();
+    try {
+      unsubConfig?.();
+    } catch {
+      // Ignore storage unsubscribe errors when extension context is invalidated
+    }
     unsubConfig = null;
     domObserver?.disconnect();
     domObserver = null;
@@ -782,15 +810,22 @@ export function createSubtitleIsolatedController(
     detachHtml5Listeners = null;
     boundHtml5Video = null;
     scheduler.cancelAll();
-    removeOverlayHost();
+    removeOverlayHost(cleanupOptions);
+
+    const winRecord = win as unknown as Record<string, unknown>;
+    if (winRecord[ISOLATED_CONTROLLER_KEY] === controllerApi) {
+      delete winRecord[ISOLATED_CONTROLLER_KEY];
+    }
   }
 
-  return {
+  const controllerApi: SubtitleIsolatedController = {
     start,
-    destroy,
+    destroy: () => destroy(),
     getActiveCue: () => ({ ...activeCueState }),
     getCues: () => scheduler.getCues(),
   };
+
+  return controllerApi;
 }
 
 function buildInPlayerOverlayCss(): string {

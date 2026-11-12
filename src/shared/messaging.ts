@@ -13,6 +13,17 @@ import type {
   TranslateStreamPortMessage,
 } from './types';
 
+export function isExtensionContextValid(hadRuntimeIdAtMount = false): boolean {
+  try {
+    if (typeof globalThis.chrome === 'undefined' || !globalThis.chrome?.runtime) {
+      return !hadRuntimeIdAtMount;
+    }
+    return Boolean(globalThis.chrome.runtime.id);
+  } catch {
+    return false;
+  }
+}
+
 export async function sendRuntimeMessage<TResponse>(
   request: RuntimeRpcRequest,
 ): Promise<TResponse> {
@@ -194,16 +205,33 @@ export async function sendTabCommand(
         return { ok: true };
       }
 
-      // Actionable user command on a pre-existing tab: dynamically inject content scripts and retry once!
+      // Actionable user command on a pre-existing tab: dynamically inject content scripts and retry with backoff!
       if (typeof chrome.scripting?.executeScript === 'function') {
         try {
           await chrome.scripting.executeScript({
             target: { tabId },
             files: ['content.js', 'image-translate.js'],
           });
-          await new Promise<void>((resolve) => setTimeout(resolve, 60));
-          const retryResult = await chrome.tabs.sendMessage(tabId, command);
-          return { ok: true, autoInjected: true, result: retryResult };
+          const retryDelaysMs = [50, 120, 250];
+          let lastRetryErr: unknown;
+          for (const delayMs of retryDelaysMs) {
+            await new Promise<void>((resolve) => setTimeout(resolve, delayMs));
+            try {
+              const retryResult = await chrome.tabs.sendMessage(tabId, command);
+              return { ok: true, autoInjected: true, result: retryResult };
+            } catch (retryErr) {
+              lastRetryErr = retryErr;
+              const retryMsg =
+                retryErr instanceof Error ? retryErr.message : String(retryErr);
+              if (!isMissingReceiverError(retryMsg)) {
+                throw retryErr;
+              }
+            }
+          }
+          throw (
+            lastRetryErr ??
+            new Error('Content script receiver did not respond after injection.')
+          );
         } catch (injectErr) {
           const injectMsg =
             injectErr instanceof Error ? injectErr.message : String(injectErr);

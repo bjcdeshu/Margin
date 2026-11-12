@@ -1,5 +1,6 @@
 import { resolveProviderIdForScene } from '@shared/constants';
 import {
+  isExtensionContextValid,
   requestBatchTranslation,
   streamBatchTranslation,
   type StreamBatchCallbacks,
@@ -507,6 +508,7 @@ export class InputQuickTranslator {
   private errorDismissTimer: ReturnType<typeof setTimeout> | null = null;
 
   private cleanupListeners: (() => void) | null = null;
+  private hadRuntimeIdAtMount = false;
 
   constructor(options: InputQuickTranslatorOptions) {
     this.config = options.config;
@@ -518,10 +520,21 @@ export class InputQuickTranslator {
 
   mount(): void {
     if (this.cleanupListeners) return;
+    this.hadRuntimeIdAtMount = Boolean(globalThis.chrome?.runtime?.id);
 
     const win = this.doc.defaultView ?? window;
-    const onKeyDown = (ev: KeyboardEvent) => this.handleKeyDown(ev);
+    const onKeyDown = (ev: KeyboardEvent) => {
+      if (!isExtensionContextValid(this.hadRuntimeIdAtMount)) {
+        this.destroy();
+        return;
+      }
+      this.handleKeyDown(ev);
+    };
     const onPointerDown = () => {
+      if (!isExtensionContextValid(this.hadRuntimeIdAtMount)) {
+        this.destroy();
+        return;
+      }
       this.spaceTimestamps = [];
     };
 

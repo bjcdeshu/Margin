@@ -37,7 +37,7 @@ describe('Margin shared contracts & temperature engine', () => {
   it('locks brand constants and Shadow DOM CSS reset invariants', () => {
     expect(BRAND.name).toBe('Margin');
     expect(BRAND.slug).toBe('margin');
-    expect(BRAND.version).toBe('2.1.1');
+    expect(BRAND.version).toBe('2.1.2');
     expect(BRAND.pinnedExtensionId).toMatch(/^[a-p]{32}$/);
     expect(SHADOW_HOST_RESET_CSS).toContain('all: initial !important');
     expect(SHADOW_HOST_RESET_CSS).toContain('font-size: 16px !important');
@@ -295,7 +295,7 @@ describe('Margin shared contracts & temperature engine', () => {
       expect(backfilled.subtitles.fontSizePercent).toBe(85);
       expect(backfilled.subtitles.stylePreset).toBe('youtube-native');
 
-      // Pre-existing tab auto-injects once and retries cleanly
+      // Pre-existing tab auto-injects once and retries with backoff until content script receiver is ready
       const retryRes = await sendTabCommand(42, {
         type: 'margin:cmd:toggle-page',
       });
@@ -304,7 +304,41 @@ describe('Margin shared contracts & temperature engine', () => {
       expect(retryRes.autoInjected).toBe(true);
       expect((retryRes.result as { translated: boolean }).translated).toBe(true);
 
+      // Slow tab where first post-inject retry still hits missing receiver succeeds on second backoff step
+      let slowSendCalls = 0;
+      (
+        (globalThis as Record<string, unknown>).chrome as {
+          tabs: { sendMessage: (tabId: number) => Promise<unknown> };
+        }
+      ).tabs.sendMessage = async () => {
+        slowSendCalls += 1;
+        if (slowSendCalls <= 2) {
+          throw new Error(
+            'Could not establish connection. Receiving end does not exist.',
+          );
+        }
+        return { ok: true, translatedAfterBackoff: true };
+      };
+      const backoffRes = await sendTabCommand(43, {
+        type: 'margin:cmd:toggle-page',
+      });
+      expect(injectCalls).toBe(2);
+      expect(slowSendCalls).toBe(3);
+      expect(backoffRes.ok).toBe(true);
+      expect(backoffRes.autoInjected).toBe(true);
+      expect(
+        (backoffRes.result as { translatedAfterBackoff: boolean })
+          .translatedAfterBackoff,
+      ).toBe(true);
+
       // Restricted chrome:// tab returns unsupportedPage: true cleanly
+      (
+        (globalThis as Record<string, unknown>).chrome as {
+          tabs: { sendMessage: (tabId: number) => Promise<unknown> };
+        }
+      ).tabs.sendMessage = async () => {
+        throw new Error('Cannot access a chrome:// URL');
+      };
       const restrictedRes = await sendTabCommand(99, {
         type: 'margin:cmd:toggle-page',
       });
