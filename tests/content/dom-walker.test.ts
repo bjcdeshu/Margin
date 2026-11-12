@@ -201,4 +201,69 @@ describe('dom-walker: smart paragraph extraction & math/code protection', () => 
       'card-span',
     ]);
   });
+
+  it('excludes rich-text composer placeholders, Draft.js/tweetTextarea, pointer-events:none overlays, and YouTube channel/owner metadata while preserving titles & clickable news cards', () => {
+    document.body.innerHTML = `
+      <!-- X Draft.js Composer -->
+      <div class="DraftEditor-root">
+        <div class="public-DraftEditorPlaceholder-root">
+          <div class="public-DraftEditorPlaceholder-inner" id="placeholder-tweet">What’s happening?</div>
+        </div>
+        <div class="DraftEditor-editorContainer">
+          <div class="public-DraftEditor-content" contenteditable="true" role="textbox" data-testid="tweetTextarea_0"></div>
+        </div>
+      </div>
+
+      <!-- Obfuscated React/Lexical composer with pointer-events:none sibling placeholder -->
+      <div class="x-obfuscated-composer">
+        <div id="obfuscated-ph" style="pointer-events: none; position: absolute;">Write a reply...</div>
+        <div><div role="textbox" contenteditable="true"></div></div>
+      </div>
+
+      <!-- Explicit data-placeholder & [data-testid*="tweetTextarea"] -->
+      <div data-testid="tweetTextarea_0_label">Post your reply</div>
+      <div data-placeholder="Ask anything...">Ask anything...</div>
+      <div class="customInputPlaceholder">Enter search query</div>
+
+      <!-- YouTube Watch Metadata: Title vs Channel/Owner/Subscribe -->
+      <ytd-watch-metadata>
+        <div id="title">
+          <h1 id="yt-watch-h1" style="max-height: 5.6rem; overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2;">
+            <yt-formatted-string>Yubi, No. 21 Swordfighter Puppet No Damage Hellwalker – Phantom Blade Zero</yt-formatted-string>
+          </h1>
+        </div>
+        <div id="bottom-row">
+          <ytd-video-owner-renderer>
+            <div id="upload-info">
+              <ytd-channel-name id="channel-name">
+                <div id="text-container"><a href="/@ONGBAL">옹발이 ONGBAL</a></div>
+              </ytd-channel-name>
+              <ytd-badge-supported-renderer>Verified</ytd-badge-supported-renderer>
+              <yt-formatted-string id="owner-sub-count">475K subscribers</yt-formatted-string>
+            </div>
+          </ytd-video-owner-renderer>
+          <tp-yt-paper-button role="button">Join</tp-yt-paper-button>
+          <div role="button" id="sub-btn">Subscribe</div>
+        </div>
+        <ytd-video-meta-block>
+          <div id="metadata-line"><span>78K views</span><span>1 day ago</span></div>
+        </ytd-video-meta-block>
+      </ytd-watch-metadata>
+
+      <!-- Clickable X Today's News card with role="button" wrapping multiple prose blocks -->
+      <div role="button" tabindex="0" class="todays-news-card">
+        <div id="news-headline" style="display: -webkit-box; -webkit-line-clamp: 2; overflow: hidden;">
+          Comma in Passwords Tip Circulates as CSV Leak Defense...
+        </div>
+        <div id="news-meta">Trending now · Other · 2,367 posts</div>
+      </div>
+    `;
+
+    const blocks = extractParagraphBlocks(document.body, { targetLang: 'zh-CN' });
+    expect(blocks.map((b) => b.id)).toEqual([
+      'yt-watch-h1',
+      'news-headline',
+      'news-meta',
+    ]);
+  });
 });

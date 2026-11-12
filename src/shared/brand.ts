@@ -1,7 +1,7 @@
 export const BRAND = {
   name: 'Margin',
   slug: 'margin',
-  version: '2.1.0',
+  version: '2.1.1',
   tagline: 'Quiet editorial translation for web, input, video, PDF & images',
   pinnedExtensionId: 'gdkbmfndollgfmblnielgfdpeoabekbf',
   storageKeyConfig: 'margin:config:v2',

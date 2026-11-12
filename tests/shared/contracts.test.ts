@@ -37,7 +37,7 @@ describe('Margin shared contracts & temperature engine', () => {
   it('locks brand constants and Shadow DOM CSS reset invariants', () => {
     expect(BRAND.name).toBe('Margin');
     expect(BRAND.slug).toBe('margin');
-    expect(BRAND.version).toBe('2.1.0');
+    expect(BRAND.version).toBe('2.1.1');
     expect(BRAND.pinnedExtensionId).toMatch(/^[a-p]{32}$/);
     expect(SHADOW_HOST_RESET_CSS).toContain('all: initial !important');
     expect(SHADOW_HOST_RESET_CSS).toContain('font-size: 16px !important');

@@ -25,6 +25,7 @@ import {
 } from './dom-walker';
 import {
   reconstructRichDom,
+  stripResidualMarkers,
   tokenizeParagraph,
   type TokenizedParagraph,
 } from './rich-text';
@@ -519,6 +520,114 @@ interface PreparedBlockTask {
 interface MountedBlockMeta {
   plainTextLength: number;
   fallbackPlain: boolean;
+  sourceText: string;
+  translatedText: string;
+}
+
+const UNCLAMP_TRACKED_PROPS = [
+  '-webkit-line-clamp',
+  'line-clamp',
+  '-webkit-box-orient',
+  'max-height',
+  'height',
+  'overflow',
+  'overflow-x',
+  'overflow-y',
+  'text-overflow',
+  'display',
+] as const;
+
+const UNCLAMP_LANDMARK_STOP_TAGS: ReadonlySet<string> = new Set([
+  'BODY',
+  'HTML',
+  'MAIN',
+  'ARTICLE',
+  'SECTION',
+  'ASIDE',
+  'NAV',
+  'HEADER',
+  'FOOTER',
+  'DIALOG',
+  'FORM',
+  'TABLE',
+  'THEAD',
+  'TBODY',
+  'TFOOT',
+  'TR',
+  'UL',
+  'OL',
+  'DL',
+]);
+
+interface SavedInlineProperty {
+  value: string;
+  priority: string;
+}
+
+interface SavedUnclampStyle {
+  hadStyleAttr: boolean;
+  originalStyleAttr: string | null;
+  styleAfterUnclamp: string | null;
+  props: Record<string, SavedInlineProperty>;
+}
+
+function parseCssLengthToApproxPx(raw: string): number {
+  const val = raw.trim().toLowerCase();
+  if (
+    !val ||
+    val === 'none' ||
+    val === 'auto' ||
+    val === 'unset' ||
+    val === 'initial' ||
+    val === 'inherit' ||
+    val === 'max-content' ||
+    val === 'min-content' ||
+    val === 'fit-content' ||
+    val.endsWith('%') ||
+    val.endsWith('vh') ||
+    val.endsWith('dvh') ||
+    val.endsWith('svh') ||
+    val.endsWith('vw')
+  ) {
+    return Number.NaN;
+  }
+  const num = Number.parseFloat(val);
+  if (!Number.isFinite(num)) {
+    return Number.NaN;
+  }
+  if (val.endsWith('rem') || val.endsWith('em')) {
+    return num * 16;
+  }
+  if (val.endsWith('lh')) {
+    return num * 22;
+  }
+  return num;
+}
+
+/**
+ * Normalizes source/translated strings (stripping `<mN>` markers, collapsing whitespace,
+ * NFKC-folding, and trimming outer punctuation/symbols) so redundant identical translations
+ * such as `NFL -> NFL` or `<m0>옹발이 ONGBAL</m0> -> <m0>옹발이 ONGBAL</m0>` are cleanly detected.
+ */
+export function normalizeComparableTranslationText(raw: string): string {
+  return stripResidualMarkers(raw)
+    .normalize('NFKC')
+    .replace(/\s+/g, ' ')
+    .replace(/^[\p{P}\p{S}\s]+|[\p{P}\p{S}\s]+$/gu, '')
+    .trim()
+    .toLowerCase();
+}
+
+export function isRedundantIdenticalTranslation(
+  sourceTokenizedText: string,
+  translatedText: string,
+): boolean {
+  const normSrc = normalizeComparableTranslationText(sourceTokenizedText);
+  const normTrans = normalizeComparableTranslationText(translatedText);
+  if (!normSrc || !normTrans) {
+    return false;
+  }
+  return normSrc === normTrans;
 }
 
 function hashGlossaryFingerprint(entries: readonly GlossaryEntry[]): string {
@@ -578,6 +687,7 @@ export class WebpageRenderer {
   private readonly translatedBlockSet = new Set<HTMLElement>();
   private readonly failedBlockTasks = new Map<HTMLElement, PreparedBlockTask>();
   private readonly mountedMeta = new WeakMap<HTMLElement, MountedBlockMeta>();
+  private readonly unclampedStyles = new WeakMap<HTMLElement, SavedUnclampStyle>();
   private readonly pendingViewportQueue = new Map<HTMLElement, TranslationScene>();
 
   private sessionTotalBlocks = 0;
@@ -807,6 +917,320 @@ export class WebpageRenderer {
     }
   }
 
+  private applyUnclampOverrides(
+    el: HTMLElement,
+    displayVal: string,
+    whiteSpaceVal: string,
+    hasLineClamp: boolean,
+  ): void {
+    let snapshot = this.unclampedStyles.get(el);
+    let wasUntouchedByHost = true;
+
+    if (!snapshot) {
+      const props: Record<string, SavedInlineProperty> = {};
+      for (const prop of UNCLAMP_TRACKED_PROPS) {
+        props[prop] = {
+          value: el.style.getPropertyValue(prop),
+          priority: el.style.getPropertyPriority(prop),
+        };
+      }
+      snapshot = {
+        hadStyleAttr: el.hasAttribute('style'),
+        originalStyleAttr: el.getAttribute('style'),
+        styleAfterUnclamp: null,
+        props,
+      };
+      this.unclampedStyles.set(el, snapshot);
+    } else {
+      wasUntouchedByHost = el.getAttribute('style') === snapshot.styleAfterUnclamp;
+    }
+
+    el.setAttribute('data-margin-unclamped', 'true');
+    el.style.setProperty('-webkit-line-clamp', 'unset', 'important');
+    el.style.setProperty('line-clamp', 'unset', 'important');
+    el.style.setProperty('max-height', 'none', 'important');
+    el.style.setProperty('height', 'auto', 'important');
+
+    if (whiteSpaceVal === 'nowrap') {
+      el.style.setProperty('overflow-x', 'clip', 'important');
+      el.style.setProperty('overflow-y', 'visible', 'important');
+    } else {
+      el.style.setProperty('overflow', 'visible', 'important');
+    }
+
+    if (
+      displayVal === '-webkit-box' ||
+      (hasLineClamp && displayVal === 'flow-root')
+    ) {
+      el.style.setProperty('display', 'block', 'important');
+    } else if (displayVal === '-webkit-inline-box') {
+      el.style.setProperty('display', 'inline-block', 'important');
+    }
+
+    if (wasUntouchedByHost) {
+      snapshot.styleAfterUnclamp = el.getAttribute('style');
+    }
+  }
+
+  /**
+   * Inspects `blockEl` and up to 3 tight ancestor wrappers (stopping before landmarks,
+   * scroll containers, positioned overlays, or multi-card containers) and reversibly
+   * relaxes CSS `-webkit-line-clamp`, tight `max-height`, or vertical overflow clipping
+   * so bilingual translations are never sliced in half or hidden below line clamps.
+   */
+  private unclampForInjectedNode(
+    blockEl: HTMLElement,
+    injectedEl: HTMLElement,
+  ): void {
+    const view = this.doc.defaultView;
+    let curr: HTMLElement | null = blockEl;
+
+    for (let depth = 0; depth <= 3 && curr; depth++) {
+      if (curr === this.doc.body || curr === this.doc.documentElement) {
+        break;
+      }
+      if (curr.hasAttribute('data-margin-host')) {
+        break;
+      }
+      if (curr.getAttribute('data-testid') === 'cellInnerDiv') {
+        break;
+      }
+
+      const tag = curr.tagName.toUpperCase();
+      if (depth > 0 && UNCLAMP_LANDMARK_STOP_TAGS.has(tag)) {
+        break;
+      }
+
+      let cs: CSSStyleDeclaration | null = null;
+      if (curr.isConnected && view && typeof view.getComputedStyle === 'function') {
+        try {
+          cs = view.getComputedStyle(curr);
+        } catch {
+          cs = null;
+        }
+      }
+
+      const rawStyleAttr = curr.getAttribute('style') ?? '';
+      const ovY = (
+        cs?.overflowY ||
+        curr.style.overflowY ||
+        curr.style.overflow ||
+        ''
+      )
+        .trim()
+        .toLowerCase();
+      const ovX = (
+        cs?.overflowX ||
+        curr.style.overflowX ||
+        curr.style.overflow ||
+        ''
+      )
+        .trim()
+        .toLowerCase();
+
+      // Never alter scrollable containers
+      if (
+        ovY === 'auto' ||
+        ovY === 'scroll' ||
+        ovX === 'auto' ||
+        ovX === 'scroll'
+      ) {
+        break;
+      }
+
+      const pos = (cs?.position || curr.style.position || '')
+        .trim()
+        .toLowerCase();
+      if (pos === 'fixed' || pos === 'sticky') {
+        break;
+      }
+      if (depth > 0 && pos === 'absolute') {
+        break;
+      }
+
+      if (depth > 0) {
+        let nonMarginChildren = 0;
+        for (let i = 0; i < curr.children.length; i++) {
+          const ch = curr.children[i];
+          if (
+            !ch.hasAttribute('data-margin-injected') &&
+            !ch.hasAttribute('data-margin-host') &&
+            ch.getAttribute('data-margin-orig-wrap') !== 'true'
+          ) {
+            nonMarginChildren += 1;
+          }
+        }
+        if (nonMarginChildren > 4) {
+          break;
+        }
+        if (curr.clientHeight > 240) {
+          break;
+        }
+      }
+
+      const inlineClampMatch = rawStyleAttr.match(
+        /(?:^|;|\s)(?:-webkit-)?line-clamp\s*:\s*([^;!]+)/i,
+      );
+      const clampVal = (
+        cs?.getPropertyValue('-webkit-line-clamp') ||
+        cs?.getPropertyValue('line-clamp') ||
+        curr.style.getPropertyValue('-webkit-line-clamp') ||
+        curr.style.getPropertyValue('line-clamp') ||
+        (curr.style as unknown as Record<string, string>).webkitLineClamp ||
+        inlineClampMatch?.[1] ||
+        ''
+      )
+        .trim()
+        .toLowerCase();
+      const clampNum = Number.parseInt(clampVal, 10);
+      const hasLineClamp =
+        clampVal !== '' &&
+        clampVal !== 'none' &&
+        clampVal !== 'unset' &&
+        clampVal !== 'initial' &&
+        Number.isFinite(clampNum) &&
+        clampNum > 0;
+
+      const inlineDisplayMatch = rawStyleAttr.match(
+        /(?:^|;|\s)display\s*:\s*([^;!]+)/i,
+      );
+      const inlineDisplayVal = (inlineDisplayMatch?.[1] ?? '')
+        .trim()
+        .toLowerCase();
+      const computedDisplayVal = (cs?.display || curr.style.display || '')
+        .trim()
+        .toLowerCase();
+      const displayVal =
+        inlineDisplayVal === '-webkit-box' ||
+        inlineDisplayVal === '-webkit-inline-box'
+          ? inlineDisplayVal
+          : computedDisplayVal || inlineDisplayVal;
+
+      const clipsY = ovY === 'hidden' || ovY === 'clip';
+      const isWebkitBox =
+        displayVal === '-webkit-box' || displayVal === '-webkit-inline-box';
+      const isWebkitBoxClamp = isWebkitBox && (clipsY || hasLineClamp);
+
+      const maxHRaw = (cs?.maxHeight || curr.style.maxHeight || '').trim();
+      const maxHPx = parseCssLengthToApproxPx(maxHRaw);
+      const hasTightMaxHeight =
+        Number.isFinite(maxHPx) &&
+        maxHPx > 0 &&
+        maxHPx <= 260 &&
+        (clipsY || hasLineClamp);
+
+      const isFlexOrGrid =
+        displayVal === 'flex' ||
+        displayVal === 'inline-flex' ||
+        displayVal === 'grid' ||
+        displayVal === 'inline-grid';
+      const inlineHeightPx = parseCssLengthToApproxPx(curr.style.height || '');
+      const hasTightInlineFixedHeight =
+        !isFlexOrGrid &&
+        clipsY &&
+        Number.isFinite(inlineHeightPx) &&
+        inlineHeightPx > 0 &&
+        inlineHeightPx <= 120;
+
+      let hasGeometricClip = false;
+      if (clipsY && curr.isConnected && injectedEl.isConnected) {
+        try {
+          const currRect = curr.getBoundingClientRect();
+          const injRect = injectedEl.getBoundingClientRect();
+          if (currRect.height > 0 && injRect.height > 0) {
+            if (
+              injRect.bottom > currRect.bottom - 0.5 ||
+              injRect.top >= currRect.bottom - 1 ||
+              curr.scrollHeight > curr.clientHeight + 1
+            ) {
+              hasGeometricClip = true;
+            }
+          }
+        } catch {
+          // Ignore geometry errors on detached documents
+        }
+      }
+
+      if (
+        hasLineClamp ||
+        isWebkitBoxClamp ||
+        hasTightMaxHeight ||
+        hasTightInlineFixedHeight ||
+        hasGeometricClip
+      ) {
+        const whiteSpaceVal = (cs?.whiteSpace || curr.style.whiteSpace || '')
+          .trim()
+          .toLowerCase();
+        this.applyUnclampOverrides(
+          curr,
+          displayVal,
+          whiteSpaceVal,
+          hasLineClamp,
+        );
+      }
+
+      curr = curr.parentElement;
+    }
+  }
+
+  private restoreSingleUnclampedElement(el: HTMLElement): void {
+    const snapshot = this.unclampedStyles.get(el);
+    el.removeAttribute('data-margin-unclamped');
+    if (!snapshot) return;
+
+    this.unclampedStyles.delete(el);
+
+    if (
+      snapshot.styleAfterUnclamp !== null &&
+      el.getAttribute('style') === snapshot.styleAfterUnclamp
+    ) {
+      if (!snapshot.hadStyleAttr || snapshot.originalStyleAttr === null) {
+        el.removeAttribute('style');
+      } else {
+        el.setAttribute('style', snapshot.originalStyleAttr);
+      }
+      return;
+    }
+
+    for (const prop of UNCLAMP_TRACKED_PROPS) {
+      const saved = snapshot.props[prop];
+      if (saved && saved.value) {
+        el.style.setProperty(prop, saved.value, saved.priority);
+      } else {
+        el.style.removeProperty(prop);
+      }
+    }
+
+    if (!snapshot.hadStyleAttr && !el.getAttribute('style')?.trim()) {
+      el.removeAttribute('style');
+    }
+  }
+
+  private restoreUnclampedForBlock(blockEl: HTMLElement): void {
+    let curr: HTMLElement | null = blockEl;
+    for (let depth = 0; depth <= 3 && curr; depth++) {
+      if (curr === this.doc.body || curr === this.doc.documentElement) {
+        break;
+      }
+      if (
+        curr.getAttribute('data-margin-unclamped') === 'true' &&
+        curr.querySelector('[data-margin-injected="true"]') === null
+      ) {
+        this.restoreSingleUnclampedElement(curr);
+      }
+      curr = curr.parentElement;
+    }
+  }
+
+  private restoreAllUnclampedElements(): void {
+    const unclamped = Array.from(
+      this.doc.querySelectorAll<HTMLElement>('[data-margin-unclamped="true"]'),
+    );
+    for (const el of unclamped) {
+      this.restoreSingleUnclampedElement(el);
+    }
+  }
+
   private mountBlockLoadingIndicator(blockEl: HTMLElement): void {
     if (!blockEl.isConnected || this.hasMountedTranslation(blockEl)) return;
     for (let i = 0; i < blockEl.children.length; i++) {
@@ -833,6 +1257,7 @@ export class WebpageRenderer {
 
       loading.append(spinner, label);
       this.insertInjectedIntoBlock(blockEl, loading);
+      this.unclampForInjectedNode(blockEl, loading);
     });
   }
 
@@ -1099,6 +1524,7 @@ export class WebpageRenderer {
     this.runInternalDomMutation(() => {
       this.clearBlockInjectedElements(blockEl);
       this.unwrapOriginalContent(blockEl);
+      this.restoreUnclampedForBlock(blockEl);
       blockEl.removeAttribute('data-margin-translated');
       this.mountedMeta.delete(blockEl);
       this.translatedBlockSet.delete(blockEl);
@@ -1112,10 +1538,27 @@ export class WebpageRenderer {
     options: { forceBilingual?: boolean } = {},
   ): { fallbackPlain: boolean } {
     this.ensureStylesInjected();
-    const reconstructed = reconstructRichDom(translatedText, tokenized, this.doc);
     const displayMode: DisplayMode = options.forceBilingual
       ? 'bilingual'
       : this.config.webpage.displayMode;
+
+    if (
+      displayMode === 'bilingual' &&
+      isRedundantIdenticalTranslation(tokenized.text, translatedText)
+    ) {
+      this.runInternalDomMutation(() => {
+        this.clearBlockInjectedElements(blockEl);
+        this.unwrapOriginalContent(blockEl);
+        this.restoreUnclampedForBlock(blockEl);
+        blockEl.removeAttribute('data-margin-translated');
+        this.mountedMeta.delete(blockEl);
+        this.translatedBlockSet.delete(blockEl);
+        this.failedBlockTasks.delete(blockEl);
+      });
+      return { fallbackPlain: false };
+    }
+
+    const reconstructed = reconstructRichDom(translatedText, tokenized, this.doc);
     const theme = this.resolveEffectiveTheme();
     const layout = this.computeLayoutMode(
       blockEl,
@@ -1156,10 +1599,13 @@ export class WebpageRenderer {
       });
 
       this.insertInjectedIntoBlock(blockEl, span);
+      this.unclampForInjectedNode(blockEl, span);
       blockEl.setAttribute('data-margin-translated', 'true');
       this.mountedMeta.set(blockEl, {
         plainTextLength: tokenized.plainTextLength,
         fallbackPlain: reconstructed.fallbackPlain,
+        sourceText: tokenized.text,
+        translatedText,
       });
       this.translatedBlockSet.add(blockEl);
       this.failedBlockTasks.delete(blockEl);
@@ -1215,6 +1661,7 @@ export class WebpageRenderer {
           retryBatch();
         });
         this.insertInjectedIntoBlock(task.block, btn);
+        this.unclampForInjectedNode(task.block, btn);
       }
     });
   }
@@ -1362,6 +1809,7 @@ export class WebpageRenderer {
             this.observedBlocks.delete(task.block);
             if (!this.hasMountedTranslation(task.block)) {
               this.clearBlockInjectedElements(task.block);
+              this.restoreUnclampedForBlock(task.block);
             }
           }
         }
@@ -1770,6 +2218,8 @@ export class WebpageRenderer {
       for (const blk of markedBlocks) {
         blk.removeAttribute('data-margin-translated');
       }
+
+      this.restoreAllUnclampedElements();
     });
   }
 
@@ -1873,11 +2323,27 @@ export class WebpageRenderer {
         }
 
         const meta = this.mountedMeta.get(parentBlock);
+        if (
+          prevDisplayMode !== newDisplayMode &&
+          newDisplayMode === 'bilingual' &&
+          meta &&
+          isRedundantIdenticalTranslation(meta.sourceText, meta.translatedText)
+        ) {
+          this.clearBlockInjectedElements(parentBlock);
+          this.unwrapOriginalContent(parentBlock);
+          this.restoreUnclampedForBlock(parentBlock);
+          parentBlock.removeAttribute('data-margin-translated');
+          this.mountedMeta.delete(parentBlock);
+          this.translatedBlockSet.delete(parentBlock);
+          continue;
+        }
+
         const plainLen = meta?.plainTextLength ?? (span.textContent?.length ?? 0);
         span.setAttribute(
           'data-margin-layout',
           this.computeLayoutMode(parentBlock, plainLen, newDisplayMode),
         );
+        this.unclampForInjectedNode(parentBlock, span);
       }
     });
   }

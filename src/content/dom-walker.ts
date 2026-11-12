@@ -92,6 +92,23 @@ export const EXCLUDED_SUBTREE_TAGS: ReadonlySet<string> = new Set([
   'OBJECT',
   'EMBED',
   'NAV',
+  // YouTube & social channel/owner/button/metadata custom elements
+  'YTD-CHANNEL-NAME',
+  'YTD-VIDEO-OWNER-RENDERER',
+  'YTD-VIDEO-META-BLOCK',
+  'YTD-BADGE-SUPPORTED-RENDERER',
+  'YTD-BUTTON-RENDERER',
+  'YTD-SUBSCRIBE-BUTTON-RENDERER',
+  'YTD-TOGGLE-BUTTON-RENDERER',
+  'YTD-MENU-RENDERER',
+  'YTD-AUTHOR-COMMENT-BADGE-RENDERER',
+  'YTD-LIVE-CHAT-FRAME',
+  'YT-BUTTON-SHAPE',
+  'YT-BUTTON-VIEW-MODEL',
+  'YT-CONTENT-METADATA-VIEW-MODEL',
+  'YT-DECORATED-AVATAR-VIEW-MODEL',
+  'TP-YT-PAPER-BUTTON',
+  'TP-YT-PAPER-TOOLTIP',
 ]);
 
 export const ATOMIC_INLINE_TAGS: ReadonlySet<string> = new Set([
@@ -128,6 +145,37 @@ const EXCLUDED_DATA_TESTIDS: ReadonlySet<string> = new Set([
   'app-bar-back',
   'SideNav_AccountSwitcher_Button',
   'logged_out_read_replies_pivot',
+  'tweetButton',
+  'tweetButtonInline',
+  'toolBar',
+  'socialContext',
+]);
+
+const EXCLUDED_ELEMENT_IDS: ReadonlySet<string> = new Set([
+  'channel-name',
+  'owner-sub-count',
+  'subscriber-count',
+  'metadata-line',
+  'info-strings',
+  'author-text',
+]);
+
+const EXCLUDED_ELEMENT_CLASSES: ReadonlySet<string> = new Set([
+  'DraftEditor-root',
+  'DraftEditor-editorContainer',
+  'public-DraftEditorPlaceholder-root',
+  'public-DraftEditorPlaceholder-inner',
+  'public-DraftEditor-content',
+  'ProseMirror',
+  'ql-container',
+  'ql-editor',
+  'ql-blank',
+  'cm-editor',
+  'monaco-editor',
+  'ace_editor',
+  'ytp-caption-window-container',
+  'ytp-chrome-controls',
+  'ytp-chrome-top',
 ]);
 
 const EXCLUDED_ARIA_ROLES: ReadonlySet<string> = new Set([
@@ -136,12 +184,38 @@ const EXCLUDED_ARIA_ROLES: ReadonlySet<string> = new Set([
   'menubar',
   'tablist',
   'toolbar',
+  'textbox',
+  'searchbox',
+  'combobox',
+  'spinbutton',
+  'listbox',
+  'menu',
+  'menuitem',
+  'menuitemcheckbox',
+  'menuitemradio',
+  'option',
+  'switch',
+  'slider',
+  'scrollbar',
+  'tooltip',
 ]);
+
+const EDITABLE_TEXT_CONTROL_SELECTOR = [
+  '[contenteditable="true"]',
+  '[contenteditable=""]',
+  '[contenteditable="plaintext-only"]',
+  '[role="textbox"]',
+  '[role="searchbox"]',
+  '[role="combobox"]',
+  'textarea',
+  'input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"])',
+].join(', ');
 
 const STANDALONE_INLINE_CANDIDATE_TAGS: ReadonlySet<string> = new Set([
   'SPAN',
   'LABEL',
   'A',
+  'YT-FORMATTED-STRING',
 ]);
 
 const CJK_OR_KANA_HANGUL_RE =
@@ -275,6 +349,105 @@ function isCssHiddenOrScreenReaderOnly(el: Element): boolean {
   return false;
 }
 
+function hasPointerEventsNone(el: Element): boolean {
+  if (el instanceof HTMLElement && el.style) {
+    const inlinePe = el.style.pointerEvents?.trim().toLowerCase();
+    if (inlinePe === 'none') {
+      return true;
+    }
+  }
+  if (el.isConnected) {
+    const view = el.ownerDocument?.defaultView;
+    if (view && typeof view.getComputedStyle === 'function') {
+      try {
+        if (
+          view.getComputedStyle(el).pointerEvents?.trim().toLowerCase() ===
+          'none'
+        ) {
+          return true;
+        }
+      } catch {
+        // Ignore computed-style errors on detached/foreign documents
+      }
+    }
+  }
+  return false;
+}
+
+/**
+ * Detects rich-text composer placeholder overlays (e.g. Draft.js, Lexical, Slate,
+ * or obfuscated React overlays using `pointer-events: none` next to a `[role="textbox"]`
+ * or `[contenteditable="true"]` input surface).
+ */
+function isComposerPlaceholderOverlay(el: Element): boolean {
+  const parent = el.parentElement;
+  if (!parent) return false;
+  if (!hasPointerEventsNone(el) && !hasPointerEventsNone(parent)) {
+    return false;
+  }
+
+  const body = el.ownerDocument?.body;
+  const docEl = el.ownerDocument?.documentElement;
+  let anc: Element | null = parent;
+
+  for (let depth = 0; depth < 3 && anc; depth++) {
+    if (anc === body || anc === docEl) break;
+    const ancTag = anc.tagName.toUpperCase();
+    if (
+      ancTag === 'MAIN' ||
+      ancTag === 'ARTICLE' ||
+      ancTag === 'SECTION' ||
+      ancTag === 'TABLE' ||
+      ancTag === 'UL' ||
+      ancTag === 'OL'
+    ) {
+      break;
+    }
+    if (anc.children.length > 8) {
+      break;
+    }
+    if (isContentEditableNode(anc)) {
+      return true;
+    }
+    const ancRole = anc.getAttribute('role')?.trim().toLowerCase();
+    if (
+      ancRole === 'textbox' ||
+      ancRole === 'searchbox' ||
+      ancRole === 'combobox'
+    ) {
+      return true;
+    }
+    if (anc.querySelector(EDITABLE_TEXT_CONTROL_SELECTOR) !== null) {
+      return true;
+    }
+    anc = anc.parentElement;
+  }
+
+  return false;
+}
+
+function isUiButtonRoleElement(
+  el: Element,
+  options: { insideParagraph?: boolean },
+): boolean {
+  const tag = el.tagName.toUpperCase();
+  if (options.insideParagraph && tag === 'A') {
+    return false;
+  }
+  // Preserve multi-block clickable card containers (e.g. React Native Web Pressable news cards)
+  if (
+    el.querySelector(
+      'article, section, p, h1, h2, h3, h4, h5, h6, blockquote, [data-testid="tweetText"], [data-testid="trend"]',
+    )
+  ) {
+    return false;
+  }
+  if (hasNestedBlockChildren(el) && (el.textContent?.trim().length ?? 0) > 36) {
+    return false;
+  }
+  return true;
+}
+
 /**
  * Returns true if `el` and its entire subtree should be skipped during block discovery
  * (or inline serialization when `options.insideParagraph` is true).
@@ -300,19 +473,63 @@ export function isExcludedElement(
     return true;
   }
 
+  const elemId = el.getAttribute('id')?.trim();
+  if (elemId) {
+    const lowerId = elemId.toLowerCase();
+    if (
+      EXCLUDED_ELEMENT_IDS.has(lowerId) ||
+      lowerId.startsWith('placeholder-')
+    ) {
+      return true;
+    }
+  }
+
   const testId = el.getAttribute('data-testid');
   if (
     testId &&
     (EXCLUDED_DATA_TESTIDS.has(testId) ||
+      testId.includes('tweetTextarea') ||
       testId.startsWith('UserAvatar-Container-') ||
       testId.startsWith('User-Avatar-Container-'))
   ) {
     return true;
   }
 
-  const role = el.getAttribute('role')?.trim().toLowerCase();
-  if (role && EXCLUDED_ARIA_ROLES.has(role)) {
+  if (
+    el.hasAttribute('data-placeholder') ||
+    el.hasAttribute('data-slate-placeholder') ||
+    el.hasAttribute('data-lexical-editor') ||
+    el.hasAttribute('data-slate-editor')
+  ) {
     return true;
+  }
+
+  const classList = el.classList;
+  if (classList && classList.length > 0) {
+    for (let i = 0; i < classList.length; i++) {
+      if (EXCLUDED_ELEMENT_CLASSES.has(classList[i])) {
+        return true;
+      }
+    }
+  }
+
+  const rawClassAttr = el.getAttribute('class');
+  if (
+    rawClassAttr &&
+    /placeholder/i.test(rawClassAttr) &&
+    !el.querySelector('article, section, table, blockquote')
+  ) {
+    return true;
+  }
+
+  const role = el.getAttribute('role')?.trim().toLowerCase();
+  if (role) {
+    if (EXCLUDED_ARIA_ROLES.has(role)) {
+      return true;
+    }
+    if (role === 'button' && isUiButtonRoleElement(el, options)) {
+      return true;
+    }
   }
 
   if (el.getAttribute('aria-hidden')?.trim().toLowerCase() === 'true') {
@@ -324,8 +541,8 @@ export function isExcludedElement(
   }
 
   if (
-    el.classList?.contains('notranslate') ||
-    el.classList?.contains('margin-notranslate')
+    classList?.contains('notranslate') ||
+    classList?.contains('margin-notranslate')
   ) {
     return true;
   }
@@ -339,6 +556,10 @@ export function isExcludedElement(
   }
 
   if (isCssHiddenOrScreenReaderOnly(el)) {
+    return true;
+  }
+
+  if (isComposerPlaceholderOverlay(el)) {
     return true;
   }
 
@@ -636,14 +857,21 @@ export function isReadableLeafBlock(
     return false;
   }
 
-  // Flex/grid card row with no bare text and a single `<span>`/`<a>`/`<label>` child alongside
-  // controls (e.g. `<div style="display:flex"><span>Card title</span><button>Open</button></div>`)
+  // Flex/grid card or heading row with no bare text and a single `<span>`/`<a>`/`<label>`/`<yt-formatted-string>`
+  // child alongside controls (e.g. `<div style="display:flex"><span>Card title</span><button>Open</button></div>`
+  // or `<h1 style="display:flex"><yt-formatted-string>Title</yt-formatted-string><button>Share</button></h1>`)
   // delegates to that child so the block translation stacks inside the text cell instead of as a flex sibling.
   if (
     (tag === 'DIV' ||
       tag === 'SECTION' ||
       tag === 'ARTICLE' ||
-      tag === 'ASIDE') &&
+      tag === 'ASIDE' ||
+      tag === 'H1' ||
+      tag === 'H2' ||
+      tag === 'H3' ||
+      tag === 'H4' ||
+      tag === 'H5' ||
+      tag === 'H6') &&
     isFlexOrGridContainer(el) &&
     !hasDirectBareNonWhitespaceText(el) &&
     countDirectInlineCandidateChildren(el) === 1

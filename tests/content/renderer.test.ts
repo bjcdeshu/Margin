@@ -15,6 +15,7 @@ import {
   LruTranslationCache,
   WEBPAGE_INJECTED_CSS,
   WebpageRenderer,
+  isRedundantIdenticalTranslation,
   packIntoBatches,
   packIntoProgressiveBatches,
 } from '../../src/content/renderer';
@@ -609,5 +610,114 @@ describe('renderer & content orchestrator: themes, reversible target-only, retry
     expect(p.querySelector('.margin-trans-root')).toBeNull();
 
     controller.destroy();
+  });
+
+  it('reversibly unclamps -webkit-line-clamp & tight max-height ancestors, suppresses identical bilingual translations (NFL -> NFL) without stuck spinners, and restores DOM bit-for-bit', async () => {
+    expect(isRedundantIdenticalTranslation('NFL', 'NFL')).toBe(true);
+    expect(isRedundantIdenticalTranslation('nfl', '“NFL.”')).toBe(true);
+    expect(
+      isRedundantIdenticalTranslation('<m0>옹발이 ONGBAL</m0>', '<m0>옹발이 ONGBAL</m0>'),
+    ).toBe(true);
+    expect(isRedundantIdenticalTranslation('Commanders', '指挥官队')).toBe(false);
+
+    const config = createDefaultMarginConfig();
+    config.webpage.displayMode = 'bilingual';
+
+    document.body.innerHTML = `
+      <main id="content-root">
+        <div id="yt-title-wrap" style="max-height: 5.6rem; overflow: hidden;">
+          <h1 id="yt-h1" style="max-height: 5.6rem; overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2;">
+            <yt-formatted-string>Yubi, No. 21 Swordfighter Puppet No Damage Hellwalker – Phantom Blade Zero</yt-formatted-string>
+          </h1>
+        </div>
+        <div id="x-news-card">
+          <div id="x-news-headline" style="display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;">Comma in Passwords Tip Circulates as CSV Leak Defense...</div>
+        </div>
+        <div id="scroll-panel" style="max-height: 120px; overflow-y: auto;">
+          <p id="inside-scroll">Scrollable container must keep overflow-y: auto untouched.</p>
+        </div>
+        <h2 id="nfl-header" style="max-height: 32px; overflow: hidden;">NFL</h2>
+      </main>
+    `;
+
+    const contentRoot = document.getElementById('content-root')!;
+    const preContentOuterHtml = contentRoot.outerHTML;
+    const preBodyHtml = document.body.innerHTML;
+    const ytWrap = document.getElementById('yt-title-wrap')!;
+    const ytH1 = document.getElementById('yt-h1')!;
+    const xHeadline = document.getElementById('x-news-headline')!;
+    const scrollPanel = document.getElementById('scroll-panel')!;
+    const nflHeader = document.getElementById('nfl-header')!;
+
+    let apiCalls = 0;
+    const renderer = new WebpageRenderer({
+      config,
+      getUrl: () => 'https://x.com/home',
+      transport: async (req) => {
+        apiCalls += 1;
+        return {
+          ok: true,
+          requestId: req.requestId,
+          providerId: 'google-free',
+          model: 'gtx',
+          items: req.items.map((it) => {
+            if (it.text.trim() === 'NFL') {
+              return { id: it.id, trans: 'NFL' };
+            }
+            if (it.text.includes('Yubi')) {
+              return {
+                id: it.id,
+                trans: 'Yubi：21号剑士傀儡无伤通关地狱行者难度 – 《影之刃零》',
+              };
+            }
+            return { id: it.id, trans: `中文译文：${it.text}` };
+          }),
+          diagnostic: makeMockDiagnostic(),
+        };
+      },
+    });
+
+    await renderer.translateWholePage();
+    expect(apiCalls).toBeGreaterThan(0);
+
+    // 1. YouTube H1 and its tight max-height parent wrapper are unclamped
+    expect(ytH1.getAttribute('data-margin-unclamped')).toBe('true');
+    expect(ytWrap.getAttribute('data-margin-unclamped')).toBe('true');
+    expect(ytH1.style.getPropertyValue('max-height')).toBe('none');
+    expect(ytH1.style.getPropertyPriority('max-height')).toBe('important');
+    expect(ytH1.style.getPropertyValue('-webkit-line-clamp')).toBe('unset');
+    expect(ytH1.style.getPropertyValue('display')).toBe('block');
+    expect(ytH1.style.getPropertyValue('overflow')).toBe('visible');
+    expect(ytH1.querySelector('.margin-trans-root')?.textContent).toContain(
+      '21号剑士傀儡',
+    );
+
+    // 2. X Today's News -webkit-line-clamp: 2 headline is unclamped
+    expect(xHeadline.getAttribute('data-margin-unclamped')).toBe('true');
+    expect(xHeadline.style.getPropertyValue('display')).toBe('block');
+    expect(xHeadline.style.getPropertyValue('-webkit-line-clamp')).toBe('unset');
+    expect(xHeadline.querySelector('.margin-trans-root')?.textContent).toContain(
+      '中文译文：Comma in Passwords',
+    );
+
+    // 3. Scrollable container (overflow-y: auto) is NEVER altered
+    expect(scrollPanel.hasAttribute('data-margin-unclamped')).toBe(false);
+    expect(scrollPanel.style.overflowY).toBe('auto');
+
+    // 4. Identical translation (NFL -> NFL) is suppressed with ZERO stuck spinner and its temporary loading unclamp restored!
+    expect(nflHeader.querySelector('.margin-trans-root')).toBeNull();
+    expect(nflHeader.querySelector('.margin-trans-loading')).toBeNull();
+    expect(nflHeader.hasAttribute('data-margin-translated')).toBe(false);
+    expect(nflHeader.hasAttribute('data-margin-unclamped')).toBe(false);
+    expect(nflHeader.getAttribute('style')).toBe('max-height: 32px; overflow: hidden;');
+
+    // 5. restorePage() restores the entire content DOM 100% bit-for-bit!
+    renderer.restorePage();
+    expect(document.querySelectorAll('[data-margin-unclamped]').length).toBe(0);
+    expect(document.body.querySelectorAll('[data-margin-injected]').length).toBe(0);
+    expect(contentRoot.outerHTML).toBe(preContentOuterHtml);
+
+    renderer.destroy();
+    expect(document.body.innerHTML).toBe(preBodyHtml);
   });
 });
