@@ -7,11 +7,9 @@ import type {
 } from '@shared/types';
 import { parse as parseYaml } from 'yaml';
 import {
-  buildExpandedPromptVariables,
-  ensureRichTagInstruction,
+  expandAssistantPrompts,
   extractStreamableVisibleText,
-  interpolateTemplate,
-  selectPromptsForBatch,
+  formatYamlItemRow,
   stripThinkingBlocks,
 } from './template';
 import type {
@@ -21,56 +19,7 @@ import type {
   PromptCodec,
 } from './types';
 
-const BLOCK_SCALAR_HEADER_RE =
-  /:\s*[|>][-+]?\d*[ \t]*\r?\n([ \t]*)\{\{\s*(?:yaml_)?text\s*\}\}/m;
-
-const NEEDS_YAML_FLOW_QUOTE_RE =
-  /(?:^\s|\s$|\n|:[ \t]|:$|[ \t]#|^[-?:,[\]{}#&*!|>'"%@`]|^(?:true|false|null|yes|no|on|off|~|[-+]?\d+(?:\.\d+)?)$)/i;
-
-function needsYamlFlowQuoting(value: string): boolean {
-  if (value === '') return true;
-  return NEEDS_YAML_FLOW_QUOTE_RE.test(value);
-}
-
-export function formatYamlItemRow(
-  itemTemplate: string,
-  wireId: number,
-  rawText: string,
-  sharedVars: Readonly<Record<string, string>>,
-): string {
-  const preExpanded = interpolateTemplate(itemTemplate, {
-    ...sharedVars,
-    id: String(wireId),
-  });
-
-  const normalizedText = String(rawText ?? '').replace(/\r\n?/g, '\n');
-  const blockMatch = BLOCK_SCALAR_HEADER_RE.exec(preExpanded);
-
-  if (blockMatch) {
-    const templateIndent = blockMatch[1] ?? '';
-    const effectiveIndent = templateIndent.length > 0 ? templateIndent : '    ';
-    const indentedSubsequent = normalizedText
-      .split('\n')
-      .map((line, idx) => {
-        if (idx === 0) {
-          return templateIndent.length > 0 ? line : `${effectiveIndent}${line}`;
-        }
-        return line.length === 0 ? '' : `${effectiveIndent}${line}`;
-      })
-      .join('\n');
-
-    return preExpanded.replace(
-      /\{\{\s*(?:yaml_)?text\s*\}\}/g,
-      () => indentedSubsequent,
-    );
-  }
-
-  const safeFlow = needsYamlFlowQuoting(normalizedText)
-    ? JSON.stringify(normalizedText)
-    : normalizedText;
-
-  return preExpanded.replace(/\{\{\s*(?:yaml_)?text\s*\}\}/g, () => safeFlow);
-}
+export { formatYamlItemRow };
 
 export function extractCleanYamlPayload(
   rawText: string,
@@ -638,58 +587,16 @@ export class YamlPromptCodec implements PromptCodec {
 
   encode(input: CodecEncodeInput): EncodedPrompt {
     const assistant = input.assistant ?? BUILTIN_ASSISTANTS['builtin-yaml'];
-    const baseVars = buildExpandedPromptVariables({
+    const { systemPrompt, userPrompt } = expandAssistantPrompts({
+      assistant,
       scene: input.scene,
       fromLang: input.fromLang,
       toLang: input.toLang,
       items: input.items,
-      assistant,
       context: input.context,
       glossary: input.glossary,
     });
-
-    const itemTemplate =
-      input.scene === 'subtitle'
-        ? assistant.env.imt_subtitle_yaml_item ||
-          assistant.env.imt_yaml_item ||
-          BUILTIN_ASSISTANTS['builtin-yaml'].env.imt_subtitle_yaml_item
-        : assistant.env.imt_yaml_item ||
-          BUILTIN_ASSISTANTS['builtin-yaml'].env.imt_yaml_item;
-
-    const yamlBlock = input.items
-      .map((item, idx) =>
-        formatYamlItemRow(itemTemplate, idx + 1, item.text, baseVars),
-      )
-      .join('\n');
-
-    const fullVars: Record<string, string> = {
-      ...baseVars,
-      yaml: yamlBlock,
-      text: yamlBlock,
-    };
-
-    const { systemTemplate, userTemplate } = selectPromptsForBatch(
-      assistant,
-      input.scene,
-      input.items.length,
-    );
-
-    const rawSystemPrompt = interpolateTemplate(systemTemplate, fullVars).trim();
-    const userPrompt = interpolateTemplate(userTemplate, fullVars).trim();
-    const userTemplateInstructionsOnly = interpolateTemplate(userTemplate, {
-      ...baseVars,
-      yaml: '',
-      text: '',
-    }).trim();
-
-    return {
-      systemPrompt: ensureRichTagInstruction(
-        rawSystemPrompt,
-        userTemplateInstructionsOnly,
-        input.items,
-      ),
-      userPrompt,
-    };
+    return { systemPrompt, userPrompt };
   }
 
   decode(
@@ -719,6 +626,8 @@ export class YamlPromptCodec implements PromptCodec {
     const expectYamlTag =
       /<yaml\b/i.test(activeAssistant.prompt ?? '') ||
       /<yaml\b/i.test(activeAssistant.multiplePrompt ?? '') ||
+      /<yaml\b/i.test(activeAssistant.inputPrompt ?? '') ||
+      /<yaml\b/i.test(activeAssistant.selectionPrompt ?? '') ||
       /<yaml\b/i.test(activeAssistant.subtitlePrompt ?? '') ||
       /<yaml\b/i.test(activeAssistant.systemPrompt ?? '');
 

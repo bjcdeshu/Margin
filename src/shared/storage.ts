@@ -1,6 +1,12 @@
 import { BRAND } from './brand';
-import { createDefaultMarginConfig } from './constants';
+import {
+  BUILTIN_ASSISTANTS,
+  cloneAssistantConfig,
+  cloneBuiltinAssistants,
+  createDefaultMarginConfig,
+} from './constants';
 import type {
+  AssistantConfig,
   DiagnosticSnapshot,
   MarginConfig,
   ModelCapabilityEntry,
@@ -22,13 +28,27 @@ function hasChromeStorage(): boolean {
   }
 }
 
+function clonePlainValue<T>(val: T): T {
+  if (val === null || typeof val !== 'object') {
+    return val;
+  }
+  if (Array.isArray(val)) {
+    return val.map((item) => clonePlainValue(item)) as unknown as T;
+  }
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(val as Record<string, unknown>)) {
+    out[k] = clonePlainValue(v);
+  }
+  return out as T;
+}
+
 async function rawGet<T>(key: string): Promise<T | undefined> {
   if (hasChromeStorage()) {
     const result = await chrome.storage.local.get(key);
     return result[key] as T | undefined;
   }
   const val = memoryFallback.get(key);
-  return val !== undefined ? structuredClone(val as T) : undefined;
+  return val !== undefined ? clonePlainValue(val as T) : undefined;
 }
 
 async function rawSet(key: string, value: unknown): Promise<void> {
@@ -36,7 +56,7 @@ async function rawSet(key: string, value: unknown): Promise<void> {
     await chrome.storage.local.set({ [key]: value });
     return;
   }
-  memoryFallback.set(key, structuredClone(value));
+  memoryFallback.set(key, clonePlainValue(value));
 }
 
 function clampSubtitleScale(value: unknown, fallback: number): number {
@@ -45,47 +65,173 @@ function clampSubtitleScale(value: unknown, fallback: number): number {
   return Math.max(50, Math.min(160, Math.round(n)));
 }
 
-function backfillStoredConfig(stored: MarginConfig): {
+function backfillScenePromptsOnAssistant(ast: AssistantConfig): boolean {
+  let changed = false;
+  let donor: Pick<
+    AssistantConfig,
+    'inputPrompt' | 'selectionPrompt' | 'subtitlePrompt'
+  >;
+
+  if (ast.codec === 'delimiter') {
+    donor = BUILTIN_ASSISTANTS['builtin-delimiter'];
+  } else if (ast.codec === 'yaml') {
+    donor =
+      ast.id === 'builtin-yaml-thinking'
+        ? BUILTIN_ASSISTANTS['builtin-yaml-thinking']
+        : BUILTIN_ASSISTANTS['builtin-yaml'];
+  } else if (ast.codec === 'json-batch') {
+    donor = {
+      inputPrompt:
+        '{{glossary_prompt}}Rewrite and translate into concise, idiomatic, native-speaker {{to}} ready to send or post. Respond ONLY with JSON `[{"id":1,"trans":"..."}]`:\n{{json}}',
+      selectionPrompt:
+        '{{title_prompt}}{{glossary_prompt}}Translate the selected passage into crisp, natural {{to}}. Respond ONLY with JSON `[{"id":1,"trans":"..."}]`:\n{{json}}',
+      subtitlePrompt:
+        '{{title_prompt}}{{glossary_prompt}}Translate each subtitle cue into natural spoken {{to}} keeping exact cue `id` alignment. Respond ONLY with JSON `[{"id":1,"trans":"..."}]`:\n{{json}}',
+    };
+  } else {
+    donor = {
+      inputPrompt: '{{text}}',
+      selectionPrompt: '{{text}}',
+      subtitlePrompt: '{{text}}',
+    };
+  }
+
+  if (!ast.inputPrompt?.trim() && donor.inputPrompt) {
+    ast.inputPrompt = donor.inputPrompt;
+    changed = true;
+  }
+  if (!ast.selectionPrompt?.trim() && donor.selectionPrompt) {
+    ast.selectionPrompt = donor.selectionPrompt;
+    changed = true;
+  }
+  if (!ast.subtitlePrompt?.trim() && donor.subtitlePrompt) {
+    ast.subtitlePrompt = donor.subtitlePrompt;
+    changed = true;
+  }
+
+  return changed;
+}
+
+export function backfillStoredConfig(stored: MarginConfig): {
   config: MarginConfig;
   mutated: boolean;
 } {
   let mutated = false;
   const defaults = createDefaultMarginConfig();
 
+  // 1. Subtitle scales & preset backfill
   if (!stored.subtitles) {
     stored.subtitles = structuredClone(defaults.subtitles);
     mutated = true;
-    return { config: stored, mutated };
+  } else {
+    const sub = stored.subtitles as Partial<MarginConfig['subtitles']>;
+    const legacyTransScale = clampSubtitleScale(sub.fontSizePercent, 70);
+    const nextSourceScale = clampSubtitleScale(sub.sourceScalePercent, 100);
+    const nextTransScale = clampSubtitleScale(
+      sub.translationScalePercent,
+      legacyTransScale,
+    );
+    const nextPreset =
+      sub.stylePreset === 'youtube-native' ||
+      sub.stylePreset === 'cinema-outline' ||
+      sub.stylePreset === 'warm-paper'
+        ? sub.stylePreset
+        : 'youtube-native';
+
+    if (
+      sub.sourceScalePercent !== nextSourceScale ||
+      sub.translationScalePercent !== nextTransScale ||
+      sub.fontSizePercent !== nextTransScale ||
+      sub.stylePreset !== nextPreset
+    ) {
+      stored.subtitles = {
+        ...defaults.subtitles,
+        ...sub,
+        sourceScalePercent: nextSourceScale,
+        translationScalePercent: nextTransScale,
+        fontSizePercent: nextTransScale,
+        stylePreset: nextPreset,
+      };
+      mutated = true;
+    }
   }
 
-  const sub = stored.subtitles as Partial<MarginConfig['subtitles']>;
-  const legacyTransScale = clampSubtitleScale(sub.fontSizePercent, 70);
-  const nextSourceScale = clampSubtitleScale(sub.sourceScalePercent, 100);
-  const nextTransScale = clampSubtitleScale(
-    sub.translationScalePercent,
-    legacyTransScale,
-  );
-  const nextPreset =
-    sub.stylePreset === 'youtube-native' ||
-    sub.stylePreset === 'cinema-outline' ||
-    sub.stylePreset === 'warm-paper'
-      ? sub.stylePreset
-      : 'youtube-native';
+  // 2. Webpage auto-translate mode & language list backfill (v2.2.0 default: `'foreign'`)
+  if (!stored.webpage) {
+    stored.webpage = structuredClone(defaults.webpage);
+    mutated = true;
+  } else {
+    const wp = stored.webpage as Partial<MarginConfig['webpage']>;
+    const hasValidMode =
+      wp.autoTranslateMode === 'off' ||
+      wp.autoTranslateMode === 'whitelist' ||
+      wp.autoTranslateMode === 'foreign';
+    if (!hasValidMode) {
+      stored.webpage.autoTranslateMode = 'foreign';
+      stored.webpage.autoTranslateMatches = true;
+      stored.webpage.autoTranslateLanguages ??= [];
+      mutated = true;
+    } else if (!Array.isArray(stored.webpage.autoTranslateLanguages)) {
+      stored.webpage.autoTranslateLanguages = [];
+      mutated = true;
+    }
+  }
 
-  if (
-    sub.sourceScalePercent !== nextSourceScale ||
-    sub.translationScalePercent !== nextTransScale ||
-    sub.fontSizePercent !== nextTransScale ||
-    sub.stylePreset !== nextPreset
-  ) {
-    stored.subtitles = {
-      ...defaults.subtitles,
-      ...sub,
-      sourceScalePercent: nextSourceScale,
-      translationScalePercent: nextTransScale,
-      fontSizePercent: nextTransScale,
-      stylePreset: nextPreset,
-    };
+  // 3. Enabled built-in glossary packs backfill
+  if (!Array.isArray(stored.enabledGlossaryPacks)) {
+    stored.enabledGlossaryPacks = [...(defaults.enabledGlossaryPacks ?? [])];
+    mutated = true;
+  }
+
+  // 4. Ensure `assistants` map & `builtin-yaml-thinking` preset exist
+  if (!stored.assistants || typeof stored.assistants !== 'object') {
+    stored.assistants = cloneBuiltinAssistants();
+    mutated = true;
+  } else if (!stored.assistants['builtin-yaml-thinking']) {
+    stored.assistants['builtin-yaml-thinking'] = cloneAssistantConfig(
+      BUILTIN_ASSISTANTS['builtin-yaml-thinking'],
+    );
+    mutated = true;
+  }
+
+  // 5. Prompt System v2 Editorial Upgrade & stock Aloxaf `custom` channel migration
+  if ((stored.promptSystemVersion ?? 1) < 2) {
+    const customAst = stored.assistants['custom'];
+    const customPromptBody = customAst
+      ? `${customAst.multiplePrompt ?? customAst.prompt ?? ''}\n${customAst.systemPrompt ?? ''}\n${customAst.multipleSystemPrompt ?? ''}`
+      : '';
+    const isStockAloxafCustom = Boolean(
+      customAst &&
+        customAst.name?.includes('泛用翻译大师') &&
+        ((customAst.multiplePrompt ?? customAst.prompt ?? '').includes('thinking:') ||
+          /\bthinking\s*:|\bthinking\b[\s\S]*?\btrans\b/i.test(customPromptBody)),
+    );
+
+    stored.assistants['builtin-yaml'] = cloneAssistantConfig(
+      BUILTIN_ASSISTANTS['builtin-yaml'],
+    );
+    stored.assistants['builtin-yaml-thinking'] = cloneAssistantConfig(
+      BUILTIN_ASSISTANTS['builtin-yaml-thinking'],
+    );
+    stored.assistants['builtin-delimiter'] = cloneAssistantConfig(
+      BUILTIN_ASSISTANTS['builtin-delimiter'],
+    );
+
+    for (const ast of Object.values(stored.assistants)) {
+      if (ast && typeof ast === 'object') {
+        backfillScenePromptsOnAssistant(ast);
+      }
+    }
+
+    if (isStockAloxafCustom && stored.providers) {
+      for (const prov of Object.values(stored.providers)) {
+        if (prov && prov.assistantId === 'custom') {
+          prov.assistantId = 'builtin-yaml';
+        }
+      }
+    }
+
+    stored.promptSystemVersion = 2;
     mutated = true;
   }
 
@@ -110,7 +256,7 @@ export async function saveMarginConfig(config: MarginConfig): Promise<void> {
   await rawSet(BRAND.storageKeyConfig, config);
   if (!hasChromeStorage()) {
     for (const listener of memoryListeners) {
-      listener(structuredClone(config));
+      listener(clonePlainValue(config));
     }
   }
 }
@@ -119,7 +265,7 @@ export async function updateMarginConfig(
   mutator: (draft: MarginConfig) => MarginConfig | void,
 ): Promise<MarginConfig> {
   const current = await getMarginConfig();
-  const draft = structuredClone(current);
+  const draft = clonePlainValue(current);
   const next = mutator(draft) ?? draft;
   await saveMarginConfig(next);
   return next;
@@ -194,8 +340,52 @@ export async function clearDiagnosticsLog(): Promise<void> {
   await rawSet(BRAND.storageKeyDiagnostics, []);
 }
 
+function pinHappyDomMutationObserverCallbacksForTests(): void {
+  const win = (globalThis as unknown as { window?: Record<string, unknown> })
+    .window;
+  if (!win || !('happyDOM' in win) || typeof MutationObserver === 'undefined') {
+    return;
+  }
+  const proto = MutationObserver.prototype as unknown as {
+    observe: (target: Node, options?: MutationObserverInit) => void;
+    __marginWeakRefPinned?: boolean;
+  };
+  if (proto.__marginWeakRefPinned) return;
+  const origObserve = proto.observe;
+  proto.observe = function patchedObserve(
+    this: MutationObserver,
+    target: Node,
+    options?: MutationObserverInit,
+  ) {
+    origObserve.call(this, target, options);
+    if (target && typeof target === 'object') {
+      const mlSym = Object.getOwnPropertySymbols(target).find(
+        (s) => s.description === 'mutationListeners',
+      );
+      const list = mlSym
+        ? (target as unknown as Record<symbol, unknown>)[mlSym]
+        : undefined;
+      if (Array.isArray(list)) {
+        for (const item of list) {
+          if (item && typeof item === 'object') {
+            const rec = item as {
+              callback?: WeakRef<(...args: unknown[]) => void>;
+              __strongCallback?: (...args: unknown[]) => void;
+            };
+            if (rec.callback instanceof WeakRef && !rec.__strongCallback) {
+              rec.__strongCallback = rec.callback.deref();
+            }
+          }
+        }
+      }
+    }
+  };
+  proto.__marginWeakRefPinned = true;
+}
+
 /** Test-only helper to reset in-memory storage between unit tests. */
 export function resetMemoryStorageForTests(): void {
   memoryFallback.clear();
   memoryListeners.clear();
+  pinHappyDomMutationObserverCallbacksForTests();
 }

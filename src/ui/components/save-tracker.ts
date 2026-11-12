@@ -65,8 +65,15 @@ export function normalizeConfigForSave(config: MarginConfig): MarginConfig {
       v: String(entry.v ?? ''),
       ...(entry.domain?.trim() ? { domain: entry.domain.trim() } : {}),
       ...(entry.caseSensitive ? { caseSensitive: true } : {}),
+      ...(entry.enabled === false ? { enabled: false } : {}),
+      ...(entry.group?.trim() ? { group: entry.group.trim() } : {}),
+      ...(entry.note?.trim() ? { note: entry.note.trim() } : {}),
     }))
     .filter((entry) => entry.k.length > 0);
+
+  if (Array.isArray(next.enabledGlossaryPacks)) {
+    next.enabledGlossaryPacks = trimDedupeStrings(next.enabledGlossaryPacks);
+  }
 
   for (const provider of Object.values(next.providers)) {
     provider.name = String(provider.name ?? '').trim() || provider.id;

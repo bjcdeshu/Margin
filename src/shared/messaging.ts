@@ -11,6 +11,7 @@ import type {
   TranslateImageRequest,
   TranslateImageResponse,
   TranslateStreamPortMessage,
+  TranslationCacheStatsResponse,
 } from './types';
 
 export function isExtensionContextValid(hadRuntimeIdAtMount = false): boolean {
@@ -66,6 +67,18 @@ export function requestProviderTest(
   return sendRuntimeMessage<TranslateBatchResponse>({
     type: 'margin:test-provider',
     payload: { providerId },
+  });
+}
+
+export function requestTranslationCacheStats(): Promise<TranslationCacheStatsResponse> {
+  return sendRuntimeMessage<TranslationCacheStatsResponse>({
+    type: 'margin:get-translation-cache-stats',
+  });
+}
+
+export function requestClearTranslationCache(): Promise<{ ok: boolean; error?: string }> {
+  return sendRuntimeMessage<{ ok: boolean; error?: string }>({
+    type: 'margin:clear-translation-cache',
   });
 }
 

@@ -1,13 +1,20 @@
 import { beforeEach, describe, expect, it } from 'vitest';
 import { BRAND } from '@shared/brand';
 import {
+  BUILTIN_ASSISTANTS,
   createDefaultMarginConfig,
+  DEFAULT_ENABLED_GLOSSARY_PACK_IDS,
   resolveProviderIdForScene,
 } from '@shared/constants';
-import { sendTabCommand } from '@shared/messaging';
+import {
+  requestClearTranslationCache,
+  requestTranslationCacheStats,
+  sendTabCommand,
+} from '@shared/messaging';
 import { SHADOW_HOST_RESET_CSS } from '@shared/shadow-styles';
 import {
   appendDiagnosticSnapshot,
+  backfillStoredConfig,
   getCapabilityCache,
   getDiagnosticsLog,
   getMarginConfig,
@@ -37,7 +44,7 @@ describe('Margin shared contracts & temperature engine', () => {
   it('locks brand constants and Shadow DOM CSS reset invariants', () => {
     expect(BRAND.name).toBe('Margin');
     expect(BRAND.slug).toBe('margin');
-    expect(BRAND.version).toBe('2.1.2');
+    expect(BRAND.version).toBe('2.2.0');
     expect(BRAND.pinnedExtensionId).toMatch(/^[a-p]{32}$/);
     expect(SHADOW_HOST_RESET_CSS).toContain('all: initial !important');
     expect(SHADOW_HOST_RESET_CSS).toContain('font-size: 16px !important');
@@ -49,6 +56,16 @@ describe('Margin shared contracts & temperature engine', () => {
     const defaults = createDefaultMarginConfig();
     expect(defaults.selection.enabled).toBe(true);
     expect(defaults.hover.enabled).toBe(true);
+    expect(defaults.webpage.autoTranslateMode).toBe('foreign');
+    expect(defaults.webpage.autoTranslateMatches).toBe(true);
+    expect(defaults.webpage.autoTranslateLanguages).toEqual([]);
+    expect(defaults.enabledGlossaryPacks).toEqual([
+      ...DEFAULT_ENABLED_GLOSSARY_PACK_IDS,
+    ]);
+    expect(defaults.promptSystemVersion).toBe(2);
+    expect(defaults.assistants['builtin-yaml']).toBeDefined();
+    expect(defaults.assistants['builtin-yaml-thinking']).toBeDefined();
+    expect(defaults.assistants['builtin-delimiter']).toBeDefined();
     expect(defaults.subtitles.sourceScalePercent).toBe(100);
     expect(defaults.subtitles.translationScalePercent).toBe(70);
     expect(defaults.subtitles.stylePreset).toBe('youtube-native');
@@ -344,6 +361,183 @@ describe('Margin shared contracts & temperature engine', () => {
       });
       expect(restrictedRes.ok).toBe(false);
       expect(restrictedRes.unsupportedPage).toBe(true);
+    } finally {
+      (globalThis as Record<string, unknown>).chrome = origChrome;
+    }
+  });
+
+  it('seamlessly upgrades live v2.0/v2.1 stored configs to v2.2.0 Editorial Prompts, foreign auto-translate, glossary packs, and channel assistant migration', async () => {
+    const legacyV20 = createDefaultMarginConfig() as unknown as Record<
+      string,
+      unknown
+    >;
+    delete legacyV20.enabledGlossaryPacks;
+    delete legacyV20.promptSystemVersion;
+
+    // Simulate pre-v2.2.0 webpage settings without autoTranslateMode
+    legacyV20.webpage = {
+      displayMode: 'bilingual',
+      theme: 'none',
+      themePatterns: [],
+      lineBreakMaxTextCount: 280,
+      enableRichHtml: true,
+      autoTranslateMatches: false,
+    };
+
+    // Simulate pre-v2.2.0 assistants: old `builtin-yaml` with `thinking:`, missing `builtin-yaml-thinking`,
+    // stock v2.0-imported `custom` (`泛用翻译大师` with `thinking:`), and a genuinely custom user assistant `my-custom`
+    legacyV20.assistants = {
+      'builtin-yaml': {
+        ...structuredClone(BUILTIN_ASSISTANTS['builtin-yaml']),
+        name: 'Old Builtin YAML',
+        prompt: 'Output:\n- id: 1\n  thinking: old\n  trans: ...\n<yaml>\n{{yaml}}\n</yaml>',
+        inputPrompt: undefined,
+        selectionPrompt: undefined,
+      },
+      'builtin-delimiter': {
+        ...structuredClone(BUILTIN_ASSISTANTS['builtin-delimiter']),
+        name: 'Old Delimiter',
+        inputPrompt: undefined,
+        selectionPrompt: undefined,
+      },
+      custom: {
+        id: 'custom',
+        name: '泛用翻译大师',
+        codec: 'yaml',
+        enableRichHtml: true,
+        temperaturePolicy: { mode: 'custom', value: 0.3 },
+        maxBatchCount: 17,
+        maxSubtitleBatchCount: 17,
+        maxCharsPerBatch: 4096,
+        separator: '\n\n%%\n\n',
+        systemPrompt: 'You are a translator.',
+        prompt:
+          'Output inside <yaml>:\n- id: 1\n  thinking: step1\n  trans: step2\n<yaml>\n{{yaml}}\n</yaml>',
+        env: {
+          imt_yaml_item: '- id: {{id}}\n  src: |-\n    {{text}}',
+        },
+      },
+      'my-custom': {
+        id: 'my-custom',
+        name: 'My Bespoke Academic Translator',
+        codec: 'delimiter',
+        enableRichHtml: true,
+        temperaturePolicy: { mode: 'omit' },
+        maxBatchCount: 6,
+        maxSubtitleBatchCount: 10,
+        maxCharsPerBatch: 2000,
+        separator: '\n\n%%\n\n',
+        systemPrompt: 'Academic style.',
+        prompt: '{{text}}',
+        env: {},
+      },
+    };
+
+    legacyV20.providers = {
+      ...(legacyV20.providers as Record<string, unknown>),
+      'openai-luna': {
+        ...(legacyV20.providers as Record<string, Record<string, unknown>>)[
+          'google-free'
+        ],
+        id: 'openai-luna',
+        preset: 'openai',
+        protocol: 'openai-chat',
+        model: 'gpt-6-luna',
+        assistantId: 'custom',
+      },
+      'zhipu-glm': {
+        ...(legacyV20.providers as Record<string, Record<string, unknown>>)[
+          'google-free'
+        ],
+        id: 'zhipu-glm',
+        preset: 'zhipu',
+        protocol: 'openai-chat',
+        model: 'glm-4.7',
+        assistantId: 'custom',
+      },
+      'academic-prov': {
+        ...(legacyV20.providers as Record<string, Record<string, unknown>>)[
+          'google-free'
+        ],
+        id: 'academic-prov',
+        preset: 'openai',
+        protocol: 'openai-chat',
+        model: 'gpt-4.1-mini',
+        assistantId: 'my-custom',
+      },
+    };
+
+    const { config: upgraded, mutated } = backfillStoredConfig(
+      legacyV20 as unknown as ReturnType<typeof createDefaultMarginConfig>,
+    );
+    expect(mutated).toBe(true);
+    expect(upgraded.promptSystemVersion).toBe(2);
+    expect(upgraded.webpage.autoTranslateMode).toBe('foreign');
+    expect(upgraded.webpage.autoTranslateMatches).toBe(true);
+    expect(upgraded.webpage.autoTranslateLanguages).toEqual([]);
+    expect(upgraded.enabledGlossaryPacks).toEqual([
+      ...DEFAULT_ENABLED_GLOSSARY_PACK_IDS,
+    ]);
+
+    // Built-in presets upgraded & `builtin-yaml-thinking` added
+    expect(upgraded.assistants['builtin-yaml'].name).toBe(
+      BUILTIN_ASSISTANTS['builtin-yaml'].name,
+    );
+    expect(upgraded.assistants['builtin-yaml'].prompt).not.toContain('thinking:');
+    expect(upgraded.assistants['builtin-yaml-thinking']).toBeDefined();
+
+    // Stock `custom` (`泛用翻译大师`) kept intact in `assistants`, with missing scene prompts backfilled
+    expect(upgraded.assistants.custom).toBeDefined();
+    expect(upgraded.assistants.custom.name).toBe('泛用翻译大师');
+    expect(upgraded.assistants.custom.inputPrompt).toBeTruthy();
+    expect(upgraded.assistants.custom.selectionPrompt).toBeTruthy();
+    expect(upgraded.assistants.custom.subtitlePrompt).toBeTruthy();
+    expect(upgraded.assistants['my-custom'].inputPrompt).toBeTruthy();
+
+    // Active channels using stock `custom` migrated to fast `'builtin-yaml'`; non-stock `my-custom` untouched!
+    expect(upgraded.providers['openai-luna'].assistantId).toBe('builtin-yaml');
+    expect(upgraded.providers['zhipu-glm'].assistantId).toBe('builtin-yaml');
+    expect(upgraded.providers['academic-prov'].assistantId).toBe('my-custom');
+
+    // Second pass is idempotent (`mutated === false`)
+    const secondPass = backfillStoredConfig(upgraded);
+    expect(secondPass.mutated).toBe(false);
+  });
+
+  it('wires requestTranslationCacheStats and requestClearTranslationCache RPC helpers', async () => {
+    const origChrome = (globalThis as Record<string, unknown>).chrome;
+    const sentTypes: string[] = [];
+    (globalThis as Record<string, unknown>).chrome = {
+      runtime: {
+        sendMessage: async (req: { type: string }) => {
+          sentTypes.push(req.type);
+          if (req.type === 'margin:get-translation-cache-stats') {
+            return {
+              ok: true,
+              memoryEntries: 12,
+              persistentEntries: 340,
+              dbAvailable: true,
+            };
+          }
+          return { ok: true };
+        },
+      },
+    };
+
+    try {
+      const stats = await requestTranslationCacheStats();
+      expect(stats).toEqual({
+        ok: true,
+        memoryEntries: 12,
+        persistentEntries: 340,
+        dbAvailable: true,
+      });
+      const cleared = await requestClearTranslationCache();
+      expect(cleared).toEqual({ ok: true });
+      expect(sentTypes).toEqual([
+        'margin:get-translation-cache-stats',
+        'margin:clear-translation-cache',
+      ]);
     } finally {
       (globalThis as Record<string, unknown>).chrome = origChrome;
     }

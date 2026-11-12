@@ -11,7 +11,7 @@ import type {
   TranslateBatchRequest,
   TranslateBatchResponse,
 } from '@shared/types';
-import { isContentEditableNode } from './dom-walker';
+import { extractPageContext, isContentEditableNode } from './dom-walker';
 import { syncFullscreenFloatingVisibility } from './renderer';
 
 const SUPPORTED_INPUT_TYPES: ReadonlySet<string> = new Set([
@@ -481,6 +481,7 @@ interface UndoSnapshot {
 export interface InputQuickTranslatorOptions {
   config: MarginConfig;
   doc?: Document;
+  getUrl?: () => string;
   now?: () => number;
   transport?: InputBatchTransportFn;
   isUrlExcluded?: () => boolean;
@@ -491,6 +492,7 @@ let inputReqCounter = 0;
 export class InputQuickTranslator {
   private config: MarginConfig;
   private readonly doc: Document;
+  private readonly getUrl?: () => string;
   private readonly now: () => number;
   private readonly transport: InputBatchTransportFn;
   private readonly isUrlExcluded?: () => boolean;
@@ -513,6 +515,7 @@ export class InputQuickTranslator {
   constructor(options: InputQuickTranslatorOptions) {
     this.config = options.config;
     this.doc = options.doc ?? document;
+    this.getUrl = options.getUrl;
     this.now = options.now ?? (() => Date.now());
     this.transport = options.transport ?? defaultInputTransport;
     this.isUrlExcluded = options.isUrlExcluded;
@@ -742,6 +745,7 @@ export class InputQuickTranslator {
       fromLang: 'auto',
       toLang,
       items: [{ id: 1, text: sourceText, hasRichTags: false }],
+      context: extractPageContext(this.doc, this.getUrl?.()),
     };
 
     try {

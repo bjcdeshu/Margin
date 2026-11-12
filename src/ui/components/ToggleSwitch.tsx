@@ -3,6 +3,7 @@ export interface ToggleSwitchProps {
   onChange: (next: boolean) => void;
   ariaLabel?: string;
   disabled?: boolean;
+  dataTestId?: string;
 }
 
 export function ToggleSwitch({
@@ -10,6 +11,7 @@ export function ToggleSwitch({
   onChange,
   ariaLabel,
   disabled = false,
+  dataTestId,
 }: ToggleSwitchProps) {
   return (
     <button
@@ -18,6 +20,7 @@ export function ToggleSwitch({
       class="mp-toggle"
       aria-checked={checked ? 'true' : 'false'}
       aria-label={ariaLabel}
+      data-testid={dataTestId}
       disabled={disabled}
       onClick={() => {
         if (!disabled) onChange(!checked);

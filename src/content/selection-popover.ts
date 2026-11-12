@@ -6,15 +6,17 @@ import {
   type StreamBatchCallbacks,
 } from '@shared/messaging';
 import { SHADOW_HOST_RESET_CSS } from '@shared/shadow-styles';
+import { updateMarginConfig } from '@shared/storage';
 import type {
   MarginConfig,
   TranslateBatchRequest,
   TranslateBatchResponse,
 } from '@shared/types';
-import { isContentEditableNode } from './dom-walker';
+import { extractPageContext, isContentEditableNode } from './dom-walker';
 import { syncFullscreenFloatingVisibility } from './renderer';
 
 const MAX_SELECTION_CHARS = 4500;
+export const MAX_GLOSSARY_TERM_CHARS = 80;
 
 export const SELECTION_POPOVER_CSS = /* css */ `
 ${SHADOW_HOST_RESET_CSS}
@@ -78,7 +80,7 @@ ${SHADOW_HOST_RESET_CSS}
 
 .card {
   position: fixed;
-  width: 340px;
+  width: 356px;
   max-width: calc(100vw - 24px);
   background: var(--paper);
   color: var(--ink);
@@ -192,6 +194,151 @@ ${SHADOW_HOST_RESET_CSS}
   color: #b4412e;
   font-size: 13px;
 }
+
+.icon-btn[data-saved="true"] {
+  color: var(--action-solid);
+  font-weight: 600;
+}
+
+.glossary-editor {
+  padding: 8px 10px 10px;
+  background: var(--paper-soft);
+  border-top: 1px solid var(--rule);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.glossary-editor[hidden] {
+  display: none !important;
+}
+
+.glossary-top-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.glossary-source-wrap {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0px;
+  overflow: hidden;
+}
+
+.glossary-source-tag {
+  font-size: 11px;
+  line-height: 14px;
+  color: var(--muted);
+  flex-shrink: 0;
+}
+
+.glossary-source-term {
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 16px;
+  color: var(--ink);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.glossary-pill-btn {
+  all: unset;
+  box-sizing: border-box;
+  height: 22px;
+  padding: 0px 7px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 11px;
+  line-height: 14px;
+  color: var(--muted);
+  background: var(--paper);
+  border: 1px solid var(--rule);
+  border-radius: 999px;
+  cursor: pointer;
+  user-select: none;
+  flex-shrink: 0;
+}
+
+.glossary-pill-btn:hover {
+  color: var(--ink);
+  border-color: var(--rule-strong);
+}
+
+.glossary-pill-btn[aria-pressed="true"] {
+  color: var(--action-solid);
+  background: var(--paper-warm);
+  border-color: var(--control-border);
+  font-weight: 600;
+}
+
+.glossary-controls-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.glossary-target-input {
+  all: unset;
+  box-sizing: border-box;
+  flex: 1 1 auto;
+  min-width: 0px;
+  height: 28px;
+  padding: 0px 8px;
+  font-size: 12px;
+  line-height: 18px;
+  color: var(--ink);
+  background: var(--paper);
+  border: 1px solid var(--rule-strong);
+  border-radius: 4px;
+}
+
+.glossary-target-input::placeholder {
+  color: var(--muted-soft);
+}
+
+.glossary-target-input:focus {
+  border-color: var(--control-border);
+  outline: 1px solid var(--focus-ring);
+}
+
+.glossary-save-btn {
+  all: unset;
+  box-sizing: border-box;
+  height: 28px;
+  padding: 0px 10px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 16px;
+  color: var(--action-solid-ink);
+  background: var(--action-solid);
+  border-radius: 4px;
+  cursor: pointer;
+  user-select: none;
+  flex-shrink: 0;
+}
+
+.glossary-save-btn:hover {
+  background: var(--action-solid-hover);
+}
+
+.glossary-status {
+  font-size: 11px;
+  line-height: 15px;
+  color: var(--action-solid);
+  font-weight: 500;
+}
+
+.glossary-status[hidden] {
+  display: none !important;
+}
 `;
 
 export type SelectionTransportFn = (
@@ -242,6 +389,7 @@ function isNodeInsideEditable(node: Node | null): boolean {
 export interface SelectionPopoverOptions {
   config: MarginConfig;
   doc?: Document;
+  getUrl?: () => string;
   now?: () => number;
   transport?: SelectionTransportFn;
   clipboardWrite?: (text: string) => Promise<void>;
@@ -253,6 +401,7 @@ let selectionReqSeq = 0;
 export class SelectionPopover {
   private config: MarginConfig;
   private readonly doc: Document;
+  private readonly getUrl?: () => string;
   private readonly now: () => number;
   private readonly transport: SelectionTransportFn;
   private readonly clipboardWrite: (text: string) => Promise<void>;
@@ -264,13 +413,21 @@ export class SelectionPopover {
   private triggerDotBtn: HTMLButtonElement | null = null;
   private cardEl: HTMLElement | null = null;
   private langPillEl: HTMLElement | null = null;
+  private glossaryBtn: HTMLButtonElement | null = null;
   private pinBtn: HTMLButtonElement | null = null;
   private copyBtn: HTMLButtonElement | null = null;
   private bodyEl: HTMLElement | null = null;
+  private glossaryEditorEl: HTMLElement | null = null;
+  private glossarySourceEl: HTMLElement | null = null;
+  private glossaryKeepOrigBtn: HTMLButtonElement | null = null;
+  private glossaryTargetInput: HTMLInputElement | null = null;
+  private glossaryStatusEl: HTMLElement | null = null;
 
   private uiState: 'closed' | 'trigger' | 'card' = 'closed';
   private pinned = false;
   private dragging = false;
+  private glossaryEditorOpen = false;
+  private glossaryTargetTouched = false;
   private cardLeft = 24;
   private cardTop = 24;
 
@@ -278,6 +435,7 @@ export class SelectionPopover {
   private translatedText = '';
   private activeAbortController: AbortController | null = null;
   private copyFeedbackTimer: ReturnType<typeof setTimeout> | null = null;
+  private glossaryFeedbackTimer: ReturnType<typeof setTimeout> | null = null;
 
   private pointerDownInsideAnchor = false;
   private suppressAnchorClickUntil = 0;
@@ -289,6 +447,7 @@ export class SelectionPopover {
   constructor(options: SelectionPopoverOptions) {
     this.config = options.config;
     this.doc = options.doc ?? document;
+    this.getUrl = options.getUrl;
     this.now = options.now ?? (() => Date.now());
     this.transport = options.transport ?? defaultSelectionTransport;
     this.clipboardWrite =
@@ -395,6 +554,9 @@ export class SelectionPopover {
   private isEventFromSelf(ev: Event): boolean {
     if (!this.hostEl) return false;
     if (ev.target === this.hostEl) return true;
+    if (ev.target instanceof Node && this.shadow?.contains(ev.target)) {
+      return true;
+    }
     if (typeof ev.composedPath === 'function') {
       return ev.composedPath().includes(this.hostEl);
     }
@@ -579,6 +741,20 @@ export class SelectionPopover {
     const actions = this.doc.createElement('div');
     actions.className = 'actions';
 
+    const glossaryBtn = this.doc.createElement('button');
+    glossaryBtn.type = 'button';
+    glossaryBtn.className = 'icon-btn';
+    glossaryBtn.setAttribute('data-action', 'collect-glossary');
+    glossaryBtn.setAttribute('aria-pressed', 'false');
+    glossaryBtn.setAttribute('aria-expanded', 'false');
+    glossaryBtn.title = '存入自定义术语库';
+    glossaryBtn.textContent = '+ 存术语';
+    glossaryBtn.addEventListener('click', (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      this.toggleGlossaryEditor();
+    });
+
     const pinBtn = this.doc.createElement('button');
     pinBtn.type = 'button';
     pinBtn.className = 'icon-btn';
@@ -617,7 +793,7 @@ export class SelectionPopover {
       this.close();
     });
 
-    actions.append(pinBtn, copyBtn, closeBtn);
+    actions.append(glossaryBtn, pinBtn, copyBtn, closeBtn);
     header.append(brandGroup, actions);
 
     // Header drag support — releases cleanly on window `pointerup` AND `pointercancel`
@@ -633,7 +809,86 @@ export class SelectionPopover {
     body.className = 'card-body';
     body.setAttribute('data-part', 'card-body');
 
-    card.append(header, body);
+    const glossaryEditor = this.doc.createElement('div');
+    glossaryEditor.className = 'glossary-editor';
+    glossaryEditor.setAttribute('data-part', 'glossary-editor');
+    glossaryEditor.hidden = true;
+
+    const glossaryTopRow = this.doc.createElement('div');
+    glossaryTopRow.className = 'glossary-top-row';
+
+    const glossarySourceWrap = this.doc.createElement('div');
+    glossarySourceWrap.className = 'glossary-source-wrap';
+    const glossarySourceTag = this.doc.createElement('span');
+    glossarySourceTag.className = 'glossary-source-tag';
+    glossarySourceTag.textContent = '术语';
+    const glossarySourceTerm = this.doc.createElement('span');
+    glossarySourceTerm.className = 'glossary-source-term';
+    glossarySourceTerm.setAttribute('data-part', 'glossary-source');
+    glossarySourceWrap.append(glossarySourceTag, glossarySourceTerm);
+
+    const keepOrigBtn = this.doc.createElement('button');
+    keepOrigBtn.type = 'button';
+    keepOrigBtn.className = 'glossary-pill-btn';
+    keepOrigBtn.setAttribute('data-action', 'glossary-keep-original');
+    keepOrigBtn.setAttribute('aria-pressed', 'false');
+    keepOrigBtn.textContent = '保留原文';
+    keepOrigBtn.addEventListener('click', (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      if (this.glossaryTargetInput) {
+        this.glossaryTargetInput.value = '';
+        this.glossaryTargetTouched = true;
+        this.syncKeepOriginalPillState();
+      }
+    });
+
+    glossaryTopRow.append(glossarySourceWrap, keepOrigBtn);
+
+    const glossaryControlsRow = this.doc.createElement('div');
+    glossaryControlsRow.className = 'glossary-controls-row';
+
+    const targetInput = this.doc.createElement('input');
+    targetInput.type = 'text';
+    targetInput.className = 'glossary-target-input';
+    targetInput.setAttribute('data-part', 'glossary-target-input');
+    targetInput.placeholder = '留空即保留原文不翻译';
+    targetInput.addEventListener('input', () => {
+      this.glossaryTargetTouched = true;
+      this.syncKeepOriginalPillState();
+    });
+    targetInput.addEventListener('keydown', (ev: KeyboardEvent) => {
+      ev.stopPropagation();
+      if (ev.key === 'Enter') {
+        ev.preventDefault();
+        void this.saveGlossaryEntry();
+      } else if (ev.key === 'Escape') {
+        ev.preventDefault();
+        this.setGlossaryEditorOpen(false);
+      }
+    });
+
+    const saveBtn = this.doc.createElement('button');
+    saveBtn.type = 'button';
+    saveBtn.className = 'glossary-save-btn';
+    saveBtn.setAttribute('data-action', 'glossary-save');
+    saveBtn.textContent = '保存';
+    saveBtn.addEventListener('click', (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      void this.saveGlossaryEntry();
+    });
+
+    glossaryControlsRow.append(targetInput, saveBtn);
+
+    const glossaryStatus = this.doc.createElement('div');
+    glossaryStatus.className = 'glossary-status';
+    glossaryStatus.setAttribute('data-part', 'glossary-status');
+    glossaryStatus.hidden = true;
+
+    glossaryEditor.append(glossaryTopRow, glossaryControlsRow, glossaryStatus);
+
+    card.append(header, body, glossaryEditor);
     layer.append(triggerIcon, triggerDot, card);
     shadow.append(style, layer);
     parent.appendChild(host);
@@ -644,9 +899,15 @@ export class SelectionPopover {
     this.triggerDotBtn = triggerDot;
     this.cardEl = card;
     this.langPillEl = langPill;
+    this.glossaryBtn = glossaryBtn;
     this.pinBtn = pinBtn;
     this.copyBtn = copyBtn;
     this.bodyEl = body;
+    this.glossaryEditorEl = glossaryEditor;
+    this.glossarySourceEl = glossarySourceTerm;
+    this.glossaryKeepOrigBtn = keepOrigBtn;
+    this.glossaryTargetInput = targetInput;
+    this.glossaryStatusEl = glossaryStatus;
 
     syncFullscreenFloatingVisibility(this.doc);
   }
@@ -694,7 +955,7 @@ export class SelectionPopover {
       this.doc.documentElement?.clientHeight ||
       768;
 
-    this.cardLeft = Math.max(8, Math.min(vw - 348, Math.round(left)));
+    this.cardLeft = Math.max(8, Math.min(vw - 364, Math.round(left)));
     this.cardTop = Math.max(8, Math.min(vh - 96, Math.round(top)));
 
     if (this.cardEl) {
@@ -771,6 +1032,7 @@ export class SelectionPopover {
     }
 
     this.translatedText = '';
+    this.resetGlossaryQuickCollectForSelection();
     this.bodyEl.setAttribute('data-status', 'loading');
     this.bodyEl.textContent = 'Translating…';
     syncFullscreenFloatingVisibility(this.doc);
@@ -791,6 +1053,7 @@ export class SelectionPopover {
       fromLang: this.config.sourceLang,
       toLang: this.config.targetLang,
       items: [{ id: 1, text: this.selectedSourceText, hasRichTags: false }],
+      context: extractPageContext(this.doc, this.getUrl?.()),
     };
 
     try {
@@ -803,6 +1066,14 @@ export class SelectionPopover {
               this.translatedText = item.trans.trim();
               this.bodyEl.setAttribute('data-status', 'ready');
               this.bodyEl.textContent = this.translatedText;
+              if (
+                this.glossaryEditorOpen &&
+                !this.glossaryTargetTouched &&
+                this.glossaryTargetInput
+              ) {
+                this.glossaryTargetInput.value = this.translatedText;
+                this.syncKeepOriginalPillState();
+              }
             }
           },
         },
@@ -822,6 +1093,14 @@ export class SelectionPopover {
       this.translatedText = response.items[0].trans.trim();
       this.bodyEl.setAttribute('data-status', 'ready');
       this.bodyEl.textContent = this.translatedText;
+      if (
+        this.glossaryEditorOpen &&
+        !this.glossaryTargetTouched &&
+        this.glossaryTargetInput
+      ) {
+        this.glossaryTargetInput.value = this.translatedText;
+        this.syncKeepOriginalPillState();
+      }
     } catch (err) {
       if (controller.signal.aborted || !this.bodyEl) return;
       this.bodyEl.setAttribute('data-status', 'error');
@@ -870,12 +1149,164 @@ export class SelectionPopover {
     }
   }
 
+  private clearGlossaryFeedbackTimer(): void {
+    if (this.glossaryFeedbackTimer !== null) {
+      clearTimeout(this.glossaryFeedbackTimer);
+      this.glossaryFeedbackTimer = null;
+    }
+  }
+
+  private isEligibleForGlossaryCollect(): boolean {
+    const len = this.selectedSourceText.trim().length;
+    return len > 0 && len <= MAX_GLOSSARY_TERM_CHARS;
+  }
+
+  private resetGlossaryQuickCollectForSelection(): void {
+    this.clearGlossaryFeedbackTimer();
+    this.glossaryTargetTouched = false;
+    this.setGlossaryEditorOpen(false);
+    const eligible = this.isEligibleForGlossaryCollect();
+    if (this.glossaryBtn) {
+      this.glossaryBtn.textContent = '+ 存术语';
+      this.glossaryBtn.removeAttribute('data-saved');
+      this.glossaryBtn.hidden = !eligible;
+      this.glossaryBtn.style.display = eligible ? 'inline-flex' : 'none';
+    }
+    if (this.glossaryStatusEl) {
+      this.glossaryStatusEl.textContent = '';
+      this.glossaryStatusEl.hidden = true;
+    }
+  }
+
+  private syncKeepOriginalPillState(): void {
+    if (!this.glossaryKeepOrigBtn || !this.glossaryTargetInput) return;
+    const isKeepOriginal = this.glossaryTargetInput.value.trim() === '';
+    this.glossaryKeepOrigBtn.setAttribute(
+      'aria-pressed',
+      isKeepOriginal ? 'true' : 'false',
+    );
+  }
+
+  private setGlossaryEditorOpen(open: boolean): void {
+    const canOpen = open && this.isEligibleForGlossaryCollect();
+    this.glossaryEditorOpen = canOpen;
+    if (this.glossaryEditorEl) {
+      this.glossaryEditorEl.hidden = !canOpen;
+    }
+    if (this.glossaryBtn) {
+      this.glossaryBtn.setAttribute('aria-pressed', canOpen ? 'true' : 'false');
+      this.glossaryBtn.setAttribute(
+        'aria-expanded',
+        canOpen ? 'true' : 'false',
+      );
+    }
+    if (canOpen) {
+      if (this.glossarySourceEl) {
+        this.glossarySourceEl.textContent = this.selectedSourceText.trim();
+      }
+      if (this.glossaryTargetInput) {
+        this.glossaryTargetTouched = false;
+        this.glossaryTargetInput.value = this.translatedText;
+        this.syncKeepOriginalPillState();
+      }
+      if (this.glossaryStatusEl) {
+        this.glossaryStatusEl.textContent = '';
+        this.glossaryStatusEl.hidden = true;
+      }
+    }
+  }
+
+  toggleGlossaryEditor(): boolean {
+    if (!this.isEligibleForGlossaryCollect()) {
+      this.setGlossaryEditorOpen(false);
+      return false;
+    }
+    this.setGlossaryEditorOpen(!this.glossaryEditorOpen);
+    return this.glossaryEditorOpen;
+  }
+
+  async saveGlossaryEntry(): Promise<boolean> {
+    if (!isExtensionContextValid(this.hadRuntimeIdAtMount)) {
+      this.destroy();
+      return false;
+    }
+    const k = this.selectedSourceText.trim();
+    if (!k || k.length > MAX_GLOSSARY_TERM_CHARS) {
+      return false;
+    }
+    const v = (this.glossaryTargetInput?.value ?? '').trim();
+
+    try {
+      const updated = await updateMarginConfig((draft) => {
+        if (!Array.isArray(draft.glossary)) {
+          draft.glossary = [];
+        }
+        const lowerK = k.toLowerCase();
+        const existingIdx = draft.glossary.findIndex(
+          (entry) =>
+            entry.k.trim().toLowerCase() === lowerK && !entry.domain?.trim(),
+        );
+        if (existingIdx >= 0) {
+          draft.glossary[existingIdx] = {
+            ...draft.glossary[existingIdx],
+            k,
+            v,
+            enabled: true,
+            group: draft.glossary[existingIdx].group || 'custom',
+          };
+        } else {
+          draft.glossary.unshift({
+            k,
+            v,
+            enabled: true,
+            group: 'custom',
+          });
+        }
+      });
+
+      this.config = updated;
+
+      if (this.glossaryStatusEl) {
+        this.glossaryStatusEl.textContent = '已存入术语库 ✓';
+        this.glossaryStatusEl.hidden = false;
+      }
+      if (this.glossaryBtn) {
+        this.glossaryBtn.textContent = '已存入术语库 ✓';
+        this.glossaryBtn.setAttribute('data-saved', 'true');
+      }
+
+      this.clearGlossaryFeedbackTimer();
+      this.glossaryFeedbackTimer = setTimeout(() => {
+        this.glossaryFeedbackTimer = null;
+        if (this.glossaryBtn) {
+          this.glossaryBtn.textContent = '+ 存术语';
+          this.glossaryBtn.removeAttribute('data-saved');
+        }
+        if (this.glossaryStatusEl) {
+          this.glossaryStatusEl.textContent = '';
+          this.glossaryStatusEl.hidden = true;
+        }
+        this.setGlossaryEditorOpen(false);
+      }, 1800);
+
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   close(): void {
     this.cleanupActiveDrag?.();
+    this.clearGlossaryFeedbackTimer();
     this.activeAbortController?.abort();
     this.activeAbortController = null;
     this.uiState = 'closed';
     this.pinned = false;
+    this.setGlossaryEditorOpen(false);
+    if (this.glossaryBtn) {
+      this.glossaryBtn.textContent = '+ 存术语';
+      this.glossaryBtn.removeAttribute('data-saved');
+    }
     if (this.cardEl) {
       this.cardEl.style.display = 'none';
       this.cardEl.setAttribute('data-pinned', 'false');
@@ -911,6 +1342,7 @@ export class SelectionPopover {
       clearTimeout(this.copyFeedbackTimer);
       this.copyFeedbackTimer = null;
     }
+    this.clearGlossaryFeedbackTimer();
     this.cleanupListeners?.();
     this.cleanupListeners = null;
     this.hostEl?.remove();
@@ -920,8 +1352,14 @@ export class SelectionPopover {
     this.triggerDotBtn = null;
     this.cardEl = null;
     this.langPillEl = null;
+    this.glossaryBtn = null;
     this.pinBtn = null;
     this.copyBtn = null;
     this.bodyEl = null;
+    this.glossaryEditorEl = null;
+    this.glossarySourceEl = null;
+    this.glossaryKeepOrigBtn = null;
+    this.glossaryTargetInput = null;
+    this.glossaryStatusEl = null;
   }
 }

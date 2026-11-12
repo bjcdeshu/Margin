@@ -4,6 +4,8 @@ import {
   sanitizeErrorText,
 } from '@core/diagnostics';
 import {
+  DEFAULT_JSON_BATCH_SYSTEM_PROMPT,
+  buildDefaultJsonBatchSystemPrompt,
   getPromptCodec,
   protectGlossaryTokens,
   restoreGlossaryTokens,
@@ -1005,4 +1007,5 @@ export async function executeVisionWithProvider(
   };
 }
 
+export { DEFAULT_JSON_BATCH_SYSTEM_PROMPT, buildDefaultJsonBatchSystemPrompt };
 export type { AssistantConfig };

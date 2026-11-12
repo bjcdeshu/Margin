@@ -332,4 +332,51 @@ describe('input-translate: Triple-Space, Alt+I, CJK direction, ShadowRoot, Escap
 
     translator.destroy();
   });
+
+  it('attaches pageContext (domain, title, summary, and automatic domain styleGuide) on input TranslateBatchRequest', async () => {
+    const config = createDefaultMarginConfig();
+    document.title = 'Pull Request #42 · openai/openai-node';
+    const descMeta = document.createElement('meta');
+    descMeta.name = 'description';
+    descMeta.content = 'Add streaming tool-call delta helpers.';
+    document.head.appendChild(descMeta);
+
+    const capturedRequests: TranslateBatchRequest[] = [];
+    const translator = new InputQuickTranslator({
+      config,
+      getUrl: () => 'https://github.com/openai/openai-node/pull/42',
+      transport: async (req) => {
+        capturedRequests.push(req);
+        return {
+          ok: true,
+          requestId: req.requestId,
+          providerId: 'google-free',
+          model: 'gtx',
+          items: [{ id: 1, trans: 'Looks good to merge after CI passes.' }],
+          diagnostic: mockDiag(),
+        };
+      },
+    });
+    translator.mount();
+
+    const textarea = document.createElement('textarea');
+    textarea.value = 'CI 通过后就可以合并了';
+    document.body.appendChild(textarea);
+    textarea.focus();
+
+    expect(await translator.translateActiveElement()).toBe(true);
+    expect(capturedRequests).toHaveLength(1);
+    expect(capturedRequests[0]?.context?.domain).toBe('github.com');
+    expect(capturedRequests[0]?.context?.title).toBe(
+      'Pull Request #42 · openai/openai-node',
+    );
+    expect(capturedRequests[0]?.context?.summary).toContain(
+      'Add streaming tool-call delta helpers.',
+    );
+    expect(capturedRequests[0]?.context?.styleGuide).toContain(
+      'Software engineering',
+    );
+
+    translator.destroy();
+  });
 });

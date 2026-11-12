@@ -1,11 +1,17 @@
 import { describe, expect, it } from 'vitest';
 import {
+  BUILTIN_GLOSSARY_PACKS,
   buildGlossaryPromptVars,
+  computeMatchedGlossarySignature,
+  formatGlossaryBulkText,
   matchGlossaryEntries,
+  parseGlossaryBulkText,
   protectGlossaryTokens,
+  resolveEffectiveGlossary,
   resolveGlossaryTarget,
   restoreGlossaryTokens,
 } from '../../src/core/prompts';
+import { createDefaultMarginConfig } from '@shared/constants';
 import type { GlossaryEntry } from '@shared/types';
 
 describe('Glossary Matcher, Keep-Original (v: "") & Non-AI Placeholder Engine', () => {
@@ -91,5 +97,117 @@ describe('Glossary Matcher, Keep-Original (v: "") & Non-AI Placeholder Engine', 
     expect(restoreGlossaryTokens(mtTranslated1, placeholderMap)).toBe(
       '另一个 LLM 示例。',
     );
+  });
+
+  it('ships 4 curated built-in glossary packs (100+ entries) and resolves user overrides & enabled:false suppressions', () => {
+    expect(BUILTIN_GLOSSARY_PACKS.map((p) => p.id)).toEqual([
+      'ai-agent-infra',
+      'dev-cloud-web',
+      'screenwriting-narrative',
+      'gaming-tech-culture',
+    ]);
+    const totalEntries = BUILTIN_GLOSSARY_PACKS.reduce(
+      (sum, pack) => sum + pack.entries.length,
+      0,
+    );
+    expect(totalEntries).toBeGreaterThanOrEqual(100);
+
+    const defaults = createDefaultMarginConfig();
+    const effectiveDefault = resolveEffectiveGlossary(defaults);
+    expect(
+      effectiveDefault.find((e) => e.k === 'Phantom Blade Zero')?.v,
+    ).toBe('影之刃零');
+    expect(effectiveDefault.find((e) => e.k === 'Logline')?.v).toBe(
+      '一句话故事梗概',
+    );
+    expect(effectiveDefault.find((e) => e.k === 'Context Window')?.v).toBe(
+      '上下文窗口',
+    );
+    expect(effectiveDefault.find((e) => e.k === 'Rate Limit')?.v).toBe(
+      '速率限制',
+    );
+    expect(effectiveDefault.find((e) => e.k === 'MCP')?.v).toBe('');
+
+    // User override replaces built-in mapping; user `enabled: false` suppresses built-in entry completely!
+    const customized = resolveEffectiveGlossary({
+      enabledGlossaryPacks: ['ai-agent-infra', 'gaming-tech-culture'],
+      glossary: [
+        { k: 'context window', v: '上下文视窗' },
+        { k: 'Phantom Blade Zero', v: '影之刃零', enabled: false },
+      ],
+    });
+    expect(
+      customized.find((e) => e.k.toLowerCase() === 'context window')?.v,
+    ).toBe('上下文视窗');
+    expect(
+      customized.find((e) => e.k.toLowerCase() === 'phantom blade zero'),
+    ).toBeUndefined();
+    expect(customized.find((e) => e.k === 'Logline')).toBeUndefined();
+  });
+
+  it('separates keepOriginalInstruction from glossaryMappingInstruction and computes per-item matched glossary signatures', () => {
+    const entries: GlossaryEntry[] = [
+      { k: 'LLM', v: '' },
+      { k: 'vLLM', v: '' },
+      { k: 'Context Window', v: '上下文窗口' },
+      { k: 'DisabledTerm', v: '已禁用', enabled: false },
+    ];
+
+    const vars = buildGlossaryPromptVars(
+      [
+        'Serving an LLM with vLLM expands the effective Context Window without touching DisabledTerm.',
+      ],
+      entries,
+    );
+    expect(vars.keepOriginalInstruction).toContain('vLLM, LLM');
+    expect(vars.glossaryMappingInstruction).toContain(
+      'Context Window => 上下文窗口',
+    );
+    expect(vars.glossaryInstruction).not.toContain('DisabledTerm');
+    expect(vars.terms).toBe(vars.glossaryInstruction);
+
+    const baseSig = computeMatchedGlossarySignature(
+      ['Serving an LLM with vLLM.'],
+      entries,
+    );
+    const sigAfterUnrelatedEdit = computeMatchedGlossarySignature(
+      ['Serving an LLM with vLLM.'],
+      [
+        ...entries,
+        { k: 'UnrelatedTermXYZ', v: '无关词条' },
+        { k: 'Context Window', v: '改动了未命中的词条' },
+      ],
+    );
+    expect(sigAfterUnrelatedEdit).toBe(baseSig);
+
+    const sigAfterMatchedEdit = computeMatchedGlossarySignature(
+      ['Serving an LLM with vLLM.'],
+      [
+        { k: 'LLM', v: '大语言模型' },
+        { k: 'vLLM', v: '' },
+      ],
+    );
+    expect(sigAfterMatchedEdit).not.toBe(baseSig);
+  });
+
+  it('parses and formats bulk glossary text cleanly (=, =>, keep-original, @domain, and # comments)', () => {
+    const rawBulk = [
+      '# AI & Narrative Glossary',
+      'LLM',
+      'Context Window = 上下文窗口',
+      'Cliffhanger => 卡点悬念',
+      'Artifact = 构建产物 @*.github.com',
+    ].join('\n');
+
+    const parsed = parseGlossaryBulkText(rawBulk);
+    expect(parsed).toEqual([
+      { k: 'LLM', v: '' },
+      { k: 'Context Window', v: '上下文窗口' },
+      { k: 'Cliffhanger', v: '卡点悬念' },
+      { k: 'Artifact', v: '构建产物', domain: '*.github.com' },
+    ]);
+
+    const formatted = formatGlossaryBulkText(parsed);
+    expect(parseGlossaryBulkText(formatted)).toEqual(parsed);
   });
 });

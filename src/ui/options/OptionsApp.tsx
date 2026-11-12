@@ -327,6 +327,12 @@ export function OptionsApp({ initialTab }: OptionsAppProps = {}) {
             draft={draft}
             onMutate={mutateDraft}
             registerPendingFlush={registerPendingFlush}
+            onEnsureSavedBeforeTest={async () => {
+              pendingFlushRef.current?.();
+              if (trackerRef.current.isDirty(draftRef.current)) {
+                await commitConfigSave(draftRef.current);
+              }
+            }}
           />
         ) : null}
 

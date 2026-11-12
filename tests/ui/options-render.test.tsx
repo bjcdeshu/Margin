@@ -1,6 +1,6 @@
 import { render } from 'preact';
 import { act } from 'preact/test-utils';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { BUILTIN_ASSISTANTS, createDefaultMarginConfig } from '@shared/constants';
 import {
   getMarginConfig,
@@ -18,7 +18,7 @@ async function flushMicrotasks(): Promise<void> {
   });
 }
 
-describe('Quiet Paper 5-Tab Settings Studio (OptionsApp)', () => {
+describe('Quiet Paper 6-Tab Settings Studio (OptionsApp)', () => {
   let container: HTMLDivElement;
 
   beforeEach(() => {
@@ -32,7 +32,7 @@ describe('Quiet Paper 5-Tab Settings Studio (OptionsApp)', () => {
     container.remove();
   });
 
-  it('renders all 5 editorial tabs, live inherit routing badges, and never shows Saved on initial load', async () => {
+  it('renders all 6 editorial tabs, live inherit routing badges, and never shows Saved on initial load', async () => {
     const cfg = createDefaultMarginConfig();
     cfg.providers['openai-bytb6BIB'] = {
       ...cfg.providers['google-free'],
@@ -77,6 +77,126 @@ describe('Quiet Paper 5-Tab Settings Studio (OptionsApp)', () => {
     expect(inputBadge?.textContent).toBe('→ OpenAI (gpt-6-luna)');
   });
 
+  it('syncs webpage.autoTranslateMode and autoTranslateMatches across GeneralTab and SiteRulesTab', async () => {
+    await saveMarginConfig(createDefaultMarginConfig());
+
+    await act(async () => {
+      render(<OptionsApp initialTab="general" />, container);
+    });
+    await flushMicrotasks();
+
+    // Default mode is `foreign` with <html lang> + visible prose character analysis explanation
+    const foreignBtn = container.querySelector(
+      '[data-testid="general-auto-mode-foreign"]',
+    ) as HTMLButtonElement;
+    expect(foreignBtn.getAttribute('aria-checked')).toBe('true');
+    expect(container.textContent).toContain('非目标语言自动翻译（推荐）');
+    expect(container.textContent).toContain('<html lang>');
+    expect(container.textContent).toContain('https://linux.do/*');
+
+    // Switch to `whitelist` in GeneralTab
+    const whitelistBtn = container.querySelector(
+      '[data-testid="general-auto-mode-whitelist"]',
+    ) as HTMLButtonElement;
+    await act(async () => {
+      whitelistBtn.click();
+    });
+
+    // Navigate to SiteRulesTab and verify `whitelist` is active in top strategy card
+    const navButtons = () =>
+      Array.from(container.querySelectorAll('.mp-nav-item')) as HTMLButtonElement[];
+    await act(async () => {
+      navButtons().find((b) => b.textContent?.includes('站点规则'))!.click();
+    });
+
+    const rulesWhitelistBtn = container.querySelector(
+      '[data-testid="rules-auto-mode-whitelist"]',
+    ) as HTMLButtonElement;
+    const rulesOffBtn = container.querySelector(
+      '[data-testid="rules-auto-mode-off"]',
+    ) as HTMLButtonElement;
+    expect(rulesWhitelistBtn.getAttribute('aria-checked')).toBe('true');
+
+    // Switch to `off` in SiteRulesTab -> keeps `autoTranslateMatches = false` in sync
+    await act(async () => {
+      rulesOffBtn.click();
+    });
+
+    const saveBtn = container.querySelector(
+      '[data-testid="options-save-btn"]',
+    ) as HTMLButtonElement;
+    await act(async () => {
+      saveBtn.click();
+    });
+    await flushMicrotasks();
+
+    const persisted = await getMarginConfig();
+    expect(persisted.webpage.autoTranslateMode).toBe('off');
+    expect(persisted.webpage.autoTranslateMatches).toBe(false);
+  });
+
+  it('defaults assistantId to builtin-yaml (Margin 信达雅精译) when adding new AI channels in ProvidersTab', async () => {
+    await saveMarginConfig(createDefaultMarginConfig());
+
+    await act(async () => {
+      render(<OptionsApp initialTab="providers" />, container);
+    });
+    await flushMicrotasks();
+
+    const presetSelect = container.querySelector(
+      'select[aria-label="新增渠道预设"]',
+    ) as HTMLSelectElement;
+    const addBtn = Array.from(container.querySelectorAll('button')).find((b) =>
+      b.textContent?.includes('添加渠道'),
+    ) as HTMLButtonElement;
+
+    // 1. Add OpenAI channel -> automatically binds `builtin-yaml`
+    await act(async () => {
+      presetSelect.value = 'openai';
+      presetSelect.dispatchEvent(new Event('change', { bubbles: true }));
+    });
+    await act(async () => {
+      addBtn.click();
+    });
+
+    const boundSelect = container.querySelector(
+      '[data-testid="provider-assistant-select"]',
+    ) as HTMLSelectElement;
+    expect(boundSelect).not.toBeNull();
+    expect(boundSelect.value).toBe('builtin-yaml');
+
+    // 2. Add Anthropic channel -> also automatically binds `builtin-yaml`
+    await act(async () => {
+      presetSelect.value = 'anthropic';
+      presetSelect.dispatchEvent(new Event('change', { bubbles: true }));
+    });
+    await act(async () => {
+      addBtn.click();
+    });
+    expect(
+      (container.querySelector('[data-testid="provider-assistant-select"]') as HTMLSelectElement)
+        .value,
+    ).toBe('builtin-yaml');
+
+    // Save and verify persisted config
+    const saveBtn = container.querySelector(
+      '[data-testid="options-save-btn"]',
+    ) as HTMLButtonElement;
+    await act(async () => {
+      saveBtn.click();
+    });
+    await flushMicrotasks();
+
+    const persisted = await getMarginConfig();
+    const aiProviders = Object.values(persisted.providers).filter(
+      (p) => p.protocol === 'openai-chat' || p.protocol === 'anthropic-messages',
+    );
+    expect(aiProviders).toHaveLength(2);
+    for (const p of aiProviders) {
+      expect(p.assistantId).toBe('builtin-yaml');
+    }
+  });
+
   it('renders live effective temperature preview badge across reasoning models, standard chat models, and 400 cache', async () => {
     const cfg = createDefaultMarginConfig();
     cfg.providers['openai-bytb6BIB'] = {
@@ -89,7 +209,7 @@ describe('Quiet Paper 5-Tab Settings Studio (OptionsApp)', () => {
       apiKeys: ['sk-key-1'],
       model: 'gpt-6-luna',
       models: ['gpt-6-luna', 'glm-4.7', 'custom-strict-v1'],
-      assistantId: 'builtin-yaml', // Aloxaf 0.3
+      assistantId: 'builtin-yaml', // 0.3
       temperaturePolicy: { mode: 'omit' },
     };
     cfg.providerOrder = ['openai-bytb6BIB'];
@@ -118,7 +238,7 @@ describe('Quiet Paper 5-Tab Settings Studio (OptionsApp)', () => {
       'https://api.example.com/v1/chat/completions',
     );
 
-    // 1. On `gpt-6-luna`, Aloxaf 0.3 is auto-omitted by Reasoning Guard
+    // 1. On `gpt-6-luna`, assistant 0.3 is auto-omitted by Reasoning Guard
     const tempBadge = container.querySelector('[data-testid="live-temperature-preview"]');
     expect(tempBadge?.textContent).toContain(
       '实际请求：自动省略 (检测到推理模型 gpt-6-luna)',
@@ -148,7 +268,7 @@ describe('Quiet Paper 5-Tab Settings Studio (OptionsApp)', () => {
     ).toContain('实际请求：自动省略 (已缓存 custom-strict-v1 的 400 拒绝记录)');
   });
 
-  it('stages assistant preset reset without auto-saving until confirmed via Save Changes', async () => {
+  it('stages built-in assistant preset reset without auto-saving until confirmed via Save Changes', async () => {
     const cfg = createDefaultMarginConfig();
     cfg.assistants['builtin-yaml'].name = 'Modified Assistant Name';
     await saveMarginConfig(cfg);
@@ -158,6 +278,17 @@ describe('Quiet Paper 5-Tab Settings Studio (OptionsApp)', () => {
     });
     await flushMicrotasks();
 
+    // All 3 built-in assistants visible in roster
+    expect(
+      container.querySelector('[data-testid="assistant-tab-builtin-yaml"]'),
+    ).not.toBeNull();
+    expect(
+      container.querySelector('[data-testid="assistant-tab-builtin-yaml-thinking"]')?.textContent,
+    ).toContain('泛用翻译大师 · 思考精修');
+    expect(
+      container.querySelector('[data-testid="assistant-tab-builtin-delimiter"]')?.textContent,
+    ).toContain('极速流式直译');
+
     // Multi-line YAML macro `imt_yaml_item` renders inside a <textarea> preserving newlines
     const envTextareas = Array.from(container.querySelectorAll('textarea'));
     expect(envTextareas.some((ta) => ta.value.includes('- id: {{id}}\n  src: |-'))).toBe(
@@ -165,9 +296,10 @@ describe('Quiet Paper 5-Tab Settings Studio (OptionsApp)', () => {
     );
 
     const resetBtn = container.querySelector(
-      '[data-testid="reset-aloxaf-yaml-btn"]',
+      '[data-testid="reset-builtin-assistant-btn"]',
     ) as HTMLButtonElement;
     expect(resetBtn).not.toBeNull();
+    expect(resetBtn.textContent).toContain('重置为内置预设');
 
     await act(async () => {
       resetBtn.click();
@@ -195,10 +327,264 @@ describe('Quiet Paper 5-Tab Settings Studio (OptionsApp)', () => {
     await flushMicrotasks();
 
     const storedAfterConfirm = await getMarginConfig();
-    expect(storedAfterConfirm.assistants['builtin-yaml'].name).toContain('泛用翻译大师');
+    expect(storedAfterConfirm.assistants['builtin-yaml'].name).toContain(
+      'Margin 信达雅精译',
+    );
     expect(
       container.querySelector('[data-testid="options-save-status"]')?.textContent,
     ).toBe('已保存');
+  });
+
+  it('powers PromptsGlossaryTab scene slots, live prompt preview + sample tester, 4 glossary packs, bulk import/export, and persistent translation DB card', async () => {
+    const cfg = createDefaultMarginConfig();
+    cfg.providers['openai-studio'] = {
+      ...cfg.providers['google-free'],
+      id: 'openai-studio',
+      name: 'OpenAI Studio',
+      preset: 'openai',
+      protocol: 'openai-chat',
+      baseUrl: 'https://api.openai.com/v1/chat/completions',
+      apiKeys: ['sk-studio'],
+      model: 'gpt-5.4-mini',
+      models: ['gpt-5.4-mini'],
+      assistantId: 'builtin-yaml',
+    };
+    cfg.providerOrder = ['openai-studio', 'google-free'];
+    cfg.routing.webpage = 'openai-studio';
+    await saveMarginConfig(cfg);
+
+    let mockMemCount = 14;
+    let mockPersistentCount = 128;
+    const sendMessageSpy = vi.fn(async (req: { type: string }) => {
+      if (req.type === 'margin:get-translation-cache-stats') {
+        return {
+          ok: true,
+          memoryEntries: mockMemCount,
+          persistentEntries: mockPersistentCount,
+          dbAvailable: true,
+        };
+      }
+      if (req.type === 'margin:clear-translation-cache') {
+        mockMemCount = 0;
+        mockPersistentCount = 0;
+        return { ok: true };
+      }
+      if (req.type === 'margin:translate-batch') {
+        mockMemCount += 1;
+        mockPersistentCount += 1;
+        return {
+          ok: true,
+          requestId: 'studio-trial-1',
+          providerId: 'openai-studio',
+          model: 'gpt-5.4-mini',
+          items: [
+            {
+              id: 1,
+              trans:
+                '当使用 200K 上下文窗口扩展 LLM Agent 时，KV Cache 复用能保持低延迟——就像在《影之刃零》中打出完美帧弹反一样。',
+            },
+          ],
+          diagnostic: {
+            schemaVersion: 1,
+            product: 'Margin',
+            version: '2.2.0',
+            time: new Date().toISOString(),
+            scene: 'webpage',
+            codec: 'yaml',
+            provider: {
+              id: 'openai-studio',
+              preset: 'openai',
+              protocol: 'openai-chat',
+              endpointOrigin: 'https://api.openai.com',
+              endpointPath: '/v1/chat/completions',
+              model: 'gpt-5.4-mini',
+            },
+            parameters: {
+              temperatureTrace: 'sent-assistant-custom',
+              temperatureSent: 0.3,
+              thinkingMode: 'provider-default',
+              stream: false,
+            },
+            httpStatus: 200,
+            kind: 'ok',
+            retryable: false,
+            attempts: 1,
+            latencyMs: 312,
+          },
+        };
+      }
+      return { ok: true };
+    });
+
+    const origChrome = (globalThis as Record<string, unknown>).chrome;
+    (globalThis as Record<string, unknown>).chrome = {
+      runtime: {
+        sendMessage: sendMessageSpy,
+      },
+    };
+
+    try {
+      await act(async () => {
+        render(<OptionsApp initialTab="prompts" />, container);
+      });
+      await flushMicrotasks();
+
+      // 1. Scene prompt slots: switch to `inputPrompt` and `selectionPrompt`
+      const inputSlotBtn = container.querySelector(
+        '[data-testid="prompt-slot-inputPrompt"]',
+      ) as HTMLButtonElement;
+      const selectionSlotBtn = container.querySelector(
+        '[data-testid="prompt-slot-selectionPrompt"]',
+      ) as HTMLButtonElement;
+      const promptTa = container.querySelector(
+        '[data-testid="assistant-prompt-textarea"]',
+      ) as HTMLTextAreaElement;
+
+      await act(async () => {
+        inputSlotBtn.click();
+      });
+      expect(promptTa.value).toContain('Rewrite and translate the user draft');
+
+      await act(async () => {
+        selectionSlotBtn.click();
+      });
+      expect(promptTa.value).toContain('Translate the selected text');
+
+      // 2. Live Prompt Preview injects Keep-Original terms, Mapped terms, and Domain Style Guide
+      const expandedUser = container.querySelector(
+        '[data-testid="preview-expanded-user"]',
+      );
+      expect(expandedUser?.textContent).toContain('Keep-Original Terms');
+      expect(expandedUser?.textContent).toContain('LLM');
+      expect(expandedUser?.textContent).toContain('Context Window => 上下文窗口');
+      expect(expandedUser?.textContent).toContain('Phantom Blade Zero => 影之刃零');
+      expect(expandedUser?.textContent).toContain('Style Guide: Social post / thread register');
+
+      // Switch preview scene to `input` -> uses `inputPrompt`
+      const previewInputBtn = container.querySelector(
+        '[data-testid="preview-scene-input"]',
+      ) as HTMLButtonElement;
+      await act(async () => {
+        previewInputBtn.click();
+      });
+      expect(expandedUser?.textContent).toContain('Rewrite and translate the user draft');
+
+      // Run Live Sample Translation (`在线试译`) -> shows translated text + latency ms
+      const runTrialBtn = container.querySelector(
+        '[data-testid="preview-run-translate-btn"]',
+      ) as HTMLButtonElement;
+      await act(async () => {
+        runTrialBtn.click();
+      });
+      await flushMicrotasks();
+
+      const trialBox = container.querySelector('[data-testid="preview-translate-result"]');
+      expect(trialBox?.textContent).toContain('312ms');
+      expect(trialBox?.textContent).toContain('影之刃零');
+
+      // 3. Built-in 4 Glossary Packs rendered + instant toggle updates enabledGlossaryPacks & live preview
+      for (const packId of [
+        'ai-agent-infra',
+        'dev-cloud-web',
+        'screenwriting-narrative',
+        'gaming-tech-culture',
+      ]) {
+        expect(
+          container.querySelector(`[data-testid="glossary-pack-${packId}"]`),
+        ).not.toBeNull();
+      }
+
+      // Expand full terms in `gaming-tech-culture` pack
+      const expandGamingBtn = container.querySelector(
+        '[data-testid="glossary-pack-expand-gaming-tech-culture"]',
+      ) as HTMLButtonElement;
+      await act(async () => {
+        expandGamingBtn.click();
+      });
+      expect(
+        container.querySelector('[data-testid="glossary-pack-gaming-tech-culture"]')
+          ?.textContent,
+      ).toContain('=> 影之刃零');
+
+      // Toggle OFF `gaming-tech-culture` -> `Phantom Blade Zero => 影之刃零` disappears from live preview!
+      const gamingToggle = container.querySelector(
+        '[data-testid="glossary-pack-toggle-gaming-tech-culture"]',
+      ) as HTMLButtonElement;
+      await act(async () => {
+        gamingToggle.click();
+      });
+      expect(expandedUser?.textContent).not.toContain('Phantom Blade Zero => 影之刃零');
+
+      // 4. Bulk Glossary Import / Export + Custom Search & Per-Entry Toggle
+      const bulkTa = container.querySelector(
+        '[data-testid="glossary-bulk-textarea"]',
+      ) as HTMLTextAreaElement;
+      const bulkReplaceBtn = container.querySelector(
+        '[data-testid="glossary-bulk-replace-btn"]',
+      ) as HTMLButtonElement;
+      const bulkExportBtn = container.querySelector(
+        '[data-testid="glossary-bulk-export-btn"]',
+      ) as HTMLButtonElement;
+
+      await act(async () => {
+        bulkTa.value = 'CUDA\nSubagent => 子代理 @github.com';
+        bulkTa.dispatchEvent(new Event('input', { bubbles: true }));
+      });
+      await act(async () => {
+        bulkReplaceBtn.click();
+      });
+
+      // Verify custom list shows Keep Original (`保留原文`) and Mapped (`指定译法`)
+      const customList = container.querySelector('[data-testid="custom-glossary-list"]');
+      expect(customList?.textContent).toContain('保留原文');
+      expect(customList?.textContent).toContain('指定译法');
+
+      // Export back to text
+      await act(async () => {
+        bulkExportBtn.click();
+      });
+      expect(bulkTa.value).toBe('CUDA\nSubagent = 子代理 @github.com');
+
+      // Save changes and confirm enabledGlossaryPacks + bulk glossary persisted
+      const saveBtn = container.querySelector(
+        '[data-testid="options-save-btn"]',
+      ) as HTMLButtonElement;
+      await act(async () => {
+        saveBtn.click();
+      });
+      await flushMicrotasks();
+
+      const persisted = await getMarginConfig();
+      expect(persisted.enabledGlossaryPacks).toEqual([
+        'ai-agent-infra',
+        'dev-cloud-web',
+        'screenwriting-narrative',
+      ]);
+      expect(persisted.glossary).toEqual([
+        { k: 'CUDA', v: '' },
+        { k: 'Subagent', v: '子代理', domain: 'github.com' },
+      ]);
+
+      // 5. Persistent Local Translation Database Status Card (Stats + Refresh + Clear)
+      const dbStats = container.querySelector('[data-testid="translation-db-stats"]');
+      expect(dbStats?.textContent).toContain('内存热缓存 15 条');
+      expect(dbStats?.textContent).toContain('本地持久化库 129 条 (IndexedDB)');
+
+      const clearDbBtn = container.querySelector(
+        '[data-testid="translation-db-clear-btn"]',
+      ) as HTMLButtonElement;
+      await act(async () => {
+        clearDbBtn.click();
+      });
+      await flushMicrotasks();
+
+      expect(dbStats?.textContent).toContain('内存热缓存 0 条 · 本地持久化库 0 条 (IndexedDB)');
+      expect(sendMessageSpy).toHaveBeenCalledWith({
+        type: 'margin:clear-translation-cache',
+      });
+    } finally {
+      (globalThis as Record<string, unknown>).chrome = origChrome;
+    }
   });
 
   it('executes 1-click legacy JSON import audit flow and redacted vs full backup export', async () => {
@@ -248,7 +634,6 @@ describe('Quiet Paper 5-Tab Settings Studio (OptionsApp)', () => {
     ).toBe('已保存');
 
     // Test Redacted Export (default: strips apiKeys)
-    // Re-add secret to verify redaction vs full backup
     const withSecret = await getMarginConfig();
     withSecret.providers['google-free'].apiKeys = ['sk-private-backup-key'];
     await saveMarginConfig(withSecret);
@@ -316,7 +701,7 @@ describe('Quiet Paper 5-Tab Settings Studio (OptionsApp)', () => {
           diagnostic: {
             schemaVersion: 1,
             product: 'Margin',
-            version: '2.0.0',
+            version: '2.2.0',
             time: new Date().toISOString(),
             scene: 'service-test',
             codec: 'json-batch',
@@ -380,7 +765,12 @@ describe('Quiet Paper 5-Tab Settings Studio (OptionsApp)', () => {
     };
     cfg.providerOrder = ['openai-pool', 'google-free'];
     cfg.routing.webpage = 'openai-pool';
-    cfg.assistants['builtin-yaml'].multiplePrompt = '<yaml>{{yaml}}</yaml>';
+    cfg.assistants['custom'] = {
+      ...structuredClone(BUILTIN_ASSISTANTS['builtin-yaml']),
+      id: 'custom',
+      name: 'Imported Custom Assistant',
+      multiplePrompt: '<yaml>{{yaml}}</yaml>',
+    };
     await saveMarginConfig(cfg);
 
     await act(async () => {
@@ -427,15 +817,21 @@ describe('Quiet Paper 5-Tab Settings Studio (OptionsApp)', () => {
     });
     expect(keysTa.value).toBe('sk-alpha,\nsk-beta, ');
 
-    // 3. Switch to Prompts tab & reset assistant with stale multiplePrompt -> delimiter preset clears multiplePrompt
+    // 3. Switch to Prompts tab, select `custom` assistant with stale multiplePrompt, and load delimiter template -> clears multiplePrompt
     await act(async () => {
       navButtons().find((b) => b.textContent?.includes('提示词与术语库'))!.click();
     });
-    const resetDelimBtn = container.querySelector(
-      '[data-testid="reset-delimiter-btn"]',
+    const customAstTab = container.querySelector(
+      '[data-testid="assistant-tab-custom"]',
     ) as HTMLButtonElement;
     await act(async () => {
-      resetDelimBtn.click();
+      customAstTab.click();
+    });
+    const loadDelimBtn = container.querySelector(
+      '[data-testid="load-delimiter-btn"]',
+    ) as HTMLButtonElement;
+    await act(async () => {
+      loadDelimBtn.click();
     });
 
     // Save changes and confirm persisted state
@@ -451,8 +847,8 @@ describe('Quiet Paper 5-Tab Settings Studio (OptionsApp)', () => {
     expect(saved.subtitles.translationScalePercent).toBe(85);
     expect(saved.subtitles.fontSizePercent).toBe(85);
     expect(saved.providers['openai-pool'].apiKeys).toEqual(['sk-alpha', 'sk-beta']);
-    expect(saved.assistants['builtin-yaml'].codec).toBe('delimiter');
-    expect(saved.assistants['builtin-yaml'].multiplePrompt).toBeUndefined();
+    expect(saved.assistants['custom'].codec).toBe('delimiter');
+    expect(saved.assistants['custom'].multiplePrompt).toBeUndefined();
 
     // 4. Switch to Migration tab, parse JSON without applying, switch tabs away and back -> preview persists!
     await act(async () => {

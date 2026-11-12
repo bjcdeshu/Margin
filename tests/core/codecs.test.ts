@@ -1,11 +1,22 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
+import { importLegacyConfig } from '../../src/core/migration';
 import {
+  buildDefaultJsonBatchSystemPrompt,
+  DEFAULT_JSON_BATCH_SYSTEM_PROMPT,
   delimiterPromptCodec,
+  expandAssistantPrompts,
   jsonBatchCodec,
   singleTextMtCodec,
   yamlPromptCodec,
 } from '../../src/core/prompts';
-import { BUILTIN_ASSISTANTS } from '@shared/constants';
+import {
+  executeBatchWithProvider,
+  ProviderExecutionPool,
+} from '../../src/core/providers';
+import {
+  BUILTIN_ASSISTANTS,
+  createDefaultMarginConfig,
+} from '@shared/constants';
 import type { AssistantConfig } from '@shared/types';
 
 describe('YamlPromptCodec (Aloxaf "泛用翻译大师" compatibility)', () => {
@@ -322,5 +333,147 @@ describe('JsonBatchCodec & SingleTextMtCodec', () => {
       { id: 9, text: 'Concise text' },
     ]);
     expect(out).toEqual([{ id: 9, trans: '简洁译文' }]);
+  });
+
+  it('ships v2.2.0 Editorial BUILTIN_ASSISTANTS (zero-thinking fast YAML default + Aloxaf thinking preset + scene prompts) and routes request.scene in engine.ts', async () => {
+    const fastYaml = BUILTIN_ASSISTANTS['builtin-yaml'];
+    const thinkingYaml = BUILTIN_ASSISTANTS['builtin-yaml-thinking'];
+    const fastDelim = BUILTIN_ASSISTANTS['builtin-delimiter'];
+
+    expect(fastYaml.name).toBe('Margin 信达雅精译 (Fast Editorial <yaml>)');
+    expect(fastYaml.prompt).not.toContain('thinking:');
+    expect(fastYaml.systemPrompt).toContain('Never include a `thinking` field');
+    expect(fastYaml.inputPrompt).toBeTruthy();
+    expect(fastYaml.selectionPrompt).toBeTruthy();
+    expect(fastYaml.subtitlePrompt).toBeTruthy();
+
+    expect(thinkingYaml.name).toBe('泛用翻译大师 · 思考精修 (Aloxaf <yaml>)');
+    expect(thinkingYaml.systemPrompt).toContain('thinking');
+    expect(thinkingYaml.inputPrompt).toBeTruthy();
+    expect(thinkingYaml.selectionPrompt).toBeTruthy();
+    expect(thinkingYaml.subtitlePrompt).toBeTruthy();
+
+    expect(fastDelim.name).toBe('极速流式直译 (%%)');
+    expect(fastDelim.inputPrompt).toBeTruthy();
+    expect(fastDelim.selectionPrompt).toBeTruthy();
+    expect(fastDelim.subtitlePrompt).toBeTruthy();
+
+    // Verify `expandAssistantPrompts` selects scene-specific templates and interpolates first-class variables
+    const inputExpanded = expandAssistantPrompts({
+      assistant: fastYaml,
+      scene: 'input',
+      fromLang: 'zh-CN',
+      toLang: 'en',
+      items: [{ id: 1, text: '帮我写一条 @openai #LLM 发布推文' }],
+      glossary: [{ k: 'LLM', v: '' }],
+    });
+    expect(inputExpanded.userPrompt).toContain('native-speaker English');
+    expect(inputExpanded.userPrompt).toContain('Keep-Original Terms');
+
+    const selectionExpanded = expandAssistantPrompts({
+      assistant: fastYaml,
+      scene: 'selection',
+      fromLang: 'en',
+      toLang: 'zh-CN',
+      items: [{ id: 1, text: 'ephemeral KV cache' }],
+      context: {
+        url: 'https://docs.vllm.ai/en/latest/',
+        domain: 'docs.vllm.ai',
+        title: 'vLLM Architecture Guide',
+        styleGuide: 'Crisp systems engineering terminology',
+      },
+    });
+    expect(selectionExpanded.userPrompt).toContain('selected text');
+    expect(selectionExpanded.userPrompt).toContain(
+      'Document Title: vLLM Architecture Guide',
+    );
+    expect(selectionExpanded.userPrompt).toContain(
+      'Style Guide: Crisp systems engineering terminology',
+    );
+
+    // Verify `DEFAULT_JSON_BATCH_SYSTEM_PROMPT` & unset-assistant scene hints in `engine.ts`
+    expect(DEFAULT_JSON_BATCH_SYSTEM_PROMPT).toContain('信达雅');
+    expect(buildDefaultJsonBatchSystemPrompt('en', 'input')).toContain(
+      'Scene Hint (Outbound Input)',
+    );
+    expect(buildDefaultJsonBatchSystemPrompt('zh-CN', 'selection')).toContain(
+      'Scene Hint (Selection)',
+    );
+    expect(buildDefaultJsonBatchSystemPrompt('zh-CN', 'subtitle')).toContain(
+      'Scene Hint (Subtitle)',
+    );
+
+    // Verify `executeBatchWithProvider` passes `scene` all the way to prompt expansion
+    let capturedUserPrompt = '';
+    const mockFetch = vi.fn(async (_url: RequestInfo | URL, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body ?? '{}')) as {
+        messages?: Array<{ role: string; content: string }>;
+      };
+      capturedUserPrompt =
+        body.messages?.find((m) => m.role === 'user')?.content ?? '';
+      return new Response(
+        JSON.stringify({
+          choices: [
+            {
+              message: {
+                content:
+                  '<yaml>\n- id: 1\n  trans: Shipped v2.2.0 cleanly!\n</yaml>',
+              },
+            },
+          ],
+        }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      );
+    });
+
+    const cfg = createDefaultMarginConfig();
+    const res = await executeBatchWithProvider({
+      scene: 'input',
+      provider: {
+        ...cfg.providers['google-free'],
+        id: 'oapi-test',
+        preset: 'openai',
+        protocol: 'openai-chat',
+        baseUrl: 'https://api.openai.com/v1/chat/completions',
+        apiKeys: ['sk-TEST_FAKE'],
+        model: 'gpt-6-luna',
+        assistantId: 'builtin-yaml',
+      },
+      assistant: fastYaml,
+      fromLang: 'zh-CN',
+      toLang: 'en',
+      items: [{ id: 1, text: '干净利落地发布了 v2.2.0！' }],
+      fetchImpl: mockFetch as unknown as typeof fetch,
+      pool: new ProviderExecutionPool(),
+    });
+    expect(res.ok).toBe(true);
+    expect(capturedUserPrompt).toContain('native-speaker English');
+  });
+
+  it('migrates legacy raw.translationLanguagePattern cleanly without flagging ignoredLegacyKeys', () => {
+    const imported = importLegacyConfig({
+      targetLanguage: 'zh-CN',
+      translationLanguagePattern: {
+        matches: ['en', 'ja'],
+        excludeMatches: ['zh-CN'],
+      },
+    });
+    expect(imported.config.webpage.autoTranslateMode).toBe('foreign');
+    expect(imported.config.webpage.autoTranslateMatches).toBe(true);
+    expect(imported.config.webpage.autoTranslateLanguages).toEqual(['en', 'ja']);
+    expect(imported.stats.ignoredLegacyKeys).toEqual([]);
+    expect(
+      imported.audit.some(
+        (a) => a.code === 'translation-language-pattern-migrated',
+      ),
+    ).toBe(true);
+
+    const importedOff = importLegacyConfig({
+      targetLanguage: 'zh-CN',
+      autoTranslateMode: 'off',
+      translationLanguagePattern: { matches: ['*'] },
+    });
+    expect(importedOff.config.webpage.autoTranslateMode).toBe('off');
+    expect(importedOff.config.webpage.autoTranslateMatches).toBe(false);
   });
 });

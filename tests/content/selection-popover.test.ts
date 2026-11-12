@@ -1,6 +1,15 @@
 import { beforeEach, describe, expect, it } from 'vitest';
 import { createDefaultMarginConfig } from '@shared/constants';
-import type { DiagnosticSnapshot, TranslateBatchResponse } from '@shared/types';
+import {
+  getMarginConfig,
+  resetMemoryStorageForTests,
+  saveMarginConfig,
+} from '@shared/storage';
+import type {
+  DiagnosticSnapshot,
+  TranslateBatchRequest,
+  TranslateBatchResponse,
+} from '@shared/types';
 import { syncFullscreenFloatingVisibility } from '../../src/content/renderer';
 import {
   SELECTION_POPOVER_CSS,
@@ -38,8 +47,10 @@ function mockSelectionDiag(): DiagnosticSnapshot {
 
 describe('selection-popover: Shadow isolation, trigger modes, <a> link safety, window.blur, Pin/Copy & drag release', () => {
   beforeEach(() => {
+    resetMemoryStorageForTests();
     document.head.innerHTML = '';
     document.body.innerHTML = '';
+    document.title = 'Selection Test Page';
     window.getSelection()?.removeAllRanges();
   });
 
@@ -288,6 +299,140 @@ describe('selection-popover: Shadow isolation, trigger modes, <a> link safety, w
     });
     syncFullscreenFloatingVisibility(document);
     expect(host.hasAttribute('data-margin-fullscreen-hidden')).toBe(false);
+
+    popover.destroy();
+  });
+
+  it('passes pageContext in selection TranslateBatchRequest and supports + 存术语 quick-collect (Mapped + Keep-Original upsert & invalidated context guard)', async () => {
+    const config = createDefaultMarginConfig();
+    config.selection.enabled = true;
+    config.selection.triggerMode = 'instant';
+    config.uiColorMode = 'night';
+    await saveMarginConfig(config);
+
+    document.title = 'Scaling Laws for Compute-Optimal LLMs';
+    const capturedRequests: TranslateBatchRequest[] = [];
+
+    const popover = new SelectionPopover({
+      config,
+      getUrl: () => 'https://arxiv.org/abs/2203.15556',
+      transport: async (req): Promise<TranslateBatchResponse> => {
+        capturedRequests.push(req);
+        return {
+          ok: true,
+          requestId: req.requestId,
+          providerId: 'google-free',
+          model: 'gtx',
+          items: [{ id: 1, trans: '上下文窗口' }],
+          diagnostic: mockSelectionDiag(),
+        };
+      },
+    });
+    popover.mount();
+
+    // 1. Short crisp term (<= 80 chars) shows `+ 存术语` and passes arxiv.org pageContext
+    popover.presentForSelection('Context Window', { x: 100, y: 120 });
+    await new Promise((r) => setTimeout(r, 15));
+
+    expect(capturedRequests).toHaveLength(1);
+    expect(capturedRequests[0]?.context?.domain).toBe('arxiv.org');
+    expect(capturedRequests[0]?.context?.title).toBe(
+      'Scaling Laws for Compute-Optimal LLMs',
+    );
+    expect(capturedRequests[0]?.context?.styleGuide).toContain(
+      'Academic & research',
+    );
+
+    const host = document.querySelector(
+      '[data-margin-host="selection-popover"]',
+    ) as HTMLElement;
+    expect(host.getAttribute('data-display-mode')).toBe('night');
+
+    const shadow = popover.getShadowRoot()!;
+    const collectBtn = shadow.querySelector(
+      '[data-action="collect-glossary"]',
+    ) as HTMLButtonElement;
+    const editorRow = shadow.querySelector(
+      '[data-part="glossary-editor"]',
+    ) as HTMLElement;
+    const sourceLabel = shadow.querySelector(
+      '[data-part="glossary-source"]',
+    ) as HTMLElement;
+    const targetInput = shadow.querySelector(
+      '[data-part="glossary-target-input"]',
+    ) as HTMLInputElement;
+    const keepOrigBtn = shadow.querySelector(
+      '[data-action="glossary-keep-original"]',
+    ) as HTMLButtonElement;
+    const saveBtn = shadow.querySelector(
+      '[data-action="glossary-save"]',
+    ) as HTMLButtonElement;
+    const statusEl = shadow.querySelector(
+      '[data-part="glossary-status"]',
+    ) as HTMLElement;
+
+    expect(collectBtn.hidden).toBe(false);
+    expect(editorRow.hidden).toBe(true);
+
+    // 2. Click `+ 存术语` -> opens compact editor pre-filled with current translation, save Mapped entry
+    collectBtn.click();
+    expect(editorRow.hidden).toBe(false);
+    expect(sourceLabel.textContent).toBe('Context Window');
+    expect(targetInput.value).toBe('上下文窗口');
+    expect(keepOrigBtn.getAttribute('aria-pressed')).toBe('false');
+
+    targetInput.value = '上下文视窗';
+    targetInput.dispatchEvent(new Event('input', { bubbles: true }));
+    saveBtn.click();
+    await new Promise((r) => setTimeout(r, 15));
+
+    expect(statusEl.textContent).toBe('已存入术语库 ✓');
+    expect(collectBtn.textContent).toBe('已存入术语库 ✓');
+
+    const afterMapped = await getMarginConfig();
+    const mappedMatches = afterMapped.glossary.filter(
+      (g) => g.k.toLowerCase() === 'context window' && !g.domain,
+    );
+    expect(mappedMatches).toHaveLength(1);
+    expect(mappedMatches[0]).toMatchObject({
+      k: 'Context Window',
+      v: '上下文视窗',
+      enabled: true,
+      group: 'custom',
+    });
+
+    // 3. Re-select case-variant `context window`, click `保留原文` -> sets target to "" and updates existing entry without duplicating!
+    popover.presentForSelection('context window', { x: 100, y: 120 });
+    await new Promise((r) => setTimeout(r, 15));
+
+    collectBtn.click();
+    keepOrigBtn.click();
+    expect(targetInput.value).toBe('');
+    expect(keepOrigBtn.getAttribute('aria-pressed')).toBe('true');
+
+    saveBtn.click();
+    await new Promise((r) => setTimeout(r, 15));
+
+    const afterKeepOrig = await getMarginConfig();
+    const keepOrigMatches = afterKeepOrig.glossary.filter(
+      (g) => g.k.toLowerCase() === 'context window' && !g.domain,
+    );
+    expect(keepOrigMatches).toHaveLength(1);
+    expect(keepOrigMatches[0]).toMatchObject({
+      k: 'context window',
+      v: '',
+      enabled: true,
+      group: 'custom',
+    });
+
+    // 4. Long selections (> 80 chars) hide `+ 存术语` cleanly
+    popover.presentForSelection('Long passage selection '.repeat(5), {
+      x: 100,
+      y: 120,
+    });
+    await new Promise((r) => setTimeout(r, 15));
+    expect(collectBtn.hidden).toBe(true);
+    expect(editorRow.hidden).toBe(true);
 
     popover.destroy();
   });

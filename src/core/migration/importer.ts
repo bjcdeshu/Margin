@@ -9,6 +9,7 @@ import {
 } from '@shared/temperature';
 import type {
   AssistantConfig,
+  AutoTranslateMode,
   DisplayMode,
   GlossaryEntry,
   HoverModifierKey,
@@ -210,6 +211,8 @@ function unwrapEnvelopeIfNeeded(
     'generalRule',
     'translationTheme',
     'translationUrlPattern',
+    'translationLanguagePattern',
+    'autoTranslateMode',
     'terms',
     'glossary',
     'targetLanguage',
@@ -261,6 +264,8 @@ function detectAssistantCodec(raw: Record<string, unknown>): PromptCodecId {
   const promptTexts = [
     raw.prompt,
     raw.multiplePrompt,
+    raw.inputPrompt,
+    raw.selectionPrompt,
     raw.subtitlePrompt,
     raw.systemPrompt,
     raw.multipleSystemPrompt,
@@ -377,6 +382,10 @@ function normalizeLegacyAssistant(
     typeof raw.multiplePrompt === 'string' ? raw.multiplePrompt : undefined;
   const rawPrompt = typeof raw.prompt === 'string' ? raw.prompt : '';
   const prompt = rawPrompt || multiplePrompt || '';
+  const inputPrompt =
+    typeof raw.inputPrompt === 'string' ? raw.inputPrompt : undefined;
+  const selectionPrompt =
+    typeof raw.selectionPrompt === 'string' ? raw.selectionPrompt : undefined;
   const subtitlePrompt =
     typeof raw.subtitlePrompt === 'string' ? raw.subtitlePrompt : undefined;
 
@@ -409,6 +418,12 @@ function normalizeLegacyAssistant(
   }
   if (multiplePrompt !== undefined) {
     assistant.multiplePrompt = multiplePrompt;
+  }
+  if (inputPrompt !== undefined) {
+    assistant.inputPrompt = inputPrompt;
+  }
+  if (selectionPrompt !== undefined) {
+    assistant.selectionPrompt = selectionPrompt;
   }
   if (subtitlePrompt !== undefined) {
     assistant.subtitlePrompt = subtitlePrompt;
@@ -1041,12 +1056,19 @@ function parseGlossaryEntries(
     const domain = nonEmptyString(item.domain) ?? groupDomain;
     const caseSensitive =
       typeof item.caseSensitive === 'boolean' ? item.caseSensitive : undefined;
+    const enabled =
+      typeof item.enabled === 'boolean' ? item.enabled : undefined;
+    const group = nonEmptyString(item.group);
+    const note = nonEmptyString(item.note);
 
     const entry: GlossaryEntry = {
       k,
       v: rawV,
       ...(domain ? { domain } : {}),
       ...(caseSensitive !== undefined ? { caseSensitive } : {}),
+      ...(enabled !== undefined ? { enabled } : {}),
+      ...(group ? { group } : {}),
+      ...(note ? { note } : {}),
     };
     const dedupKey = `${k}::${domain ?? ''}::${caseSensitive ? '1' : '0'}`;
     deduped.set(dedupKey, entry);
@@ -1303,6 +1325,17 @@ function importNativeMarginV2(
     config.glossary = parseGlossaryEntries(raw.glossary, audit);
     glossaryEntriesImported = config.glossary.length;
   }
+  if (Array.isArray(raw.enabledGlossaryPacks)) {
+    config.enabledGlossaryPacks = raw.enabledGlossaryPacks.filter(
+      (id): id is string => typeof id === 'string' && id.trim().length > 0,
+    );
+  }
+  if (
+    typeof raw.promptSystemVersion === 'number' &&
+    Number.isFinite(raw.promptSystemVersion)
+  ) {
+    config.promptSystemVersion = Math.floor(raw.promptSystemVersion);
+  }
 
   if (isPlainObject(raw.webpage)) {
     const wp = raw.webpage;
@@ -1324,8 +1357,22 @@ function importNativeMarginV2(
     if (typeof wp.enableRichHtml === 'boolean') {
       config.webpage.enableRichHtml = wp.enableRichHtml;
     }
+    if (
+      wp.autoTranslateMode === 'off' ||
+      wp.autoTranslateMode === 'whitelist' ||
+      wp.autoTranslateMode === 'foreign'
+    ) {
+      config.webpage.autoTranslateMode = wp.autoTranslateMode as AutoTranslateMode;
+    }
     if (typeof wp.autoTranslateMatches === 'boolean') {
       config.webpage.autoTranslateMatches = wp.autoTranslateMatches;
+    } else if (wp.autoTranslateMode !== undefined) {
+      config.webpage.autoTranslateMatches = config.webpage.autoTranslateMode !== 'off';
+    }
+    if (Array.isArray(wp.autoTranslateLanguages)) {
+      config.webpage.autoTranslateLanguages = splitMultiValues(
+        wp.autoTranslateLanguages,
+      );
     }
   }
 
@@ -1837,7 +1884,27 @@ export function importLegacyConfig(
     config.subtitles.displayMode = 'source-only';
   }
 
-  // 10. URL Rules (`translationUrlPattern` + `immediateTranslateUrlPattern`)
+  // 10. URL Rules & Foreign-Page Auto-Translation (`translationUrlPattern`, `immediateTranslateUrlPattern`, `translationLanguagePattern`)
+  const rawAutoModeVal = raw.autoTranslateMode ?? generalRule.autoTranslateMode;
+  const rawAutoModeStr = nonEmptyString(rawAutoModeVal)?.toLowerCase();
+  const explicitlyTurnedOff =
+    rawAutoModeVal === false ||
+    rawAutoModeStr === 'off' ||
+    rawAutoModeStr === 'false' ||
+    rawAutoModeStr === 'none' ||
+    rawAutoModeStr === 'disabled';
+
+  if (explicitlyTurnedOff) {
+    config.webpage.autoTranslateMode = 'off';
+    config.webpage.autoTranslateMatches = false;
+  } else if (rawAutoModeStr === 'whitelist') {
+    config.webpage.autoTranslateMode = 'whitelist';
+    config.webpage.autoTranslateMatches = true;
+  } else {
+    config.webpage.autoTranslateMode = 'foreign';
+    config.webpage.autoTranslateMatches = true;
+  }
+
   if (isPlainObject(raw.translationUrlPattern)) {
     const urlPat = raw.translationUrlPattern;
     const rawExcludes =
@@ -1850,7 +1917,11 @@ export function importLegacyConfig(
     if (rawMatches !== undefined) {
       const includes = splitMultiValues(rawMatches);
       config.urlRules.includeMatches = includes;
-      if (includes.length > 0 && raw.autoTranslateMatches === undefined) {
+      if (
+        includes.length > 0 &&
+        raw.autoTranslateMatches === undefined &&
+        !explicitlyTurnedOff
+      ) {
         config.webpage.autoTranslateMatches = true;
       }
     }
@@ -1863,8 +1934,51 @@ export function importLegacyConfig(
         ...config.urlRules.includeMatches,
         ...immMatches,
       ]);
+      if (!explicitlyTurnedOff) {
+        config.webpage.autoTranslateMatches = true;
+      }
+    }
+  }
+
+  const rawLangPattern =
+    raw.translationLanguagePattern ?? generalRule.translationLanguagePattern;
+  if (rawLangPattern !== undefined) {
+    let rawLangMatches: unknown;
+    if (isPlainObject(rawLangPattern)) {
+      rawLangMatches =
+        rawLangPattern.matches ??
+        rawLangPattern['matches.add'] ??
+        rawLangPattern.includeMatches;
+    } else {
+      rawLangMatches = rawLangPattern;
+    }
+
+    const targetLower = config.targetLang.trim().toLowerCase();
+    const extractedLangs = splitMultiValues(rawLangMatches)
+      .map((code) => code.trim().toLowerCase().replace(/_/g, '-'))
+      .filter(
+        (code) =>
+          code.length > 0 &&
+          code !== '*' &&
+          code !== 'all' &&
+          code !== 'auto' &&
+          code !== targetLower,
+      );
+
+    config.webpage.autoTranslateLanguages = Array.from(new Set(extractedLangs));
+    if (!explicitlyTurnedOff) {
+      config.webpage.autoTranslateMode = 'foreign';
       config.webpage.autoTranslateMatches = true;
     }
+    ctx.onNormalized();
+    audit.push({
+      level: 'normalized',
+      code: 'translation-language-pattern-migrated',
+      message:
+        config.webpage.autoTranslateLanguages.length > 0
+          ? `Migrated legacy translationLanguagePattern -> webpage.autoTranslateMode ("${config.webpage.autoTranslateMode}") with autoTranslateLanguages [${config.webpage.autoTranslateLanguages.join(', ')}].`
+          : `Migrated legacy translationLanguagePattern -> webpage.autoTranslateMode ("${config.webpage.autoTranslateMode}", all foreign languages).`,
+    });
   }
 
   // 11. Glossary (`terms` / `glossary`, preserving `v: ""` keep-original entries)

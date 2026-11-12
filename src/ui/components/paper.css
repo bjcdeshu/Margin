@@ -843,22 +843,197 @@ body {
 
 .mp-popup-site-bar {
   display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 6px;
   padding-top: 6px;
   border-top: 1px solid var(--rule-soft);
   font-size: 11.5px;
 }
 
+.mp-popup-site-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
 .mp-popup-site-host {
   font-family: var(--font-mono);
   font-size: 11.5px;
-  color: var(--muted);
+  color: var(--ink-soft);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
   min-width: 0;
+}
+
+.mp-popup-site-pills {
+  display: flex;
+  align-items: center;
+  background: var(--paper-soft);
+  border: 1px solid var(--rule);
+  border-radius: var(--radius-control);
+  padding: 2px;
+  gap: 2px;
+}
+
+.mp-popup-site-pill {
+  appearance: none;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--muted);
+  font-family: var(--font-sans);
+  font-size: 11.5px;
+  font-weight: 500;
+  padding: 4px 6px;
+  border-radius: 3px;
+  cursor: pointer;
+  flex: 1 1 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 3px;
+  white-space: nowrap;
+  transition:
+    color var(--motion-fast) var(--ease-standard),
+    background-color var(--motion-fast) var(--ease-standard),
+    border-color var(--motion-fast) var(--ease-standard);
+}
+
+.mp-popup-site-pill:hover {
+  color: var(--ink);
+}
+
+.mp-popup-site-pill[aria-checked="true"] {
+  background: var(--paper);
+  color: var(--ink);
+  border-color: var(--rule-strong);
+}
+
+.mp-popup-site-sub {
+  font-size: 10.5px;
+  font-weight: 400;
+  color: var(--muted);
+}
+
+/* Built-in Domain Glossary Packs (2x2 Editorial Grid) */
+.mp-pack-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  margin-top: 10px;
+}
+
+.mp-pack-card {
+  border: 1px solid var(--rule);
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--paper-soft) 45%, var(--paper));
+  padding: 13px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  transition: border-color var(--motion-fast) var(--ease-standard);
+}
+
+.mp-pack-card[data-enabled="true"] {
+  border-color: var(--rule-strong);
+}
+
+.mp-pack-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.mp-pack-title-line {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.mp-pack-title {
+  font-size: 13.5px;
+  font-weight: 600;
+  color: var(--ink);
+}
+
+.mp-pack-desc {
+  margin: 0;
+  font-size: 12px;
+  color: var(--muted);
+  line-height: 1.48;
+}
+
+.mp-pack-terms {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  padding-top: 2px;
+}
+
+.mp-pack-term-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 7px;
+  font-size: 11.5px;
+  font-family: var(--font-mono);
+  border-radius: var(--radius-control);
+  border: 1px solid var(--rule);
+  background: var(--paper);
+  color: var(--ink);
+}
+
+.mp-pack-term-target {
+  font-family: var(--font-sans);
+  font-size: 11px;
+  color: var(--muted);
+}
+
+/* Live Prompt Preview & Persistent DB Card */
+.mp-preview-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  margin-top: 6px;
+}
+
+.mp-preview-pane {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  min-width: 0;
+}
+
+.mp-preview-code {
+  margin: 0;
+  padding: 10px 12px;
+  border-radius: var(--radius-control);
+  border: 1px solid var(--rule);
+  background: var(--paper);
+  color: var(--ink);
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 240px;
+  overflow-y: auto;
+}
+
+.mp-db-card {
+  border: 1px solid var(--rule);
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--paper-soft) 45%, var(--paper));
+  padding: 14px 16px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  flex-wrap: wrap;
 }
 
 /* Flat Table / Glossary / Diagnostics */
@@ -1089,5 +1264,10 @@ body {
 
   .mp-studio-main {
     padding: 20px 18px 48px;
+  }
+
+  .mp-pack-grid,
+  .mp-preview-grid {
+    grid-template-columns: 1fr;
   }
 }

@@ -3,6 +3,7 @@ export * from './types';
 export * from './temperature';
 export * from './constants';
 export * from './url-match';
+export * from './page-language';
 export * from './storage';
 export * from './messaging';
 export * from './shadow-styles';

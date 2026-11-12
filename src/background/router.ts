@@ -1,5 +1,9 @@
 import { buildDiagnosticSnapshot } from '@core/diagnostics';
 import {
+  computeMatchedGlossarySignature,
+  resolveEffectiveGlossary,
+} from '@core/prompts';
+import {
   executeBatchWithProvider,
   executeVisionWithProvider,
   type ProviderRuntimeEnv,
@@ -25,9 +29,11 @@ import type {
 } from '@shared/types';
 import {
   backgroundTranslationCache,
+  computeAssistantPromptFingerprint,
   makeTranslationCacheKey,
   type TranslationLruCache,
 } from './cache';
+import type { TranslationPersistenceWriteItem } from './translation-db';
 import {
   type DnrFetchDependencies,
   fetchImageDataUrlWithDnr,
@@ -169,25 +175,56 @@ export async function handleTranslateBatch(
       ? 'single-text'
       : (assistant?.codec ?? 'json-batch');
 
+  const effectiveGlossary = resolveEffectiveGlossary(config);
+  const configForRun: MarginConfig = {
+    ...config,
+    glossary: effectiveGlossary,
+  };
+  const effectiveContext = filterContextForProvider(provider, request.context);
+  const domainOrUrl = request.context?.domain || request.context?.url;
+  const effectiveStyleGuide = effectiveContext?.styleGuide;
+  const promptFingerprint = computeAssistantPromptFingerprint(
+    assistant,
+    request.scene,
+    codecId,
+  );
+
   const cache = env.translationCache ?? backgroundTranslationCache;
   const useCache = shouldUseTranslationCache(request.scene);
 
   const cachedOutputs = new Map<number, BatchItemOutput>();
   const uncachedItems: BatchItemInput[] = [];
+  const cacheKeysByItemId = new Map<number, string>();
 
-  if (useCache) {
+  if (useCache && request.items.length > 0) {
+    const requestedKeys: string[] = [];
     for (const item of request.items) {
+      const matchedGlossarySig = computeMatchedGlossarySignature(
+        [item.text],
+        effectiveGlossary,
+        domainOrUrl,
+      );
       const key = makeTranslationCacheKey({
         providerId: provider.id,
         model: provider.model,
         assistantId: assistant?.id,
         codecId,
+        scene: request.scene,
         fromLang: request.fromLang,
         toLang: request.toLang,
-        glossary: config.glossary,
+        matchedGlossarySig,
+        promptFingerprint,
+        styleGuide: effectiveStyleGuide,
         sourceText: item.text,
       });
-      const hit = cache.get(key);
+      cacheKeysByItemId.set(item.id, key);
+      requestedKeys.push(key);
+    }
+
+    const hitsMap = await cache.getMany(requestedKeys);
+    for (const item of request.items) {
+      const key = cacheKeysByItemId.get(item.id);
+      const hit = key !== undefined ? hitsMap.get(key) : undefined;
       if (hit !== undefined) {
         const outItem: BatchItemOutput = { id: item.id, trans: hit };
         cachedOutputs.set(item.id, outItem);
@@ -237,8 +274,6 @@ export async function handleTranslateBatch(
     };
   }
 
-  const effectiveContext = filterContextForProvider(provider, request.context);
-
   const result = await executeBatchWithProvider({
     scene: request.scene,
     provider,
@@ -247,7 +282,7 @@ export async function handleTranslateBatch(
     toLang: request.toLang,
     items: uncachedItems,
     context: effectiveContext,
-    glossary: config.glossary,
+    glossary: configForRun.glossary,
     stream: streamCallbacks?.stream ?? false,
     onDelta: streamCallbacks?.onDelta,
     onItemReady: streamCallbacks?.onItemReady,
@@ -263,21 +298,44 @@ export async function handleTranslateBatch(
 
   if (result.ok && useCache) {
     const uncachedById = new Map(uncachedItems.map((it) => [it.id, it]));
+    const writeBatch: TranslationPersistenceWriteItem[] = [];
     for (const outItem of result.items) {
       const srcItem = uncachedById.get(outItem.id);
       if (srcItem && outItem.trans.trim() !== '') {
-        const key = makeTranslationCacheKey({
-          providerId: provider.id,
-          model: provider.model,
-          assistantId: assistant?.id,
-          codecId,
-          fromLang: request.fromLang,
-          toLang: request.toLang,
-          glossary: config.glossary,
-          sourceText: srcItem.text,
+        const key =
+          cacheKeysByItemId.get(outItem.id) ??
+          makeTranslationCacheKey({
+            providerId: provider.id,
+            model: provider.model,
+            assistantId: assistant?.id,
+            codecId,
+            scene: request.scene,
+            fromLang: request.fromLang,
+            toLang: request.toLang,
+            matchedGlossarySig: computeMatchedGlossarySignature(
+              [srcItem.text],
+              effectiveGlossary,
+              domainOrUrl,
+            ),
+            promptFingerprint,
+            styleGuide: effectiveStyleGuide,
+            sourceText: srcItem.text,
+          });
+        writeBatch.push({
+          key,
+          value: outItem.trans,
+          meta: {
+            providerId: provider.id,
+            model: provider.model,
+            fromLang: request.fromLang,
+            toLang: request.toLang,
+            scene: request.scene,
+          },
         });
-        cache.set(key, outItem.trans);
       }
+    }
+    if (writeBatch.length > 0) {
+      await cache.setMany(writeBatch);
     }
   }
 
@@ -380,10 +438,12 @@ export async function handleTranslateImage(
     ? config.assistants[provider.assistantId]
     : undefined;
 
+  const effectiveGlossary = resolveEffectiveGlossary(config);
+
   const { systemPrompt, userPrompt } = buildVisionTranslationPrompts({
     fromLang: request.fromLang,
     toLang: request.toLang,
-    glossary: config.glossary,
+    glossary: effectiveGlossary,
     pageUrl: request.pageUrl,
   });
 
@@ -465,9 +525,20 @@ export async function handleRuntimeRpcRequest(
       return handleTranslateBatch(testBatch, config, env);
     }
 
+    case 'margin:get-translation-cache-stats': {
+      const cache = env.translationCache ?? backgroundTranslationCache;
+      const stats = await cache.getStats();
+      return {
+        ok: true,
+        memoryEntries: stats.memoryEntries,
+        persistentEntries: stats.persistentEntries,
+        dbAvailable: stats.dbAvailable,
+      };
+    }
+
     case 'margin:clear-translation-cache': {
       const cache = env.translationCache ?? backgroundTranslationCache;
-      cache.clear();
+      await cache.clearAll();
       if (
         typeof globalThis.chrome !== 'undefined' &&
         typeof chrome.tabs?.query === 'function' &&
@@ -504,6 +575,7 @@ export function isRuntimeRpcRequest(msg: unknown): msg is RuntimeRpcRequest {
     t === 'margin:translate-image' ||
     t === 'margin:fetch-image-data-url' ||
     t === 'margin:test-provider' ||
+    t === 'margin:get-translation-cache-stats' ||
     t === 'margin:clear-translation-cache'
   );
 }

@@ -106,3 +106,117 @@ export function resolveThemeForUrl(
   }
   return defaultTheme;
 }
+
+export type SiteAutoRuleState = 'follow' | 'always' | 'never';
+
+function extractHttpHostname(url: string): string | null {
+  try {
+    const parsed = new URL(String(url ?? '').trim());
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+      return null;
+    }
+    const host = parsed.hostname.trim().toLowerCase();
+    return host || null;
+  } catch {
+    return null;
+  }
+}
+
+function isGlobalCatchAllPattern(pattern: string): boolean {
+  const t = String(pattern ?? '').trim().toLowerCase();
+  return (
+    t === '<all_urls>' ||
+    t === '*://*/*' ||
+    t === 'https://*/*' ||
+    t === 'http://*/*' ||
+    t === '*'
+  );
+}
+
+function doesPatternMatchSiteHost(
+  pattern: string,
+  url: string,
+  hostname: string,
+): boolean {
+  const trimmed = String(pattern ?? '').trim();
+  if (!trimmed || isGlobalCatchAllPattern(trimmed)) {
+    return false;
+  }
+  return (
+    matchesUrlGlob(url, trimmed) ||
+    matchesUrlGlob(`https://${hostname}/`, trimmed) ||
+    matchesUrlGlob(`http://${hostname}/`, trimmed)
+  );
+}
+
+export function getSiteAutoRule(
+  url: string,
+  rules: UrlPatternConfig,
+): SiteAutoRuleState {
+  const hostname = extractHttpHostname(url);
+  if (!hostname) return 'follow';
+
+  if (rules.excludeMatches.some((p) => doesPatternMatchSiteHost(p, url, hostname))) {
+    return 'never';
+  }
+  if (rules.includeMatches.some((p) => doesPatternMatchSiteHost(p, url, hostname))) {
+    return 'always';
+  }
+  return 'follow';
+}
+
+export function applySiteAutoRule(
+  url: string,
+  state: SiteAutoRuleState,
+  rules: UrlPatternConfig,
+): UrlPatternConfig {
+  const hostname = extractHttpHostname(url);
+  if (!hostname) {
+    return {
+      includeMatches: [...rules.includeMatches],
+      excludeMatches: [...rules.excludeMatches],
+      skipPrivateNetworks: rules.skipPrivateNetworks,
+    };
+  }
+
+  const canonical = `*://${hostname}/*`;
+  const cleanIncludes = rules.includeMatches.filter(
+    (p) => !doesPatternMatchSiteHost(p, url, hostname),
+  );
+  const cleanExcludes = rules.excludeMatches.filter(
+    (p) => !doesPatternMatchSiteHost(p, url, hostname),
+  );
+
+  if (state === 'always') {
+    return {
+      includeMatches: [...cleanIncludes, canonical],
+      excludeMatches: cleanExcludes,
+      skipPrivateNetworks: rules.skipPrivateNetworks,
+    };
+  }
+
+  if (state === 'never') {
+    return {
+      includeMatches: cleanIncludes,
+      excludeMatches: [...cleanExcludes, canonical],
+      skipPrivateNetworks: rules.skipPrivateNetworks,
+    };
+  }
+
+  return {
+    includeMatches: cleanIncludes,
+    excludeMatches: cleanExcludes,
+    skipPrivateNetworks: rules.skipPrivateNetworks,
+  };
+}
+
+export {
+  detectPageLanguageSample,
+  evaluateAutoTranslateDecision,
+  type AutoTranslateDecision,
+  type AutoTranslateDecisionReason,
+  type DetectPageLanguageParams,
+  type EvaluateAutoTranslateParams,
+  type LanguageConfidence,
+  type PageLanguageDetectionResult,
+} from './page-language';

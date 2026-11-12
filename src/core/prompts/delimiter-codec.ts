@@ -6,11 +6,8 @@ import type {
   TranslationScene,
 } from '@shared/types';
 import {
-  buildExpandedPromptVariables,
-  ensureRichTagInstruction,
+  expandAssistantPrompts,
   extractStreamableVisibleText,
-  interpolateTemplate,
-  selectPromptsForBatch,
   stripThinkingBlocks,
 } from './template';
 import type {
@@ -113,12 +110,12 @@ export class DelimiterPromptCodec implements PromptCodec {
     const { joinSeparator } = resolveSeparatorToken(assistant);
 
     const joinedText = input.items.map((it) => it.text).join(joinSeparator);
-    const vars = buildExpandedPromptVariables({
+    const { systemPrompt, userPrompt } = expandAssistantPrompts({
+      assistant,
       scene: input.scene,
       fromLang: input.fromLang,
       toLang: input.toLang,
       items: input.items,
-      assistant,
       context: input.context,
       glossary: input.glossary,
       extraVars: {
@@ -126,28 +123,7 @@ export class DelimiterPromptCodec implements PromptCodec {
       },
     });
 
-    const { systemTemplate, userTemplate } = selectPromptsForBatch(
-      assistant,
-      input.scene,
-      input.items.length,
-    );
-
-    const rawSystemPrompt = interpolateTemplate(systemTemplate, vars).trim();
-    const userPrompt = interpolateTemplate(userTemplate, vars).trim();
-    const userTemplateInstructionsOnly = interpolateTemplate(userTemplate, {
-      ...vars,
-      text: '',
-      yaml: '',
-    }).trim();
-
-    return {
-      systemPrompt: ensureRichTagInstruction(
-        rawSystemPrompt,
-        userTemplateInstructionsOnly,
-        input.items,
-      ),
-      userPrompt,
-    };
+    return { systemPrompt, userPrompt };
   }
 
   decode(

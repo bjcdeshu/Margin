@@ -88,10 +88,12 @@ function parseSplitList(raw: string): string[] {
     .filter(Boolean);
 }
 
-function createProviderFromPreset(preset: ProviderPreset): ProviderConfig {
+export function createProviderFromPreset(preset: ProviderPreset): ProviderConfig {
   const meta = PROVIDER_PRESETS[preset];
   const suffix = Math.random().toString(36).slice(2, 7);
   const id = `${preset}-${suffix}`;
+  const isAiChannel =
+    meta.protocol === 'openai-chat' || meta.protocol === 'anthropic-messages';
   return {
     id,
     name: meta.label,
@@ -103,6 +105,7 @@ function createProviderFromPreset(preset: ProviderPreset): ProviderConfig {
     apiKeys: [],
     model: meta.defaultModel,
     models: [...meta.suggestedModels],
+    ...(isAiChannel ? { assistantId: 'builtin-yaml' } : {}),
     enableContext: preset !== 'deeplx' && preset !== 'google-free',
     enableRichHtml: true,
     stream: preset === 'deeplx' || preset === 'google-free' ? 'off' : 'auto',
@@ -596,6 +599,9 @@ export function ProvidersTab({
                     p.protocol = nextProto;
                     if (nextProto === 'deeplx' || nextProto === 'google-web') {
                       p.stream = 'off';
+                      delete p.assistantId;
+                    } else if (!p.assistantId && draft.assistants['builtin-yaml']) {
+                      p.assistantId = 'builtin-yaml';
                     }
                   });
                 }}
@@ -873,12 +879,13 @@ export function ProvidersTab({
                 label={lang === 'en' ? 'Bound Prompt Assistant' : '绑定提示词助手 (assistantId)'}
                 hint={
                   lang === 'en'
-                    ? 'Choose Aloxaf <yaml>, %% streaming delimiter, or built-in JSON batch'
-                    : '可绑定「泛用翻译大师 (<yaml>)」、「通用翻译 (%%)」或使用内置 JSON 批处理'
+                    ? 'Defaults to Margin Fast Editorial (<yaml>) with scene-aware prompts; also supports Thinking (<yaml>), %% delimiter, or JSON batch'
+                    : '新建 AI 渠道默认绑定「Margin 信达雅精译 (<yaml>)」结构化分场景提示词；也可切换思考精修、极速 %% 或 JSON 批处理'
                 }
               >
                 <select
                   class="mp-select"
+                  data-testid="provider-assistant-select"
                   aria-label={lang === 'en' ? 'Bound Prompt Assistant' : '绑定提示词助手'}
                   value={provider.assistantId ?? ''}
                   onChange={(e) => {

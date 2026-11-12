@@ -10,6 +10,7 @@ import {
   getMarginConfig,
   onMarginConfigChanged,
   saveMarginConfig,
+  updateMarginConfig,
 } from '@shared/storage';
 import type {
   DisplayMode,
@@ -19,9 +20,10 @@ import type {
   UiColorMode,
 } from '@shared/types';
 import {
+  applySiteAutoRule,
+  getSiteAutoRule,
   isUnsupportedBrowserUrl,
-  matchesAnyUrlGlob,
-  matchesUrlGlob,
+  type SiteAutoRuleState,
 } from '@shared/url-match';
 import {
   SegmentedControl,
@@ -29,6 +31,7 @@ import {
   createSaveTracker,
   formatLanguageOption,
   labelForDisplayMode,
+  normalizeConfigForSave,
   useUiColorMode,
 } from '../components';
 
@@ -287,30 +290,100 @@ export function PopupApp({
     () => Boolean(activeTab.url && isUnsupportedBrowserUrl(activeTab.url)),
     [activeTab.url],
   );
-  const isDomainExcluded = useMemo(() => {
-    if (!activeTab.url || !tabDomain) return false;
-    return matchesAnyUrlGlob(activeTab.url, config.urlRules.excludeMatches);
-  }, [activeTab.url, tabDomain, config.urlRules.excludeMatches]);
+  const siteAutoRule: SiteAutoRuleState = useMemo(() => {
+    if (!activeTab.url || !tabDomain) return 'follow';
+    return getSiteAutoRule(activeTab.url, config.urlRules);
+  }, [activeTab.url, tabDomain, config.urlRules]);
 
-  const handleToggleDomainExclude = () => {
-    if (!activeTab.url || !tabDomain) return;
+  const autoMode = config.webpage.autoTranslateMode ?? 'foreign';
+  const followModeBadge =
+    autoMode === 'foreign'
+      ? lang === 'en'
+        ? '(Foreign Auto)'
+        : '(非中自动)'
+      : autoMode === 'whitelist'
+        ? lang === 'en'
+          ? '(Whitelist)'
+          : '(仅白名单)'
+        : lang === 'en'
+          ? '(Manual)'
+          : '(手动)';
+
+  const handleSelectSiteAutoRule = async (nextState: SiteAutoRuleState) => {
+    if (!hydratedRef.current || !activeTab.url || !tabDomain) return;
     const targetUrl = activeTab.url;
-    const nextExcluded = !isDomainExcluded;
-    void persistUserPatch((draft) => {
-      if (isDomainExcluded) {
-        draft.urlRules.excludeMatches = draft.urlRules.excludeMatches.filter(
-          (pattern) => !matchesUrlGlob(targetUrl, pattern),
+
+    if (nextState !== siteAutoRule) {
+      const optimistic = structuredClone(configRef.current);
+      optimistic.urlRules = applySiteAutoRule(
+        targetUrl,
+        nextState,
+        optimistic.urlRules,
+      );
+      const normalizedOptimistic = trackerRef.current.beginUserSave(optimistic);
+      syncConfigState(normalizedOptimistic);
+
+      const seq = ++saveSeqRef.current;
+      try {
+        await updateMarginConfig((draft) => {
+          draft.urlRules = applySiteAutoRule(
+            targetUrl,
+            nextState,
+            draft.urlRules,
+          );
+          return normalizeConfigForSave(draft);
+        });
+        const persisted = await getMarginConfig();
+        trackerRef.current.observePersisted(persisted);
+        if (seq === saveSeqRef.current) {
+          syncConfigState(persisted);
+        }
+      } catch (err) {
+        trackerRef.current.failSave(
+          err instanceof Error ? err.message : String(err),
         );
-      } else {
-        draft.urlRules.excludeMatches = [
-          ...draft.urlRules.excludeMatches,
-          tabDomain.originGlob,
-        ];
+        return;
       }
-    });
-    if (nextExcluded) {
-      setPageState(IDLE_PAGE_STATE);
-      setCommandNotice(null);
+    }
+
+    const shouldTranslateNow = nextState === 'always' && !pageState.active;
+    const shouldRestoreNow = nextState === 'never' && pageState.active;
+
+    if ((shouldTranslateNow || shouldRestoreNow) && activeTab.id !== undefined) {
+      const res = await sendTabCommand(activeTab.id, {
+        type: 'margin:cmd:toggle-page',
+      });
+      if (res.ok) {
+        const returnedState = extractDispatchedPageState(res.result);
+        if (returnedState) {
+          setPageState(returnedState);
+        } else {
+          setPageState((prev) => ({
+            ...prev,
+            active: shouldTranslateNow,
+          }));
+        }
+        setCommandNotice({
+          text: shouldTranslateNow
+            ? lang === 'en'
+              ? 'Site set to Always Translate · Bilingual mode enabled'
+              : '已设为「此站必翻」并开启当前页面翻译'
+            : lang === 'en'
+              ? 'Site set to Never Translate · Restored original page'
+              : '已设为「此站不翻」并还原网页原文',
+        });
+      } else if (shouldRestoreNow) {
+        setPageState((prev) => ({ ...prev, active: false }));
+        setCommandNotice(null);
+      } else if (shouldTranslateNow && res.unsupportedPage) {
+        setCommandNotice({
+          text:
+            lang === 'en'
+              ? 'This page does not support content script injection.'
+              : '当前页面不支持注入翻译脚本',
+          isError: true,
+        });
+      }
     }
   };
 
@@ -751,27 +824,65 @@ export function PopupApp({
         <div class="mp-popup-site-bar">
           {tabDomain ? (
             <>
-              <span class="mp-popup-site-host" title={tabDomain.hostname}>
-                {tabDomain.hostname}
-              </span>
-              <button
-                type="button"
-                data-testid="popup-domain-toggle"
-                class={
-                  isDomainExcluded
-                    ? 'mp-btn mp-btn--solid mp-btn--sm'
-                    : 'mp-btn mp-btn--sm'
+              <div class="mp-popup-site-meta">
+                <span class="mp-popup-site-host" title={tabDomain.hostname}>
+                  {tabDomain.hostname}
+                </span>
+                <span class="mp-muted" data-testid="popup-site-rule-status">
+                  {siteAutoRule === 'follow'
+                    ? `${lang === 'en' ? 'Global' : '跟随全局'} ${followModeBadge}`
+                    : siteAutoRule === 'always'
+                      ? lang === 'en'
+                        ? 'Rule: Always'
+                        : '规则: 此站必翻'
+                      : lang === 'en'
+                        ? 'Rule: Never'
+                        : '规则: 此站不翻'}
+                </span>
+              </div>
+
+              <div
+                class="mp-popup-site-pills"
+                role="radiogroup"
+                aria-label={
+                  lang === 'en'
+                    ? 'Site Auto-Translate Rule'
+                    : '当前网站自动翻译规则'
                 }
-                onClick={handleToggleDomainExclude}
+                data-testid="popup-site-rule-group"
               >
-                {isDomainExcluded
-                  ? lang === 'en'
-                    ? 'Disabled · Enable'
-                    : '已禁用 · 点击恢复'
-                  : lang === 'en'
-                    ? 'Disable on site'
-                    : '在此网站禁用'}
-              </button>
+                <button
+                  type="button"
+                  role="radio"
+                  class="mp-popup-site-pill"
+                  data-testid="popup-site-rule-follow"
+                  aria-checked={siteAutoRule === 'follow' ? 'true' : 'false'}
+                  onClick={() => void handleSelectSiteAutoRule('follow')}
+                >
+                  <span>{lang === 'en' ? 'Follow' : '跟随全局'}</span>
+                  <span class="mp-popup-site-sub">{followModeBadge}</span>
+                </button>
+                <button
+                  type="button"
+                  role="radio"
+                  class="mp-popup-site-pill"
+                  data-testid="popup-site-rule-always"
+                  aria-checked={siteAutoRule === 'always' ? 'true' : 'false'}
+                  onClick={() => void handleSelectSiteAutoRule('always')}
+                >
+                  {lang === 'en' ? 'Always' : '此站必翻'}
+                </button>
+                <button
+                  type="button"
+                  role="radio"
+                  class="mp-popup-site-pill"
+                  data-testid="popup-site-rule-never"
+                  aria-checked={siteAutoRule === 'never' ? 'true' : 'false'}
+                  onClick={() => void handleSelectSiteAutoRule('never')}
+                >
+                  {lang === 'en' ? 'Never' : '此站不翻'}
+                </button>
+              </div>
             </>
           ) : (
             <span class="mp-muted">

@@ -7,9 +7,10 @@ import type {
 } from '@shared/types';
 import {
   buildExpandedPromptVariables,
+  ensureRichTagInstruction,
+  expandAssistantPrompts,
   extractStreamableVisibleText,
   interpolateTemplate,
-  selectPromptsForBatch,
   stripThinkingBlocks,
 } from './template';
 import type {
@@ -18,6 +19,36 @@ import type {
   EncodedPrompt,
   PromptCodec,
 } from './types';
+
+export const DEFAULT_JSON_BATCH_SYSTEM_PROMPT = [
+  'You are Margin, a senior bilingual editor translating into {{to}} with accuracy, idiomatic rhythm, and authentic register ("信达雅").',
+  '1. Idiomatic Prose: Restructure long clauses, nested modifiers, and passive constructions into clean, natural, rhythmic {{to}} prose with zero translationese.',
+  '2. Domain & Register: Match tone and terminology to any provided Document Title, Context Summary, and Style Guide.',
+  '3. Markup & Token Integrity: Preserve inline <m0>...</m0> / <mN> HTML tags, <m-g id="N"/> placeholders, @handles, #hashtags, URLs, Markdown formatting, and code/CLI identifiers verbatim.',
+  '4. Glossary Obedience: Strictly obey any provided Keep-Original terms and Required Term Mappings.',
+  '5. JSON Contract: Respond ONLY with a valid JSON array of objects `[{"id":1,"trans":"..."}]` with no commentary or extra fields.',
+].join('\n');
+
+export function buildDefaultJsonBatchSystemPrompt(
+  toLang: string,
+  scene: TranslationScene | 'service-test' = 'webpage',
+): string {
+  const toName = getEnglishLanguageName(toLang);
+  const base = interpolateTemplate(DEFAULT_JSON_BATCH_SYSTEM_PROMPT, {
+    to: toName,
+    to_lang: toName,
+  });
+  if (scene === 'input') {
+    return `${base}\nScene Hint (Outbound Input): Rewrite and translate into concise, idiomatic, native-speaker ${toName} ready to post or send directly (e.g. on X, GitHub issues/PRs, or chat), preserving @mentions, #hashtags, URLs, Markdown, and inline code verbatim.`;
+  }
+  if (scene === 'selection') {
+    return `${base}\nScene Hint (Selection): Render the selected phrase or passage into crisp, contextually accurate ${toName} without dictionary notes or explanations.`;
+  }
+  if (scene === 'subtitle') {
+    return `${base}\nScene Hint (Subtitle): Use natural spoken rhythm and concise on-screen pacing. Keep each translation strictly inside its matching cue \`id\`; never merge, split, or shift trailing words across adjacent cues.`;
+  }
+  return base;
+}
 
 function extractJsonBody(raw: string): string {
   const stripped = stripThinkingBlocks(raw);
@@ -133,12 +164,12 @@ export class JsonBatchCodec implements PromptCodec {
     );
 
     if (input.assistant) {
-      const vars = buildExpandedPromptVariables({
+      const { systemPrompt, userPrompt } = expandAssistantPrompts({
+        assistant: input.assistant,
         scene: input.scene,
         fromLang: input.fromLang,
         toLang: input.toLang,
         items: input.items,
-        assistant: input.assistant,
         context: input.context,
         glossary: input.glossary,
         extraVars: {
@@ -146,15 +177,7 @@ export class JsonBatchCodec implements PromptCodec {
           text: payloadJson,
         },
       });
-      const { systemTemplate, userTemplate } = selectPromptsForBatch(
-        input.assistant,
-        input.scene,
-        input.items.length,
-      );
-      return {
-        systemPrompt: interpolateTemplate(systemTemplate, vars).trim(),
-        userPrompt: interpolateTemplate(userTemplate, vars).trim(),
-      };
+      return { systemPrompt, userPrompt };
     }
 
     const vars = buildExpandedPromptVariables({
@@ -166,24 +189,25 @@ export class JsonBatchCodec implements PromptCodec {
       glossary: input.glossary,
     });
 
-    const toName = getEnglishLanguageName(input.toLang);
     const contextLines: string[] = [];
-    if (vars.imt_title) contextLines.push(`Document Title: ${vars.imt_title}`);
-    if (vars.imt_theme) contextLines.push(`Context Summary: ${vars.imt_theme}`);
-    if (vars.imt_style_guide) {
-      contextLines.push(`Style Guide: ${vars.imt_style_guide}`);
+    if (vars.title) contextLines.push(`Document Title: ${vars.title}`);
+    if (vars.summary) contextLines.push(`Context Summary: ${vars.summary}`);
+    if (vars.styleGuide) {
+      contextLines.push(`Style Guide: ${vars.styleGuide}`);
     }
-    if (vars.imt_terms) {
-      contextLines.push(`Required Glossary: ${vars.imt_terms}`);
+    if (vars.glossaryInstruction) {
+      contextLines.push(vars.glossaryInstruction);
     }
 
-    const subtitleRule =
-      input.scene === 'subtitle'
-        ? ' Keep each translation strictly inside its matching `id`; never shift trailing words across cues.'
-        : '';
-
-    const systemPrompt =
-      `You are a meticulous editorial translator. Translate every item naturally into ${toName} while preserving inline <mN> tags verbatim.${subtitleRule} Respond ONLY with a valid JSON array of objects \`[{"id":1,"trans":"..."}]\`.`;
+    const rawSystemPrompt = buildDefaultJsonBatchSystemPrompt(
+      input.toLang,
+      input.scene,
+    );
+    const systemPrompt = ensureRichTagInstruction(
+      rawSystemPrompt,
+      '',
+      input.items,
+    );
 
     const prefix = contextLines.length > 0 ? `${contextLines.join('\n')}\n` : '';
     const userPrompt = `${prefix}${payloadJson}`;

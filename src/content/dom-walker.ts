@@ -1212,13 +1212,326 @@ export function findClosestParagraphBlock(
   return null;
 }
 
+const SOCIAL_COMMUNITY_DOMAINS = [
+  'x.com',
+  'twitter.com',
+  'threads.net',
+  'bsky.app',
+  'reddit.com',
+  'news.ycombinator.com',
+] as const;
+
+const DEVELOPER_DOCS_DOMAINS = [
+  'github.com',
+  'gitlab.com',
+  'stackoverflow.com',
+  'developer.mozilla.org',
+  'npmjs.com',
+  'pypi.org',
+  'crates.io',
+  'huggingface.co',
+  'cloud.google.com',
+] as const;
+
+const ACADEMIC_RESEARCH_DOMAINS = [
+  'arxiv.org',
+  'openreview.net',
+  'nature.com',
+  'science.org',
+  'acm.org',
+  'ieee.org',
+  'scholar.google.com',
+] as const;
+
+const VIDEO_CREATOR_DOMAINS = [
+  'youtube.com',
+  'youtu.be',
+  'twitch.tv',
+  'vimeo.com',
+] as const;
+
+const EDITORIAL_JOURNALISM_DOMAINS = [
+  'nytimes.com',
+  'economist.com',
+  'bloomberg.com',
+  'ft.com',
+  'theverge.com',
+  'arstechnica.com',
+  'substack.com',
+  'medium.com',
+] as const;
+
+const PROSE_SAMPLER_SKIP_TAGS: ReadonlySet<string> = new Set([
+  ...EXCLUDED_SUBTREE_TAGS,
+  ...ATOMIC_INLINE_TAGS,
+  'TIME',
+]);
+
+function matchesDomainGroup(
+  host: string,
+  candidates: readonly string[],
+): boolean {
+  for (const base of candidates) {
+    if (host === base || host.endsWith(`.${base}`)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 /**
- * Extracts zero-latency local page context (`title`, `domain`, compact summary)
- * without making any blocking LLM pre-request.
+ * Infers an editorial register & terminology style guide from the current domain/URL
+ * so webpage, selection, input, and subtitle prompts adapt automatically across site genres.
  */
-export function extractPageContext(doc: Document = document): PageContextPayload {
+export function inferDomainStyleGuide(
+  domain: string,
+  url?: string,
+): string | undefined {
+  let host = String(domain ?? '')
+    .trim()
+    .toLowerCase()
+    .replace(/\.+$/, '');
+
+  if (!host && url) {
+    try {
+      host = new URL(url).hostname.toLowerCase().replace(/\.+$/, '');
+    } catch {
+      host = '';
+    }
+  }
+
+  if (!host) {
+    return undefined;
+  }
+
+  // Note: `docs.*` subdomains (e.g. `docs.rs`, `docs.python.org`, `docs.github.com`) always use engineering register
+  if (
+    host.startsWith('docs.') ||
+    host.includes('.docs.') ||
+    matchesDomainGroup(host, DEVELOPER_DOCS_DOMAINS)
+  ) {
+    return 'Software engineering & developer documentation register: crisp, accurate technical prose; preserve code identifiers, CLI flags, file paths, API names, and error literals verbatim.';
+  }
+
+  if (matchesDomainGroup(host, SOCIAL_COMMUNITY_DOMAINS)) {
+    return 'Social & tech community register: concise, authentic internet/conversational tone; preserve creator voice, humor/irony, @handles, #hashtags, $tickers, and slang naturally.';
+  }
+
+  if (matchesDomainGroup(host, ACADEMIC_RESEARCH_DOMAINS)) {
+    return 'Academic & research register: rigorous scholarly style, precise domain terminology, and exact logical qualifiers.';
+  }
+
+  if (matchesDomainGroup(host, VIDEO_CREATOR_DOMAINS)) {
+    return 'Video & creator platform register: natural spoken rhythm suitable for video titles, chapters, and creator commentary.';
+  }
+
+  if (matchesDomainGroup(host, EDITORIAL_JOURNALISM_DOMAINS)) {
+    return 'Editorial & journalism register: fluent, publication-grade journalistic prose with clear narrative flow.';
+  }
+
+  return undefined;
+}
+
+function shouldSkipElementInProseSample(el: Element): boolean {
+  const tag = el.tagName.toUpperCase();
+  if (PROSE_SAMPLER_SKIP_TAGS.has(tag)) {
+    return true;
+  }
+
+  if (
+    el.hasAttribute('data-margin-injected') ||
+    el.hasAttribute('data-margin-host') ||
+    el.hasAttribute('data-margin-block') ||
+    el.hasAttribute('data-margin-inline')
+  ) {
+    return true;
+  }
+
+  if (
+    el.hasAttribute('hidden') &&
+    el.getAttribute('data-margin-orig-wrap') !== 'true'
+  ) {
+    return true;
+  }
+
+  if (el.hasAttribute('is-empty')) {
+    return true;
+  }
+
+  if (el.getAttribute('aria-hidden')?.trim().toLowerCase() === 'true') {
+    return true;
+  }
+
+  if (isContentEditableNode(el)) {
+    return true;
+  }
+
+  if (
+    el.hasAttribute('data-placeholder') ||
+    el.hasAttribute('data-slate-placeholder') ||
+    el.hasAttribute('data-lexical-editor') ||
+    el.hasAttribute('data-slate-editor')
+  ) {
+    return true;
+  }
+
+  const elemId = el.getAttribute('id')?.trim();
+  if (elemId) {
+    const lowerId = elemId.toLowerCase();
+    if (
+      EXCLUDED_ELEMENT_IDS.has(lowerId) ||
+      lowerId.startsWith('placeholder-')
+    ) {
+      return true;
+    }
+  }
+
+  const testId = el.getAttribute('data-testid');
+  if (
+    testId &&
+    (EXCLUDED_DATA_TESTIDS.has(testId) ||
+      testId.includes('tweetTextarea') ||
+      testId.startsWith('UserAvatar-Container-') ||
+      testId.startsWith('User-Avatar-Container-'))
+  ) {
+    return true;
+  }
+
+  const classList = el.classList;
+  if (classList && classList.length > 0) {
+    for (let i = 0; i < classList.length; i++) {
+      const cls = classList[i];
+      if (EXCLUDED_ELEMENT_CLASSES.has(cls)) {
+        return true;
+      }
+    }
+    for (const cls of ATOMIC_INLINE_CLASSES) {
+      if (classList.contains(cls)) {
+        return true;
+      }
+    }
+    for (const cls of SCREEN_READER_ONLY_CLASSES) {
+      if (classList.contains(cls)) {
+        return true;
+      }
+    }
+  }
+
+  if (hasExplicitInputPlaceholderClass(el)) {
+    return true;
+  }
+
+  if (el instanceof HTMLElement && el.style) {
+    const display = el.style.display?.trim().toLowerCase();
+    const visibility = el.style.visibility?.trim().toLowerCase();
+    if (
+      display === 'none' ||
+      visibility === 'hidden' ||
+      visibility === 'collapse'
+    ) {
+      return true;
+    }
+    if (
+      el.style.pointerEvents?.trim().toLowerCase() === 'none' &&
+      isComposerPlaceholderOverlay(el)
+    ) {
+      return true;
+    }
+  }
+
+  const role = el.getAttribute('role')?.trim().toLowerCase();
+  if (role) {
+    if (role === 'group') {
+      if (el.querySelector(GROUP_ROLE_CONTENT_DESCENDANTS_SELECTOR) === null) {
+        return true;
+      }
+    } else if (EXCLUDED_ARIA_ROLES.has(role)) {
+      return true;
+    } else if (role === 'button') {
+      if (el.querySelector(UI_BUTTON_STRUCTURAL_DESCENDANTS_SELECTOR) === null) {
+        const compact = (el.textContent ?? '').replace(/\s+/g, ' ').trim();
+        if (
+          !(compact.length > 24 && /\s/.test(compact)) &&
+          countCjkOrKanaHangulChars(compact) < 10
+        ) {
+          return true;
+        }
+      }
+    }
+  }
+
+  return false;
+}
+
+/**
+ * Fast (< 1ms) visible prose sampler for automatic page language detection.
+ * Skips scripts, styles, code/pre, SVG, form inputs, UI buttons/chrome, and Margin's
+ * own injected nodes, collecting up to `maxChars` of readable page text.
+ */
+export function samplePageProseForLanguageDetection(
+  root: ParentNode | null = typeof document !== 'undefined'
+    ? document.body
+    : null,
+  maxChars = 900,
+): string {
+  if (!root || maxChars <= 0) {
+    return '';
+  }
+  if (root instanceof Element && shouldSkipElementInProseSample(root)) {
+    return '';
+  }
+
+  const chunks: string[] = [];
+  let totalLen = 0;
+
+  const walk = (parent: ParentNode): void => {
+    for (
+      let node = parent.firstChild;
+      node && totalLen < maxChars;
+      node = node.nextSibling
+    ) {
+      if (node.nodeType === Node.TEXT_NODE) {
+        const cleaned = (node.nodeValue ?? '').replace(/\s+/g, ' ').trim();
+        if (!cleaned) continue;
+        if (
+          /^https?:\/\/\S+$/i.test(cleaned) ||
+          AT_HANDLE_RE.test(cleaned) ||
+          METRIC_COUNTER_RE.test(cleaned) ||
+          RELATIVE_TIMESTAMP_RE.test(cleaned)
+        ) {
+          continue;
+        }
+        const remaining = maxChars - totalLen;
+        const slice =
+          cleaned.length > remaining ? cleaned.slice(0, remaining) : cleaned;
+        chunks.push(slice);
+        totalLen += slice.length + 1;
+      } else if (node.nodeType === Node.ELEMENT_NODE) {
+        const el = node as Element;
+        if (shouldSkipElementInProseSample(el)) {
+          continue;
+        }
+        walk(el);
+      }
+    }
+  };
+
+  walk(root);
+  return chunks.join(' ').slice(0, maxChars).trim();
+}
+
+/**
+ * Extracts zero-latency local page context (`title`, `domain`, compact summary, and
+ * automatic domain `styleGuide`) without making any blocking LLM pre-request.
+ */
+export function extractPageContext(
+  doc: Document = document,
+  urlOverride?: string,
+): PageContextPayload {
   const rawUrl =
-    doc.location?.href || (typeof location !== 'undefined' ? location.href : '');
+    urlOverride?.trim() ||
+    doc.location?.href ||
+    (typeof location !== 'undefined' ? location.href : '');
   let domain = '';
   try {
     domain = rawUrl ? new URL(rawUrl).hostname : '';
@@ -1259,11 +1572,13 @@ export function extractPageContext(doc: Document = document): PageContextPayload
   }
 
   const combinedSummary = summaryParts.join(' — ').slice(0, 450).trim();
+  const styleGuide = inferDomainStyleGuide(domain, rawUrl);
 
   return {
     url: rawUrl,
     domain,
     title,
     summary: combinedSummary || undefined,
+    ...(styleGuide ? { styleGuide } : {}),
   };
 }

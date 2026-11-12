@@ -116,10 +116,17 @@ export const PROVIDER_PRESETS: Readonly<Record<ProviderPreset, ProviderPresetMet
   },
 };
 
+export const DEFAULT_ENABLED_GLOSSARY_PACK_IDS = [
+  'ai-agent-infra',
+  'dev-cloud-web',
+  'screenwriting-narrative',
+  'gaming-tech-culture',
+] as const;
+
 export const BUILTIN_ASSISTANTS: Record<string, AssistantConfig> = {
   'builtin-yaml': {
     id: 'builtin-yaml',
-    name: 'Master Structured YAML (Aloxaf-Compatible)',
+    name: 'Margin 信达雅精译 (Fast Editorial <yaml>)',
     codec: 'yaml',
     enableRichHtml: true,
     temperaturePolicy: { mode: 'custom', value: 0.3 },
@@ -127,12 +134,22 @@ export const BUILTIN_ASSISTANTS: Record<string, AssistantConfig> = {
     maxSubtitleBatchCount: 17,
     maxCharsPerBatch: 4096,
     separator: '\n\n%%\n\n',
-    systemPrompt:
-      'You are a meticulous editorial translator. Translate every item naturally into {{to}} while preserving inline <mN> tags verbatim. Respond ONLY inside a <yaml>...</yaml> block with fields `id`, optional brief `thinking`, and `trans`.',
+    systemPrompt: [
+      'You are Margin, a senior bilingual editor translating into {{to}} with accuracy, idiomatic rhythm, and authentic register ("信达雅").',
+      '1. Idiomatic Prose: Restructure English long clauses, nested modifiers, and passive constructions into clean, natural, rhythmic {{to}} prose with zero translationese.',
+      '2. Domain & Register: Match tone and terminology to any provided Document Title, Context Summary, and Style Guide.',
+      '3. Markup & Token Integrity: Preserve inline <m0>...</m0> HTML wrapper tags, <m-g id="N"/> placeholders, @handles, #hashtags, URLs, Markdown formatting, and code/CLI identifiers verbatim.',
+      '4. Glossary Obedience: Strictly obey any provided glossary rules—preserve Keep-Original terms in exact source spelling and apply Required Term Mappings verbatim.',
+      '5. Fast YAML Contract: Respond ONLY inside a single <yaml>...</yaml> block where each item has `- id: <number>` and `  trans: <translation>` ONLY. Never include a `thinking` field, preamble, or trailing commentary.',
+    ].join('\n'),
     prompt:
-      '{{title_prompt}}{{summary_prompt}}{{terms_prompt}}Translate into {{to}}:\n<yaml>\n{{yaml}}\n</yaml>',
+      '{{title_prompt}}{{summary_prompt}}{{style_prompt}}{{glossary_prompt}}Translate into {{to}}:\n<yaml>\n{{yaml}}\n</yaml>',
+    inputPrompt:
+      '{{glossary_prompt}}Rewrite and translate the user draft into concise, idiomatic, native-speaker {{to}} ready to post or send directly (e.g. on X, GitHub issues/PRs, or chat). Preserve @mentions, #hashtags, URLs, Markdown, and inline code verbatim. Output ONLY `- id: 1` and `trans` inside <yaml>:\n<yaml>\n{{yaml}}\n</yaml>',
+    selectionPrompt:
+      '{{title_prompt}}{{style_prompt}}{{glossary_prompt}}Translate the selected text into crisp, contextually accurate {{to}}. Render phrases and sentences naturally in context without dictionary notes or explanations. Output ONLY `- id` and `trans` inside <yaml>:\n<yaml>\n{{yaml}}\n</yaml>',
     subtitlePrompt:
-      '{{title_prompt}}{{terms_prompt}}Translate each video subtitle cue into {{to}}. Keep each translation strictly inside its own cue `id`; never shift trailing words to adjacent cues:\n<yaml>\n{{yaml}}\n</yaml>',
+      '{{title_prompt}}{{sub_summary_prompt}}{{style_prompt}}{{glossary_prompt}}Translate each video subtitle cue into natural, spoken {{to}} with concise on-screen pacing. Keep each translation strictly inside its own cue `id`; never merge, split, or shift trailing words across adjacent cues. Output ONLY `- id` and `trans` inside <yaml>:\n<yaml>\n{{yaml}}\n</yaml>',
     env: {
       imt_yaml_item: '- id: {{id}}\n  src: |-\n    {{text}}',
       imt_subtitle_yaml_item: '- id: {{id}}\n  src: {{text}}',
@@ -140,16 +157,59 @@ export const BUILTIN_ASSISTANTS: Record<string, AssistantConfig> = {
       imt_trans_field: 'trans',
       imt_sub_source_field: 'src',
       imt_sub_trans_field: 'trans',
-      title_prompt: 'Document Title: {{imt_title}}\n',
-      summary_prompt: 'Context Summary: {{imt_theme}}\n',
+      title_prompt: 'Document Title: {{title}}\n',
+      summary_prompt: 'Context Summary: {{summary}}\n',
+      style_prompt: 'Style Guide: {{styleGuide}}\n',
+      glossary_prompt: '{{glossaryInstruction}}\n',
       terms_prompt: 'Required Glossary: {{imt_terms}}\n',
-      sub_summary_prompt: 'Video Context: {{imt_theme}}\n',
+      sub_summary_prompt: 'Video Context: {{summary}}\n',
+      sub_terms_prompt: 'Required Glossary: {{imt_terms}}\n',
+    },
+  },
+  'builtin-yaml-thinking': {
+    id: 'builtin-yaml-thinking',
+    name: '泛用翻译大师 · 思考精修 (Aloxaf <yaml>)',
+    codec: 'yaml',
+    enableRichHtml: true,
+    temperaturePolicy: { mode: 'custom', value: 0.3 },
+    maxBatchCount: 17,
+    maxSubtitleBatchCount: 17,
+    maxCharsPerBatch: 4096,
+    separator: '\n\n%%\n\n',
+    systemPrompt: [
+      'You are a meticulous literary and technical editor translating into {{to}} using two-step structured reflection.',
+      '1. First note key register, syntax restructuring, and glossary/markup constraints briefly in `thinking`, then write idiomatic, publication-grade {{to}} in `trans` (restructuring long English clauses and passives into natural prose).',
+      '2. Preserve all inline <m0>...</m0> tags, <m-g id="N"/> placeholders, @handles, #hashtags, URLs, and code identifiers verbatim.',
+      '3. Strictly obey any provided Keep-Original terms, Required Term Mappings, Document Title, Context Summary, and Style Guide.',
+      '4. Respond ONLY inside a <yaml>...</yaml> block using `- id: <number>`, `  thinking: <brief editorial note>`, and `  trans: <final translation>`.',
+    ].join('\n'),
+    prompt:
+      '{{title_prompt}}{{summary_prompt}}{{style_prompt}}{{glossary_prompt}}Translate into {{to}} with brief `thinking` and polished `trans`:\n<yaml>\n{{yaml}}\n</yaml>',
+    inputPrompt:
+      '{{glossary_prompt}}Translate the user draft into idiomatic, native-speaker {{to}} ready to post on X, GitHub issues/PRs, or chat. Preserve @mentions, #hashtags, URLs, Markdown, and inline code verbatim. Respond inside <yaml> with `id: 1`, brief `thinking`, and `trans`:\n<yaml>\n{{yaml}}\n</yaml>',
+    selectionPrompt:
+      '{{title_prompt}}{{style_prompt}}{{glossary_prompt}}Translate the selected passage into crisp, contextually accurate {{to}}. Respond inside <yaml> with `id`, brief `thinking`, and `trans`:\n<yaml>\n{{yaml}}\n</yaml>',
+    subtitlePrompt:
+      '{{title_prompt}}{{sub_summary_prompt}}{{style_prompt}}{{glossary_prompt}}Translate each video subtitle cue into natural spoken {{to}}. Keep each translation strictly inside its own cue `id`; never shift trailing words to adjacent cues. Respond inside <yaml> with `id`, brief `thinking`, and `trans`:\n<yaml>\n{{yaml}}\n</yaml>',
+    env: {
+      imt_yaml_item: '- id: {{id}}\n  src: |-\n    {{text}}',
+      imt_subtitle_yaml_item: '- id: {{id}}\n  src: {{text}}',
+      imt_source_field: 'src',
+      imt_trans_field: 'trans',
+      imt_sub_source_field: 'src',
+      imt_sub_trans_field: 'trans',
+      title_prompt: 'Document Title: {{title}}\n',
+      summary_prompt: 'Context Summary: {{summary}}\n',
+      style_prompt: 'Style Guide: {{styleGuide}}\n',
+      glossary_prompt: '{{glossaryInstruction}}\n',
+      terms_prompt: 'Required Glossary: {{imt_terms}}\n',
+      sub_summary_prompt: 'Video Context: {{summary}}\n',
       sub_terms_prompt: 'Required Glossary: {{imt_terms}}\n',
     },
   },
   'builtin-delimiter': {
     id: 'builtin-delimiter',
-    name: 'Fast Streaming Delimiter (%%)',
+    name: '极速流式直译 (%%)',
     codec: 'delimiter',
     enableRichHtml: true,
     temperaturePolicy: { mode: 'omit' },
@@ -157,15 +217,44 @@ export const BUILTIN_ASSISTANTS: Record<string, AssistantConfig> = {
     maxSubtitleBatchCount: 12,
     maxCharsPerBatch: 1800,
     separator: '\n\n%%\n\n',
-    systemPrompt:
-      'You are a professional translator. Translate the user input into {{to}}. Preserve `%%` paragraph separators and any `<mN>` inline tags exactly. Output ONLY the translated text.',
-    prompt: '{{title_prompt}}{{terms_prompt}}{{text}}',
+    systemPrompt: [
+      'You are Margin, a fast editorial translator into {{to}}.',
+      'Restructure source sentences into clean, idiomatic {{to}} prose with zero translationese.',
+      'Preserve `%%` paragraph separators, inline <m0>...</m0> / <mN> tags, <m-g id="N"/> placeholders, @handles, #hashtags, URLs, and code verbatim.',
+      'Strictly obey any provided Keep-Original and Term Mapping rules, and output ONLY the translated text.',
+    ].join(' '),
+    prompt: '{{title_prompt}}{{style_prompt}}{{glossary_prompt}}{{text}}',
+    inputPrompt:
+      '{{glossary_prompt}}Rewrite and translate into concise, native-speaker {{to}} ready to send or post (preserving @mentions, #hashtags, URLs, and code verbatim; output ONLY the translation):\n{{text}}',
+    selectionPrompt:
+      '{{title_prompt}}{{style_prompt}}{{glossary_prompt}}Translate the selected text into crisp, natural {{to}} (output ONLY the translation):\n{{text}}',
+    subtitlePrompt:
+      '{{title_prompt}}{{sub_summary_prompt}}{{style_prompt}}{{glossary_prompt}}Translate each subtitle cue into natural spoken {{to}}, keeping exact `%%` cue boundaries without shifting words across cues:\n{{text}}',
     env: {
-      title_prompt: 'Title: {{imt_title}}\n',
+      title_prompt: 'Title: {{title}}\n',
+      sub_summary_prompt: 'Video Context: {{summary}}\n',
+      style_prompt: 'Style Guide: {{styleGuide}}\n',
+      glossary_prompt: '{{glossaryInstruction}}\n',
       terms_prompt: 'Glossary: {{imt_terms}}\n',
     },
   },
 };
+
+export function cloneAssistantConfig(ast: AssistantConfig): AssistantConfig {
+  return {
+    ...ast,
+    temperaturePolicy: { ...ast.temperaturePolicy },
+    ...(ast.env ? { env: { ...ast.env } } : {}),
+  };
+}
+
+export function cloneBuiltinAssistants(): Record<string, AssistantConfig> {
+  const out: Record<string, AssistantConfig> = {};
+  for (const [key, ast] of Object.entries(BUILTIN_ASSISTANTS)) {
+    out[key] = cloneAssistantConfig(ast);
+  }
+  return out;
+}
 
 export function resolveProviderIdForScene(
   scene: TranslationScene | 'service-test',
@@ -240,20 +329,22 @@ export function createDefaultMarginConfig(): MarginConfig {
       'google-free': googleFree,
     },
     providerOrder: ['google-free'],
-    assistants: {
-      ...structuredClone(BUILTIN_ASSISTANTS),
-    },
+    assistants: cloneBuiltinAssistants(),
     glossary: [
       { k: 'LLM', v: '' },
       { k: 'LLMs', v: '' },
     ],
+    enabledGlossaryPacks: [...DEFAULT_ENABLED_GLOSSARY_PACK_IDS],
+    promptSystemVersion: 2,
     webpage: {
       displayMode: 'bilingual',
       theme: 'none',
       themePatterns: [],
       lineBreakMaxTextCount: 280,
       enableRichHtml: true,
-      autoTranslateMatches: false,
+      autoTranslateMatches: true,
+      autoTranslateMode: 'foreign',
+      autoTranslateLanguages: [],
     },
     input: {
       enabled: true,

@@ -4,6 +4,8 @@ import {
   extractPageContext,
   extractParagraphBlocks,
   findClosestParagraphBlock,
+  inferDomainStyleGuide,
+  samplePageProseForLanguageDetection,
 } from '../../src/content/dom-walker';
 
 describe('dom-walker: smart paragraph extraction & math/code protection', () => {
@@ -464,5 +466,99 @@ describe('dom-walker: smart paragraph extraction & math/code protection', () => 
     expect(
       findClosestParagraphBlock(foreignZh, { targetLang: 'zh-CN' }),
     ).toBeNull();
+  });
+
+  it('samples visible readable prose in < 5ms while skipping script, style, code, pre, svg, inputs, UI buttons, and Margin attributes', () => {
+    document.body.innerHTML = `
+      <nav><a href="/home">Home</a><a href="/explore">Explore</a></nav>
+      <script>const secret = "English script noise that must never be sampled";</script>
+      <style>.btn { content: "English style noise"; }</style>
+      <noscript>Enable JavaScript to continue browsing.</noscript>
+      <pre><code>git checkout -b feature/auto-translate</code></pre>
+      <textarea>Draft inside textarea</textarea>
+      <input type="text" value="Search query value" />
+      <button type="button">Subscribe</button>
+      <div role="button">Follow</div>
+      <svg><text>Vector label</text></svg>
+      <div data-margin-block="true">Previously injected Margin block</div>
+      <span data-margin-inline="true">Previously injected Margin inline</span>
+      <span data-margin-injected="true">Injected translation</span>
+      <article>
+        <p>Margin automatically detects foreign-language prose using character distribution.</p>
+        <p>Inline <code>evaluateAutoTranslateDecision()</code> tokens and @handles are skipped cleanly.</p>
+      </article>
+    `;
+
+    const t0 = performance.now();
+    const sample = samplePageProseForLanguageDetection(document.body, 900);
+    const elapsedMs = performance.now() - t0;
+
+    expect(elapsedMs).toBeLessThan(15);
+    expect(sample).toContain(
+      'Margin automatically detects foreign-language prose using character distribution.',
+    );
+    expect(sample).not.toContain('English script noise');
+    expect(sample).not.toContain('English style noise');
+    expect(sample).not.toContain('git checkout');
+    expect(sample).not.toContain('evaluateAutoTranslateDecision');
+    expect(sample).not.toContain('Draft inside textarea');
+    expect(sample).not.toContain('Subscribe');
+    expect(sample).not.toContain('Follow');
+    expect(sample).not.toContain('Vector label');
+    expect(sample).not.toContain('Previously injected Margin');
+
+    const capped = samplePageProseForLanguageDetection(document.body, 42);
+    expect(capped.length).toBeLessThanOrEqual(42);
+  });
+
+  it('infers domain-aware styleGuide in extractPageContext across social, developer/docs, academic, video, and editorial sites', () => {
+    document.title = 'Understanding Attention Sinks';
+    document.body.innerHTML = `<p>Streaming LLM inference with constant KV cache memory.</p>`;
+
+    const xCtx = extractPageContext(document, 'https://x.com/karpathy/status/123');
+    expect(xCtx.domain).toBe('x.com');
+    expect(xCtx.styleGuide).toContain('Social & tech community');
+    expect(xCtx.styleGuide).toContain('@handles');
+
+    const ghCtx = extractPageContext(
+      document,
+      'https://github.com/anthropics/claude-code/issues/1',
+    );
+    expect(ghCtx.domain).toBe('github.com');
+    expect(ghCtx.styleGuide).toContain('Software engineering');
+    expect(ghCtx.styleGuide).toContain('CLI flags');
+
+    const docsSubdomainCtx = extractPageContext(
+      document,
+      'https://docs.example.io/guide/getting-started',
+    );
+    expect(docsSubdomainCtx.styleGuide).toContain('Software engineering');
+
+    const arxivCtx = extractPageContext(
+      document,
+      'https://arxiv.org/abs/2309.17453',
+    );
+    expect(arxivCtx.domain).toBe('arxiv.org');
+    expect(arxivCtx.styleGuide).toContain('Academic & research');
+
+    const ytCtx = extractPageContext(
+      document,
+      'https://www.youtube.com/watch?v=AOJwkm3yixU',
+    );
+    expect(ytCtx.domain).toBe('www.youtube.com');
+    expect(ytCtx.styleGuide).toContain('Video & creator');
+
+    const nytCtx = extractPageContext(
+      document,
+      'https://www.nytimes.com/2026/11/12/technology/ai.html',
+    );
+    expect(nytCtx.styleGuide).toContain('Editorial & journalism');
+
+    expect(inferDomainStyleGuide('unknown-personal-site.example')).toBeUndefined();
+    const genericCtx = extractPageContext(
+      document,
+      'https://unknown-personal-site.example/hello',
+    );
+    expect(genericCtx.styleGuide).toBeUndefined();
   });
 });

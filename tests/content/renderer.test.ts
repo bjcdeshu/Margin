@@ -60,6 +60,7 @@ describe('renderer & content orchestrator: themes, reversible target-only, retry
     document.head.innerHTML = '';
     document.body.innerHTML = '';
     document.documentElement.removeAttribute('data-margin-mask-revealed');
+    document.documentElement.removeAttribute('lang');
   });
 
   afterEach(() => {
@@ -508,6 +509,7 @@ describe('renderer & content orchestrator: themes, reversible target-only, retry
 
     // 2. Loading spinner + fuller final overwrite + toggle ON->OFF->ON + live targetLang switch
     const config = createDefaultMarginConfig();
+    config.webpage.autoTranslateMode = 'whitelist';
     config.providers['google-free'].stream = 'on';
 
     const p = document.createElement('p');
@@ -978,8 +980,10 @@ describe('renderer & content orchestrator: themes, reversible target-only, retry
 
       // 2. Orphaned content script self-cleans on extension reload (`chrome.runtime.id` -> undefined)
       let zombieTransportCalls = 0;
+      const zombieCfg = createDefaultMarginConfig();
+      zombieCfg.webpage.autoTranslateMode = 'whitelist';
       const zombieController = new MarginContentController({
-        config: createDefaultMarginConfig(),
+        config: zombieCfg,
         getUrl: () => 'https://x.com/home',
         transport: async () => {
           zombieTransportCalls += 1;
@@ -1200,8 +1204,10 @@ describe('renderer & content orchestrator: themes, reversible target-only, retry
       const sharedPara = document.getElementById('shared-para')!;
 
       // Mount World 1 controllers while chrome.runtime.id and chrome.storage.onChanged are live
+      const oldCfg = createDefaultMarginConfig();
+      oldCfg.webpage.autoTranslateMode = 'whitelist';
       const oldController = new MarginContentController({
-        config: createDefaultMarginConfig(),
+        config: oldCfg,
         getUrl: () => 'https://www.youtube.com/watch?v=AOJwkm3yixU',
       });
       oldController.mount();
@@ -1257,5 +1263,228 @@ describe('renderer & content orchestrator: themes, reversible target-only, retry
       delete globalBag[imageBootKey];
       (globalThis as Record<string, unknown>).chrome = origChrome;
     }
+  });
+
+  it('auto-translates English pages in foreign mode, skips Chinese pages with misleading <html lang="en">, and honors https://linux.do/* exclusion', async () => {
+    // 1. English page on GitHub -> auto-translates immediately & populates getPageState() + domain styleGuide
+    document.documentElement.setAttribute('lang', 'en');
+    document.body.innerHTML = `
+      <article>
+        <p id="gh-readme">Margin provides calm bilingual reading with zero-flicker Shadow DOM isolation across modern SPAs.</p>
+      </article>
+    `;
+
+    const seenContexts: Array<TranslateBatchRequest['context']> = [];
+    const enController = new MarginContentController({
+      config: createDefaultMarginConfig(),
+      getUrl: () => 'https://github.com/openai/openai-node',
+      transport: async (req) => {
+        seenContexts.push(req.context);
+        return {
+          ok: true,
+          requestId: req.requestId,
+          providerId: 'google-free',
+          model: 'gtx',
+          items: req.items.map((it) => ({
+            id: it.id,
+            trans: `自动译文：${it.text}`,
+          })),
+          diagnostic: makeMockDiagnostic(),
+        };
+      },
+    });
+    enController.mount();
+
+    expect(enController.renderer.isActive).toBe(true);
+    expect(enController.getPageState()).toMatchObject({
+      active: true,
+      autoTranslated: true,
+      detectedPageLang: 'en',
+    });
+
+    await vi.waitFor(() => {
+      expect(
+        document.getElementById('gh-readme')?.querySelector('.margin-trans-root')
+          ?.textContent,
+      ).toContain('自动译文：Margin provides calm bilingual reading');
+    });
+    expect(seenContexts[0]?.domain).toBe('github.com');
+    expect(seenContexts[0]?.styleGuide).toContain('Software engineering');
+    enController.destroy();
+
+    // 2. Chinese page leaving `<html lang="en">` in index.html -> MUST NOT auto-translate!
+    document.documentElement.setAttribute('lang', 'en');
+    document.body.innerHTML = `
+      <article>
+        <p id="zh-article">这是一篇完整的简体中文技术长文，即便模板错误标记了英文语言属性也不应自动触发翻译。</p>
+      </article>
+    `;
+    let zhApiCalls = 0;
+    const zhController = new MarginContentController({
+      config: createDefaultMarginConfig(),
+      getUrl: () => 'https://juejin.cn/post/7390001',
+      transport: async (req) => {
+        zhApiCalls += 1;
+        return {
+          ok: true,
+          requestId: req.requestId,
+          providerId: 'google-free',
+          model: 'gtx',
+          items: req.items.map((it) => ({ id: it.id, trans: it.text })),
+          diagnostic: makeMockDiagnostic(),
+        };
+      },
+    });
+    zhController.mount();
+
+    expect(zhController.renderer.isActive).toBe(false);
+    expect(zhController.getPageState()).toMatchObject({
+      active: false,
+      autoTranslated: false,
+      detectedPageLang: 'zh',
+    });
+    expect(zhApiCalls).toBe(0);
+    zhController.destroy();
+
+    // 3. Excluded site (`https://linux.do/*`) with English prose in `foreign` mode -> MUST NOT auto-translate!
+    document.documentElement.setAttribute('lang', 'en');
+    document.body.innerHTML = `
+      <article>
+        <p id="linuxdo-en">Even when a post on linux.do is written entirely in English, site exclusion wins.</p>
+      </article>
+    `;
+    let linuxDoCalls = 0;
+    const linuxDoController = new MarginContentController({
+      config: createDefaultMarginConfig(),
+      getUrl: () => 'https://linux.do/t/topic/88888',
+      transport: async (req) => {
+        linuxDoCalls += 1;
+        return {
+          ok: true,
+          requestId: req.requestId,
+          providerId: 'google-free',
+          model: 'gtx',
+          items: req.items.map((it) => ({ id: it.id, trans: it.text })),
+          diagnostic: makeMockDiagnostic(),
+        };
+      },
+    });
+    linuxDoController.mount();
+
+    expect(linuxDoController.renderer.isActive).toBe(false);
+    expect(linuxDoController.getPageState().autoTranslated).toBe(false);
+    expect(linuxDoCalls).toBe(0);
+    linuxDoController.destroy();
+  });
+
+  it('auto-translates SPA feeds after post-hydration MutationObserver recheck, enforces Alt+A manuallyDisabledInSession lock across SPA routes, and reacts to permissive/exclusion config updates', async () => {
+    document.documentElement.setAttribute('lang', 'en');
+    // Initial document_idle on https://x.com/home BEFORE tweets hydrate (only nav/buttons exist)
+    document.body.innerHTML = `
+      <nav role="navigation"><a href="/home">Home</a><a href="/explore">Explore</a></nav>
+      <button type="button">Post</button>
+      <main id="timeline-feed"></main>
+    `;
+
+    const config = createDefaultMarginConfig();
+    await saveMarginConfig(config);
+
+    let currentUrl = 'https://x.com/home';
+    let fakeNow = 10_000;
+    let apiCalls = 0;
+
+    const controller = new MarginContentController({
+      config,
+      now: () => fakeNow,
+      getUrl: () => currentUrl,
+      transport: async (req) => {
+        apiCalls += 1;
+        return {
+          ok: true,
+          requestId: req.requestId,
+          providerId: 'google-free',
+          model: 'gtx',
+          items: req.items.map((it) => ({
+            id: it.id,
+            trans: `推文自动译文：${it.text}`,
+          })),
+          diagnostic: makeMockDiagnostic(),
+        };
+      },
+    });
+    controller.mount();
+
+    // Before hydration: insufficient prose -> awaiting-content, not active yet
+    expect(controller.renderer.isActive).toBe(false);
+    expect(apiCalls).toBe(0);
+
+    // Async SPA feed hydration mounts English tweet > 24 chars
+    const feed = document.getElementById('timeline-feed')!;
+    const tweet1 = document.createElement('article');
+    tweet1.innerHTML = `<div id="hydrated-tweet-1" data-testid="tweetText">Anthropic and OpenAI engineers discuss structured YAML streaming latency across modern browsers.</div>`;
+    feed.appendChild(tweet1);
+
+    // Hydration MutationObserver (220ms debounce) detects English prose and auto-enables translation!
+    await vi.waitFor(
+      () => {
+        expect(controller.renderer.isActive).toBe(true);
+        expect(
+          document
+            .getElementById('hydrated-tweet-1')
+            ?.querySelector('.margin-trans-root')?.textContent,
+        ).toContain('推文自动译文：Anthropic and OpenAI');
+      },
+      { timeout: 1500 },
+    );
+
+    expect(controller.getPageState()).toMatchObject({
+      active: true,
+      autoTranslated: true,
+      detectedPageLang: 'en',
+    });
+
+    // User manually toggles translation OFF via Alt+A (`margin:cmd:toggle-page`) -> locks session manual-off!
+    fakeNow += 2000;
+    const toggledOff = await controller.handleCommand(
+      { type: 'margin:cmd:toggle-page' },
+      'key',
+    );
+    expect(toggledOff).toBe(false);
+    expect(controller.renderer.isActive).toBe(false);
+    expect(controller.getPageState().autoTranslated).toBe(false);
+
+    const callsAfterManualOff = apiCalls;
+
+    // SPA route click (`popstate` / `yt-navigate-finish`) + new English tweets MUST NOT re-trigger auto-translation!
+    currentUrl = 'https://x.com/explore';
+    const tweet2 = document.createElement('article');
+    tweet2.innerHTML = `<div id="hydrated-tweet-2" data-testid="tweetText">Another foreign-language post mounted during the same tab session after manual off.</div>`;
+    feed.appendChild(tweet2);
+    window.dispatchEvent(new Event('popstate'));
+    await new Promise((r) => setTimeout(r, 280));
+
+    expect(controller.renderer.isActive).toBe(false);
+    expect(apiCalls).toBe(callsAfterManualOff);
+
+    // Making site rules more permissive (`includeMatches: ['*://x.com/*']`) via onMarginConfigChanged resets manual-off lock and auto-translates!
+    const permissiveCfg = structuredClone(config);
+    permissiveCfg.urlRules.includeMatches = ['*://x.com/*'];
+    await saveMarginConfig(permissiveCfg);
+
+    await vi.waitFor(() => {
+      expect(controller.renderer.isActive).toBe(true);
+      expect(controller.getPageState().autoTranslated).toBe(true);
+    });
+
+    // Excluding URL via onMarginConfigChanged while `active && autoTranslated` immediately disables page translation!
+    const excludedCfg = structuredClone(permissiveCfg);
+    excludedCfg.urlRules.excludeMatches = ['https://linux.do/*', '*://x.com/*'];
+    await saveMarginConfig(excludedCfg);
+
+    expect(controller.renderer.isActive).toBe(false);
+    expect(controller.getPageState().autoTranslated).toBe(false);
+    expect(document.querySelector('.margin-trans-root')).toBeNull();
+
+    controller.destroy();
   });
 });

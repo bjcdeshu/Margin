@@ -23,6 +23,7 @@ import {
   extractParagraphBlocks,
   findClosestParagraphBlock,
   findFirstDirectBlockBoundaryChild,
+  inferDomainStyleGuide,
 } from './dom-walker';
 import {
   reconstructRichDom,
@@ -508,6 +509,7 @@ export interface WebpageRendererOptions {
   cache?: LruTranslationCache;
   transport?: BatchTransportFn;
   flushDelayMs?: number;
+  onManualStop?: () => void;
 }
 
 interface PreparedBlockTask {
@@ -635,7 +637,7 @@ function hashGlossaryFingerprint(entries: readonly GlossaryEntry[]): string {
   if (!entries || entries.length === 0) return '0';
   let h = 2166136261;
   for (const e of entries) {
-    const row = `${e.k}=>${e.v}@${e.domain ?? ''}:${e.caseSensitive ? 1 : 0};`;
+    const row = `${e.k}=>${e.v}@${e.domain ?? ''}:${e.caseSensitive ? 1 : 0}:${e.enabled === false ? 0 : 1};`;
     for (let i = 0; i < row.length; i++) {
       h ^= row.charCodeAt(i);
       h = Math.imul(h, 16777619);
@@ -673,6 +675,7 @@ export class WebpageRenderer {
   readonly cache: LruTranslationCache;
   private readonly transport: BatchTransportFn;
   private readonly flushDelayMs: number;
+  private readonly onManualStop?: () => void;
 
   private active = false;
   private maskRevealedGlobally = false;
@@ -723,6 +726,7 @@ export class WebpageRenderer {
     this.cache = options.cache ?? new LruTranslationCache(DEFAULT_LRU_CAPACITY);
     this.transport = options.transport ?? defaultBatchTransport;
     this.flushDelayMs = options.flushDelayMs ?? 32;
+    this.onManualStop = options.onManualStop;
 
     this.bindFullscreenListener();
   }
@@ -845,7 +849,8 @@ export class WebpageRenderer {
     const model = provider?.model ?? '';
     const assistantId = provider?.assistantId ?? '';
     const glossaryFp = hashGlossaryFingerprint(this.config.glossary);
-    return `${providerId}:${model}:${assistantId}:${this.config.sourceLang}->${this.config.targetLang}:${enableRichHtml ? '1' : '0'}:${glossaryFp}:${tokenizedText}`;
+    const packsFp = (this.config.enabledGlossaryPacks ?? []).join(',');
+    return `${providerId}:${model}:${assistantId}:${this.config.sourceLang}->${this.config.targetLang}:${enableRichHtml ? '1' : '0'}:${glossaryFp}:${packsFp}:${tokenizedText}`;
   }
 
   private getPageContext(scene: TranslationScene): PageContextPayload | undefined {
@@ -864,17 +869,28 @@ export class WebpageRenderer {
     );
     const provider = this.config.providers[providerId];
     if (provider && !provider.enableContext) {
-      return currentUrl || domain ? { url: currentUrl, domain } : undefined;
+      if (!currentUrl && !domain) return undefined;
+      const styleGuide = inferDomainStyleGuide(domain, currentUrl);
+      return {
+        url: currentUrl,
+        domain,
+        ...(styleGuide ? { styleGuide } : {}),
+      };
     }
 
     if (this.pageContextCache && this.pageContextCache.url === currentUrl) {
       return this.pageContextCache.payload;
     }
-    const extracted = extractPageContext(this.doc);
+    const extracted = extractPageContext(this.doc, currentUrl);
+    const resolvedUrl = currentUrl || extracted.url;
+    const resolvedDomain = domain || extracted.domain;
+    const styleGuide =
+      extracted.styleGuide ?? inferDomainStyleGuide(resolvedDomain, resolvedUrl);
     const payload: PageContextPayload = {
       ...extracted,
-      url: currentUrl || extracted.url,
-      domain: domain || extracted.domain,
+      url: resolvedUrl,
+      domain: resolvedDomain,
+      ...(styleGuide ? { styleGuide } : {}),
     };
     this.pageContextCache = { url: currentUrl, payload };
     return payload;
@@ -1323,6 +1339,7 @@ export class WebpageRenderer {
         ev.stopPropagation();
         const action = actionBtn.dataset.action;
         if (action === 'stop') {
+          this.onManualStop?.();
           this.restorePage();
         } else if (action === 'retry-failed') {
           const failed = Array.from(this.failedBlockTasks.values());
@@ -2610,6 +2627,7 @@ export class WebpageRenderer {
       assistant?.prompt ?? '',
       assistant?.multiplePrompt ?? '',
       hashGlossaryFingerprint(cfg.glossary),
+      (cfg.enabledGlossaryPacks ?? []).join(','),
     ]);
   }
 

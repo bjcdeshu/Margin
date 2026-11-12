@@ -28,6 +28,8 @@ export type TranslationTheme = 'none' | 'mask' | 'opacity' | 'weakening';
 
 export type DisplayMode = 'bilingual' | 'target-only';
 
+export type AutoTranslateMode = 'off' | 'whitelist' | 'foreign';
+
 export type UiColorMode = 'paper' | 'night' | 'system';
 
 export type SelectionTriggerMode = 'off' | 'icon' | 'dot' | 'instant';
@@ -103,6 +105,8 @@ export interface AssistantConfig {
   prompt: string;
   multipleSystemPrompt?: string;
   multiplePrompt?: string;
+  inputPrompt?: string;
+  selectionPrompt?: string;
   subtitlePrompt?: string;
   env: Record<string, string>;
 }
@@ -113,6 +117,10 @@ export interface GlossaryEntry {
   v: string;
   domain?: string;
   caseSensitive?: boolean;
+  /** Defaults to true when omitted. */
+  enabled?: boolean;
+  group?: string;
+  note?: string;
 }
 
 export interface ThemePatternRule {
@@ -133,6 +141,8 @@ export interface WebpageSettings {
   lineBreakMaxTextCount: number;
   enableRichHtml: boolean;
   autoTranslateMatches: boolean;
+  autoTranslateMode: AutoTranslateMode;
+  autoTranslateLanguages?: string[];
 }
 
 export interface InputTranslateSettings {
@@ -189,6 +199,8 @@ export interface MarginConfig {
   providerOrder: string[];
   assistants: Record<string, AssistantConfig>;
   glossary: GlossaryEntry[];
+  enabledGlossaryPacks?: string[];
+  promptSystemVersion?: number;
   webpage: WebpageSettings;
   input: InputTranslateSettings;
   selection: SelectionSettings;
@@ -413,17 +425,26 @@ export interface ExportMarginOptions {
   includeSecrets: boolean;
 }
 
+export interface TranslationCacheStatsResponse {
+  ok: true;
+  memoryEntries: number;
+  persistentEntries: number;
+  dbAvailable: boolean;
+}
+
 export type RuntimeRpcRequest =
   | { type: 'margin:translate-batch'; payload: TranslateBatchRequest }
   | { type: 'margin:translate-image'; payload: TranslateImageRequest }
   | { type: 'margin:fetch-image-data-url'; payload: FetchImageDataUrlRequest }
   | { type: 'margin:test-provider'; payload: { providerId: string } }
+  | { type: 'margin:get-translation-cache-stats' }
   | { type: 'margin:clear-translation-cache' };
 
 export type RuntimeRpcResponse =
   | TranslateBatchResponse
   | TranslateImageResponse
   | FetchImageDataUrlResponse
+  | TranslationCacheStatsResponse
   | { ok: boolean; error?: string };
 
 export type TabCommandMessage =
@@ -444,6 +465,8 @@ export interface TabPageState {
   inFlightBlocks: number;
   translatedBlocks: number;
   maskRevealed: boolean;
+  autoTranslated?: boolean;
+  detectedPageLang?: string;
   lastError?: string;
 }
 

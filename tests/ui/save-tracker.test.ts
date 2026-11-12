@@ -106,4 +106,24 @@ describe('Snapshot-Verified Save State (save-tracker)', () => {
     b.urlRules.excludeMatches = ['  https://linux.do/*  '];
     expect(canonicalizeConfigSnapshot(a)).toBe(canonicalizeConfigSnapshot(b));
   });
+
+  it('preserves disabled glossary entry state and enabledGlossaryPacks during normalization', () => {
+    const tracker = createSaveTracker();
+    const base = createDefaultMarginConfig();
+    tracker.hydrateReadOnly(base);
+
+    const edited = structuredClone(base);
+    edited.glossary[0].enabled = false;
+    edited.enabledGlossaryPacks = ['ai-agent-infra', 'gaming-tech-culture'];
+
+    expect(tracker.isDirty(edited)).toBe(true);
+    const normalized = tracker.beginUserSave(edited);
+    expect(normalized.glossary[0].enabled).toBe(false);
+    expect(normalized.enabledGlossaryPacks).toEqual([
+      'ai-agent-infra',
+      'gaming-tech-culture',
+    ]);
+    expect(tracker.observePersisted(normalized)).toBe(true);
+    expect(tracker.getState().status).toBe('saved');
+  });
 });

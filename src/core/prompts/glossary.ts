@@ -13,6 +13,10 @@ export interface GlossaryPromptVars {
   imt_terms: string;
   imt_terms_with_domain: string;
   imt_terms_without_domain: string;
+  keepOriginalInstruction: string;
+  glossaryMappingInstruction: string;
+  glossaryInstruction: string;
+  terms: string;
 }
 
 export interface ProtectedGlossaryBatch {
@@ -46,6 +50,7 @@ export function isGlossaryEntryApplicable(
   entry: GlossaryEntry,
   domainOrUrl?: string,
 ): boolean {
+  if (entry.enabled === false) return false;
   const key = String(entry.k ?? '').trim();
   if (!key) return false;
 
@@ -215,12 +220,81 @@ export function buildGlossaryPromptVars(
   const withDomain = matched.filter((m) => m.hasDomain);
   const withoutDomain = matched.filter((m) => !m.hasDomain);
 
+  const keepOriginalMatches = matched.filter(
+    (m) => String(m.entry.v ?? '').trim() === '',
+  );
+  const mappedMatches = matched.filter(
+    (m) => String(m.entry.v ?? '').trim() !== '',
+  );
+
+  const keepOriginalInstruction =
+    keepOriginalMatches.length > 0
+      ? `Keep-Original Terms (preserve exact source spelling, do NOT translate): ${keepOriginalMatches
+          .map((m) => m.key)
+          .join(', ')}`
+      : '';
+
+  const glossaryMappingInstruction =
+    mappedMatches.length > 0
+      ? `Required Term Mappings (use exact target translation): ${mappedMatches
+          .map((m) => `${m.key} => ${m.target}`)
+          .join('; ')}`
+      : '';
+
+  const glossaryInstruction = [
+    keepOriginalInstruction,
+    glossaryMappingInstruction,
+  ]
+    .filter(Boolean)
+    .join('\n');
+
   return {
     matched,
     imt_terms: formatGlossaryListForPrompt(matched),
     imt_terms_with_domain: formatGlossaryListForPrompt(withDomain),
     imt_terms_without_domain: formatGlossaryListForPrompt(withoutDomain),
+    keepOriginalInstruction,
+    glossaryMappingInstruction,
+    glossaryInstruction,
+    terms: glossaryInstruction,
   };
+}
+
+/**
+ * Computes a deterministic cache-key signature ONLY over glossary entries that
+ * actually match `texts` (within `domainOrUrl`). Editing or adding unrelated
+ * glossary terms never invalidates cached translations.
+ */
+export function computeMatchedGlossarySignature(
+  texts: readonly string[],
+  glossary: readonly GlossaryEntry[],
+  domainOrUrl?: string,
+): string {
+  const matched = matchGlossaryEntries(texts, glossary, domainOrUrl);
+  if (matched.length === 0) return 'g0';
+
+  const canonical = [...matched].sort((a, b) => {
+    const lowerCmp = a.key.toLowerCase().localeCompare(b.key.toLowerCase());
+    if (lowerCmp !== 0) return lowerCmp;
+    const keyCmp = a.key.localeCompare(b.key);
+    if (keyCmp !== 0) return keyCmp;
+    return a.target.localeCompare(b.target);
+  });
+
+  let h1 = 2166136261;
+  let h2 = 0x811c9dc5 ^ 0x9e3779b9;
+  for (const item of canonical) {
+    const token = `${item.key}\u0000${item.target}\u0000${item.entry.caseSensitive ? '1' : '0'}\u0001`;
+    for (let i = 0; i < token.length; i++) {
+      const ch = token.charCodeAt(i);
+      h1 ^= ch;
+      h1 = Math.imul(h1, 16777619);
+      h2 ^= ch;
+      h2 = Math.imul(h2, 1099511627);
+    }
+  }
+
+  return `g${(h1 >>> 0).toString(36)}${(h2 >>> 0).toString(36)}_${canonical.length}`;
 }
 
 /**

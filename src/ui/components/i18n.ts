@@ -1,5 +1,6 @@
 import { SUPPORTED_LANGUAGES } from '@shared/constants';
 import type {
+  AutoTranslateMode,
   DisplayMode,
   PromptCodecId,
   ProviderPreset,
@@ -127,6 +128,42 @@ export function labelForPreset(preset: ProviderPreset, lang: UiLang): string {
     custom: { 'zh-CN': '自定义 OpenAI 兼容渠道', en: 'Custom OpenAI-Compatible' },
   };
   return pickText(lang, map[preset]);
+}
+
+export function labelForAutoTranslateMode(
+  mode: AutoTranslateMode,
+  lang: UiLang,
+): string {
+  switch (mode) {
+    case 'foreign':
+      return lang === 'en'
+        ? 'Foreign Pages Auto (Recommended)'
+        : '非目标语言自动翻译（推荐）';
+    case 'whitelist':
+      return lang === 'en' ? 'Whitelist Sites Only' : '仅白名单站点';
+    case 'off':
+      return lang === 'en' ? 'Manual Only (Alt+A)' : '仅手动触发 (Alt+A)';
+  }
+}
+
+export function describeAutoTranslateMode(
+  mode: AutoTranslateMode,
+  lang: UiLang,
+): string {
+  switch (mode) {
+    case 'foreign':
+      return lang === 'en'
+        ? 'Combines <html lang> metadata with visible prose character analysis — English-UI Chrome never mis-translates Chinese sites, while English, Japanese, and other foreign pages (such as X & GitHub) translate automatically, strictly honoring excluded URLs like https://linux.do/*.'
+        : '结合网页 <html lang> 声明与可见正文字符分布双重判定：即使使用英文界面 Chrome 也绝不会误翻中文站点；访问 X、GitHub 等英文/日文等外语页面时自动开启双语翻译，并严格遵守 https://linux.do/* 等排除规则与单站「此站不翻」设置。';
+    case 'whitelist':
+      return lang === 'en'
+        ? 'Automatically translates only sites matching your Include Whitelist or set to "Always" in the popup; excluded URLs always take precedence.'
+        : '仅在访问命中自动翻译白名单 (Include Matches) 或弹窗设为「此站必翻」的站点时自动翻译；排除规则优先级最高。';
+    case 'off':
+      return lang === 'en'
+        ? 'Keeps every page in its original language until triggered manually via Alt+A, Alt+W, or the toolbar popup.'
+        : '打开网页默认保持原文，仅在按下 Alt+A / Alt+W 或点击工具栏弹窗「翻译当前页面」时手动触发。';
+  }
 }
 
 export function describeTemperatureResolution(params: {

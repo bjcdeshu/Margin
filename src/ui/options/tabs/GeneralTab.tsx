@@ -3,6 +3,7 @@ import {
   resolveProviderIdForScene,
 } from '@shared/constants';
 import type {
+  AutoTranslateMode,
   DisplayMode,
   MarginConfig,
   TranslationScene,
@@ -14,7 +15,9 @@ import {
   SegmentedControl,
   StatusPill,
   ToggleSwitch,
+  describeAutoTranslateMode,
   formatLanguageOption,
+  labelForAutoTranslateMode,
   labelForColorMode,
   labelForDisplayMode,
   labelForScene,
@@ -64,6 +67,32 @@ export function GeneralTab({ draft, onMutate }: GeneralTabProps) {
     { value: 'mask', label: labelForTheme('mask', lang) },
     { value: 'opacity', label: labelForTheme('opacity', lang) },
     { value: 'weakening', label: labelForTheme('weakening', lang) },
+  ];
+
+  const currentAutoMode: AutoTranslateMode =
+    draft.webpage.autoTranslateMode ??
+    (draft.webpage.autoTranslateMatches ? 'whitelist' : 'off');
+
+  const autoTranslateOptions: Array<{
+    value: AutoTranslateMode;
+    label: string;
+    dataTestId: string;
+  }> = [
+    {
+      value: 'foreign',
+      label: labelForAutoTranslateMode('foreign', lang),
+      dataTestId: 'general-auto-mode-foreign',
+    },
+    {
+      value: 'whitelist',
+      label: labelForAutoTranslateMode('whitelist', lang),
+      dataTestId: 'general-auto-mode-whitelist',
+    },
+    {
+      value: 'off',
+      label: labelForAutoTranslateMode('off', lang),
+      dataTestId: 'general-auto-mode-off',
+    },
   ];
 
   return (
@@ -127,6 +156,25 @@ export function GeneralTab({ draft, onMutate }: GeneralTabProps) {
               </option>
             ))}
           </select>
+        </FieldRow>
+
+        <FieldRow
+          stacked
+          label={lang === 'en' ? 'Auto-Translate Strategy' : '自动翻译策略'}
+          hint={describeAutoTranslateMode(currentAutoMode, lang)}
+        >
+          <SegmentedControl
+            ariaLabel={lang === 'en' ? 'Auto-Translate Strategy' : '自动翻译策略'}
+            dataTestId="general-auto-translate-mode"
+            options={autoTranslateOptions}
+            value={currentAutoMode}
+            onChange={(nextMode) =>
+              onMutate((d) => {
+                d.webpage.autoTranslateMode = nextMode;
+                d.webpage.autoTranslateMatches = nextMode !== 'off';
+              })
+            }
+          />
         </FieldRow>
 
         <FieldRow label={lang === 'en' ? 'Display Mode' : '默认显示模式'}>

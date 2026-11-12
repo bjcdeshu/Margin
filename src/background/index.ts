@@ -9,6 +9,7 @@ import {
   registerContextMenus,
 } from './router';
 
+export * from './translation-db';
 export * from './cache';
 export * from './vision';
 export * from './dnr-image';

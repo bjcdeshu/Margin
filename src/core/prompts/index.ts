@@ -7,6 +7,7 @@ import { yamlPromptCodec, YamlPromptCodec } from './yaml-codec';
 
 export * from './types';
 export * from './glossary';
+export * from './glossary-packs';
 export * from './template';
 export * from './yaml-codec';
 export * from './delimiter-codec';

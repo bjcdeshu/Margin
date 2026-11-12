@@ -1,4 +1,4 @@
-import { getEnglishLanguageName } from '@shared/constants';
+import { BUILTIN_ASSISTANTS, getEnglishLanguageName } from '@shared/constants';
 import type {
   AssistantConfig,
   BatchItemInput,
@@ -8,26 +8,107 @@ import type {
 } from '@shared/types';
 import { buildGlossaryPromptVars } from './glossary';
 
+const BLOCK_SCALAR_HEADER_RE =
+  /:\s*[|>][-+]?\d*[ \t]*\r?\n([ \t]*)\{\{\s*(?:yaml_)?text\s*\}\}/m;
+
+const NEEDS_YAML_FLOW_QUOTE_RE =
+  /(?:^\s|\s$|\n|:[ \t]|:$|[ \t]#|^[-?:,[\]{}#&*!|>'"%@`]|^(?:true|false|null|yes|no|on|off|~|[-+]?\d+(?:\.\d+)?)$)/i;
+
+function needsYamlFlowQuoting(value: string): boolean {
+  if (value === '') return true;
+  return NEEDS_YAML_FLOW_QUOTE_RE.test(value);
+}
+
+export function formatYamlItemRow(
+  itemTemplate: string,
+  wireId: number,
+  rawText: string,
+  sharedVars: Readonly<Record<string, string>>,
+): string {
+  const preExpanded = interpolateTemplate(itemTemplate, {
+    ...sharedVars,
+    id: String(wireId),
+  });
+
+  const normalizedText = String(rawText ?? '').replace(/\r\n?/g, '\n');
+  const blockMatch = BLOCK_SCALAR_HEADER_RE.exec(preExpanded);
+
+  if (blockMatch) {
+    const templateIndent = blockMatch[1] ?? '';
+    const effectiveIndent = templateIndent.length > 0 ? templateIndent : '    ';
+    const indentedSubsequent = normalizedText
+      .split('\n')
+      .map((line, idx) => {
+        if (idx === 0) {
+          return templateIndent.length > 0 ? line : `${effectiveIndent}${line}`;
+        }
+        return line.length === 0 ? '' : `${effectiveIndent}${line}`;
+      })
+      .join('\n');
+
+    return preExpanded.replace(
+      /\{\{\s*(?:yaml_)?text\s*\}\}/g,
+      () => indentedSubsequent,
+    );
+  }
+
+  const safeFlow = needsYamlFlowQuoting(normalizedText)
+    ? JSON.stringify(normalizedText)
+    : normalizedText;
+
+  return preExpanded.replace(/\{\{\s*(?:yaml_)?text\s*\}\}/g, () => safeFlow);
+}
+
 const PLACEHOLDER_RE = /\{\{\s*([A-Za-z0-9_.-]+)\s*\}\}/g;
 
 const DEFAULT_OPTIONAL_PROMPT_VARS: Readonly<Record<string, string>> = {
   title_prompt: '',
   summary_prompt: '',
   terms_prompt: '',
+  glossary_prompt: '',
   sub_summary_prompt: '',
   sub_terms_prompt: '',
   style_prompt: '',
   html_only: '',
   extra_prompt: '',
+  title: '',
+  summary: '',
+  styleGuide: '',
+  style_guide: '',
+  domain: '',
+  url: '',
+  terms: '',
+  keepOriginalInstruction: '',
+  glossaryMappingInstruction: '',
+  glossaryInstruction: '',
 };
 
 const BUILTIN_CONDITIONAL_ENV_DEFAULTS: Readonly<Record<string, string>> = {
   title_prompt: 'Document Title: {{imt_title}}\n',
   summary_prompt: 'Context Summary: {{imt_summary}}\n',
+  style_prompt: 'Style Guide: {{styleGuide}}\n',
+  glossary_prompt: '{{glossaryInstruction}}\n',
   terms_prompt: 'Required Glossary: {{imt_terms}}\n',
   sub_summary_prompt: 'Video Context: {{imt_summary}}\n',
   sub_terms_prompt: 'Required Glossary: {{imt_terms}}\n',
 };
+
+const PRUNABLE_DYNAMIC_VARS = new Set([
+  'title',
+  'summary',
+  'styleGuide',
+  'style_guide',
+  'domain',
+  'url',
+  'terms',
+  'keepOriginalInstruction',
+  'glossaryMappingInstruction',
+  'glossaryInstruction',
+]);
+
+function isPrunableContextOrGlossaryVar(name: string): boolean {
+  return name.startsWith('imt_') || PRUNABLE_DYNAMIC_VARS.has(name);
+}
 
 const RICH_TAG_MARKER_RE = /<\/?m(?:\d+|N)\b/i;
 
@@ -169,6 +250,12 @@ export function buildExpandedPromptVariables(
     to: toName,
     to_lang: toName,
     content_type: richBatch ? 'html' : 'text',
+    title: String(context?.title ?? '').trim(),
+    summary: String(context?.summary ?? '').trim(),
+    styleGuide: String(context?.styleGuide ?? '').trim(),
+    style_guide: String(context?.styleGuide ?? '').trim(),
+    domain: String(context?.domain ?? '').trim(),
+    url: String(context?.url ?? '').trim(),
     imt_title: String(context?.title ?? '').trim(),
     imt_url: String(context?.url ?? '').trim(),
     imt_domain: String(context?.domain ?? '').trim(),
@@ -179,6 +266,10 @@ export function buildExpandedPromptVariables(
     imt_terms: glossaryVars.imt_terms,
     imt_terms_with_domain: glossaryVars.imt_terms_with_domain,
     imt_terms_without_domain: glossaryVars.imt_terms_without_domain,
+    keepOriginalInstruction: glossaryVars.keepOriginalInstruction,
+    glossaryMappingInstruction: glossaryVars.glossaryMappingInstruction,
+    glossaryInstruction: glossaryVars.glossaryInstruction,
+    terms: glossaryVars.terms,
     imt_source_field: imtSourceField,
     imt_trans_field: imtTransField,
     imt_sub_source_field: rawEnv.imt_sub_source_field || imtSourceField,
@@ -210,10 +301,10 @@ export function buildExpandedPromptVariables(
 
     if (!key.startsWith('imt_')) {
       const refs = Array.from(tpl.matchAll(PLACEHOLDER_RE), (m) => m[1]);
-      const imtRefs = refs.filter((r) => r.startsWith('imt_'));
+      const condRefs = refs.filter(isPrunableContextOrGlossaryVar);
       if (
-        imtRefs.length > 0 &&
-        imtRefs.every((r) => String(baseVars[r] ?? '').trim() === '')
+        condRefs.length > 0 &&
+        condRefs.every((r) => String(baseVars[r] ?? '').trim() === '')
       ) {
         resolvedEnv[key] = '';
         prunedKeys.add(key);
@@ -239,7 +330,7 @@ export function buildExpandedPromptVariables(
         const refs = Array.from(currentTpl.matchAll(PLACEHOLDER_RE), (m) => m[1]);
         const dynamicRefs = refs.filter(
           (r) =>
-            r.startsWith('imt_') ||
+            isPrunableContextOrGlossaryVar(r) ||
             Object.prototype.hasOwnProperty.call(resolvedEnv, r),
         );
         if (
@@ -269,8 +360,8 @@ export function buildExpandedPromptVariables(
 
 export function selectPromptsForBatch(
   assistant: AssistantConfig,
-  scene: TranslationScene | 'service-test',
-  itemCount: number,
+  scene: TranslationScene | 'service-test' = 'webpage',
+  itemCount = 1,
 ): { systemTemplate: string; userTemplate: string } {
   const systemTemplate =
     itemCount > 1 && assistant.multipleSystemPrompt?.trim()
@@ -278,11 +369,133 @@ export function selectPromptsForBatch(
       : assistant.systemPrompt;
 
   let userTemplate = assistant.prompt;
-  if (scene === 'subtitle' && assistant.subtitlePrompt?.trim()) {
+  if (scene === 'input' && assistant.inputPrompt?.trim()) {
+    userTemplate = assistant.inputPrompt;
+  } else if (scene === 'selection' && assistant.selectionPrompt?.trim()) {
+    userTemplate = assistant.selectionPrompt;
+  } else if (scene === 'subtitle' && assistant.subtitlePrompt?.trim()) {
     userTemplate = assistant.subtitlePrompt;
   } else if (itemCount > 1 && assistant.multiplePrompt?.trim()) {
+    userTemplate = assistant.multiplePrompt;
+  } else if (!userTemplate?.trim() && assistant.multiplePrompt?.trim()) {
     userTemplate = assistant.multiplePrompt;
   }
 
   return { systemTemplate, userTemplate };
+}
+
+export interface ExpandAssistantPromptsInput {
+  assistant: AssistantConfig;
+  scene?: TranslationScene | 'service-test';
+  fromLang: string;
+  toLang: string;
+  items: readonly BatchItemInput[];
+  context?: PageContextPayload;
+  glossary?: readonly GlossaryEntry[];
+  extraVars?: Readonly<Record<string, string>>;
+}
+
+function normalizePromptSpacing(text: string): string {
+  return text.replace(/\n{3,}/g, '\n\n').trim();
+}
+
+export function expandAssistantPrompts(input: ExpandAssistantPromptsInput): {
+  systemPrompt: string;
+  userPrompt: string;
+  vars: Record<string, string>;
+} {
+  const scene = input.scene ?? 'webpage';
+  const assistant = input.assistant;
+  const baseVars = buildExpandedPromptVariables({
+    scene,
+    fromLang: input.fromLang,
+    toLang: input.toLang,
+    items: input.items,
+    assistant,
+    context: input.context,
+    glossary: input.glossary,
+    extraVars: input.extraVars,
+  });
+
+  const computedPayloadVars: Record<string, string> = {};
+  const payloadJson = JSON.stringify(
+    input.items.map((item, idx) => ({
+      id: idx + 1,
+      src: item.text,
+    })),
+  );
+
+  if (input.extraVars?.json === undefined) {
+    computedPayloadVars.json = payloadJson;
+  }
+
+  if (assistant.codec === 'yaml') {
+    if (input.extraVars?.yaml === undefined) {
+      const itemTemplate =
+        scene === 'subtitle'
+          ? assistant.env.imt_subtitle_yaml_item ||
+            assistant.env.imt_yaml_item ||
+            BUILTIN_ASSISTANTS['builtin-yaml'].env.imt_subtitle_yaml_item
+          : assistant.env.imt_yaml_item ||
+            BUILTIN_ASSISTANTS['builtin-yaml'].env.imt_yaml_item;
+      const yamlBlock = input.items
+        .map((item, idx) =>
+          formatYamlItemRow(itemTemplate, idx + 1, item.text, baseVars),
+        )
+        .join('\n');
+      computedPayloadVars.yaml = yamlBlock;
+      if (input.extraVars?.text === undefined) {
+        computedPayloadVars.text = yamlBlock;
+      }
+    }
+  } else if (assistant.codec === 'delimiter') {
+    if (input.extraVars?.text === undefined) {
+      const sep =
+        assistant.separator && assistant.separator.length > 0
+          ? assistant.separator
+          : BUILTIN_ASSISTANTS['builtin-delimiter'].separator;
+      computedPayloadVars.text = input.items.map((it) => it.text).join(sep);
+    }
+  } else if (assistant.codec === 'json-batch') {
+    if (input.extraVars?.text === undefined) {
+      computedPayloadVars.text = payloadJson;
+    }
+  } else if (input.extraVars?.text === undefined) {
+    computedPayloadVars.text = input.items.map((it) => it.text).join('\n');
+  }
+
+  const vars: Record<string, string> = {
+    ...baseVars,
+    ...computedPayloadVars,
+    ...input.extraVars,
+  };
+
+  const { systemTemplate, userTemplate } = selectPromptsForBatch(
+    assistant,
+    scene,
+    input.items.length,
+  );
+
+  const rawSystemPrompt = normalizePromptSpacing(
+    interpolateTemplate(systemTemplate, vars),
+  );
+  const userPrompt = interpolateTemplate(userTemplate, vars).trim();
+  const userInstructionsOnly = normalizePromptSpacing(
+    interpolateTemplate(userTemplate, {
+      ...vars,
+      yaml: '',
+      text: '',
+      json: '',
+    }),
+  );
+
+  return {
+    systemPrompt: ensureRichTagInstruction(
+      rawSystemPrompt,
+      userInstructionsOnly,
+      input.items,
+    ),
+    userPrompt,
+    vars,
+  };
 }

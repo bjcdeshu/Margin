@@ -2,6 +2,7 @@ export interface SegmentOption<T extends string> {
   value: T;
   label: string;
   title?: string;
+  dataTestId?: string;
 }
 
 export interface SegmentedControlProps<T extends string> {
@@ -10,6 +11,7 @@ export interface SegmentedControlProps<T extends string> {
   onChange: (next: T) => void;
   ariaLabel?: string;
   fullWidth?: boolean;
+  dataTestId?: string;
 }
 
 export function SegmentedControl<T extends string>({
@@ -18,12 +20,14 @@ export function SegmentedControl<T extends string>({
   onChange,
   ariaLabel,
   fullWidth = false,
+  dataTestId,
 }: SegmentedControlProps<T>) {
   return (
     <div
       class={fullWidth ? 'mp-segmented mp-segmented--full' : 'mp-segmented'}
       role="radiogroup"
       aria-label={ariaLabel}
+      data-testid={dataTestId}
     >
       {options.map((opt) => {
         const checked = opt.value === value;
@@ -35,6 +39,7 @@ export function SegmentedControl<T extends string>({
             class="mp-segmented-btn"
             aria-checked={checked ? 'true' : 'false'}
             title={opt.title}
+            data-testid={opt.dataTestId}
             onClick={() => {
               if (!checked) onChange(opt.value);
             }}
