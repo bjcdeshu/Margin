@@ -1,3 +1,8 @@
+import {
+  DEFAULT_SSE_IDLE_TIMEOUT_MS,
+  ProviderTimeoutError,
+} from './timeout';
+
 export interface SseEventFrame {
   event?: string;
   data: string;
@@ -19,6 +24,47 @@ function toUint8Array(chunk: unknown): Uint8Array {
   return new Uint8Array(0);
 }
 
+async function readChunkWithIdleGuard(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  signal?: AbortSignal,
+  idleTimeoutMs = DEFAULT_SSE_IDLE_TIMEOUT_MS,
+): Promise<ReadableStreamReadResult<Uint8Array>> {
+  if (signal?.aborted) {
+    void reader.cancel().catch(() => undefined);
+    throw new DOMException('The operation was aborted.', 'AbortError');
+  }
+
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  let onAbort: (() => void) | null = null;
+
+  const guardPromise = new Promise<never>((_, reject) => {
+    if (signal) {
+      onAbort = () => {
+        void reader.cancel().catch(() => undefined);
+        reject(new DOMException('The operation was aborted.', 'AbortError'));
+      };
+      signal.addEventListener('abort', onAbort, { once: true });
+    }
+    if (Number.isFinite(idleTimeoutMs) && idleTimeoutMs > 0) {
+      timer = setTimeout(() => {
+        void reader.cancel().catch(() => undefined);
+        reject(new ProviderTimeoutError(idleTimeoutMs, 'stream-idle'));
+      }, idleTimeoutMs);
+    }
+  });
+
+  try {
+    return await Promise.race([reader.read(), guardPromise]);
+  } finally {
+    if (timer !== null) {
+      clearTimeout(timer);
+    }
+    if (signal && onAbort) {
+      signal.removeEventListener('abort', onAbort);
+    }
+  }
+}
+
 /**
  * Decodes an HTTP Server-Sent Events (SSE) stream strictly via `TextDecoder('utf-8')`
  * over raw `ArrayBuffer` / `Uint8Array` byte chunks so misconfigured proxy charsets
@@ -28,6 +74,7 @@ export async function readSseStream(
   response: Response,
   onEvent: (frame: SseEventFrame) => void | 'stop',
   signal?: AbortSignal,
+  idleTimeoutMs = DEFAULT_SSE_IDLE_TIMEOUT_MS,
 ): Promise<void> {
   if (!response.body) {
     // Fallback if test mock omitted ReadableStream body
@@ -42,12 +89,11 @@ export async function readSseStream(
 
   try {
     while (true) {
-      if (signal?.aborted) {
-        await reader.cancel().catch(() => undefined);
-        throw new DOMException('The operation was aborted.', 'AbortError');
-      }
-
-      const { value, done } = await reader.read();
+      const { value, done } = await readChunkWithIdleGuard(
+        reader,
+        signal,
+        idleTimeoutMs,
+      );
       if (done) {
         const trailing = decoder.decode();
         if (trailing) {
@@ -63,7 +109,7 @@ export async function readSseStream(
       const decodedText = decoder.decode(bytes, { stream: true });
       const shouldStop = parseSseTextChunk(decodedText, state, onEvent);
       if (shouldStop) {
-        await reader.cancel().catch(() => undefined);
+        void reader.cancel().catch(() => undefined);
         break;
       }
     }

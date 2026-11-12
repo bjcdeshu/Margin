@@ -78,8 +78,12 @@ function shouldUseTranslationCache(
 function buildMissingProviderBatchResponse(
   request: TranslateBatchRequest,
   attemptedProviderId: string,
+  errorCode: 'PROVIDER_NOT_FOUND' | 'PROVIDER_DISABLED' = 'PROVIDER_NOT_FOUND',
 ): TranslateBatchResponse {
-  const msg = `Provider "${attemptedProviderId}" is not configured or enabled.`;
+  const msg =
+    errorCode === 'PROVIDER_DISABLED'
+      ? `Provider "${attemptedProviderId}" is currently disabled.`
+      : `Provider "${attemptedProviderId}" is not configured or enabled.`;
   const diagnostic = buildDiagnosticSnapshot({
     scene: request.scene,
     codec: 'json-batch',
@@ -110,7 +114,7 @@ function buildMissingProviderBatchResponse(
     items: [],
     diagnostic,
     error: {
-      code: 'PROVIDER_NOT_FOUND',
+      code: errorCode,
       message: msg,
       retryable: false,
     },
@@ -127,6 +131,19 @@ export async function handleTranslateBatch(
     onItemReady?: (item: BatchItemOutput) => void;
   },
 ): Promise<TranslateBatchResponse> {
+  if (request.providerId && request.scene !== 'service-test') {
+    const explicit = config.providers[request.providerId];
+    if (!explicit || !explicit.enabled) {
+      const missingResp = buildMissingProviderBatchResponse(
+        request,
+        request.providerId,
+        explicit ? 'PROVIDER_DISABLED' : 'PROVIDER_NOT_FOUND',
+      );
+      await appendDiagnosticSnapshot(missingResp.diagnostic);
+      return missingResp;
+    }
+  }
+
   const providerId = resolveProviderIdForScene(
     request.scene,
     config.routing,
@@ -134,8 +151,12 @@ export async function handleTranslateBatch(
     request.providerId,
   );
   const provider = config.providers[providerId];
-  if (!provider) {
-    const missingResp = buildMissingProviderBatchResponse(request, providerId);
+  if (!provider || (request.scene !== 'service-test' && !provider.enabled)) {
+    const missingResp = buildMissingProviderBatchResponse(
+      request,
+      providerId,
+      provider ? 'PROVIDER_DISABLED' : 'PROVIDER_NOT_FOUND',
+    );
     await appendDiagnosticSnapshot(missingResp.diagnostic);
     return missingResp;
   }
@@ -233,6 +254,8 @@ export async function handleTranslateBatch(
     fetchImpl: env.fetchImpl,
     pool: env.pool,
     retryBaseDelayMs: env.retryBaseDelayMs,
+    requestTimeoutMs: env.requestTimeoutMs,
+    streamIdleTimeoutMs: env.streamIdleTimeoutMs,
     signal: env.signal,
   });
 
@@ -295,21 +318,32 @@ export async function handleTranslateImage(
   config: MarginConfig,
   env: BackgroundRouterEnv = {},
 ): Promise<TranslateImageResponse> {
-  const providerId = resolveProviderIdForScene(
+  const resolvedId = resolveProviderIdForScene(
     'image',
     config.routing,
     config.providers,
     request.providerId,
   );
-  const provider = config.providers[providerId];
+  const providerId =
+    request.providerId && config.providers[request.providerId]?.enabled === false
+      ? request.providerId
+      : resolvedId;
+  const provider = request.providerId
+    ? config.providers[request.providerId]
+    : config.providers[providerId];
 
-  if (!provider) {
-    const msg = `Provider "${providerId}" is not configured for Image translation.`;
+  if (!provider || !provider.enabled) {
+    const targetId = request.providerId ?? providerId;
+    const errCode = provider ? 'PROVIDER_DISABLED' : 'PROVIDER_NOT_FOUND';
+    const msg =
+      errCode === 'PROVIDER_DISABLED'
+        ? `Provider "${targetId}" is currently disabled for Image translation.`
+        : `Provider "${targetId}" is not configured or enabled for Image translation.`;
     const diagnostic = buildDiagnosticSnapshot({
       scene: 'image',
       codec: 'json-batch',
       provider: {
-        id: providerId || 'unknown',
+        id: targetId || 'unknown',
         preset: 'custom',
         protocol: 'openai-chat',
         resolvedEndpoint: 'https://invalid.local/',
@@ -330,12 +364,12 @@ export async function handleTranslateImage(
     return {
       ok: false,
       requestId: request.requestId,
-      providerId,
+      providerId: targetId,
       model: '',
       regions: [],
       diagnostic,
       error: {
-        code: 'PROVIDER_NOT_FOUND',
+        code: errCode,
         message: msg,
         retryable: false,
       },
@@ -362,6 +396,8 @@ export async function handleTranslateImage(
     fetchImpl: env.fetchImpl,
     pool: env.pool,
     retryBaseDelayMs: env.retryBaseDelayMs,
+    requestTimeoutMs: env.requestTimeoutMs,
+    streamIdleTimeoutMs: env.streamIdleTimeoutMs,
     signal: env.signal,
   });
 
@@ -432,6 +468,29 @@ export async function handleRuntimeRpcRequest(
     case 'margin:clear-translation-cache': {
       const cache = env.translationCache ?? backgroundTranslationCache;
       cache.clear();
+      if (
+        typeof globalThis.chrome !== 'undefined' &&
+        typeof chrome.tabs?.query === 'function' &&
+        typeof chrome.tabs?.sendMessage === 'function'
+      ) {
+        try {
+          const tabs = await chrome.tabs.query({});
+          await Promise.all(
+            tabs.map(async (tab) => {
+              if (tab.id === undefined) return;
+              try {
+                await chrome.tabs.sendMessage(tab.id, {
+                  type: 'margin:cmd:clear-page-cache',
+                });
+              } catch {
+                // Ignore tabs without active content script
+              }
+            }),
+          );
+        } catch {
+          // Ignore tab enumeration errors
+        }
+      }
       return { ok: true };
     }
   }
@@ -612,8 +671,8 @@ export async function dispatchShortcutCommand(
     return false;
   }
 
-  await sendTabCommand(tabId, message);
-  return true;
+  const dispatchResult = await sendTabCommand(tabId, message);
+  return dispatchResult.ok;
 }
 
 export function registerContextMenus(): void {

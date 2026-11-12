@@ -192,4 +192,38 @@ describe('rich-text: <mN> tokenizer, zero-innerHTML reconstructor & per-item fal
       '测试 残留 文本',
     );
   });
+
+  it('preserves multi-paragraph newlines on pre-line/pre-wrap blocks while collapsing HTML indentation newlines on normal prose and skipping nested blocks/buttons', () => {
+    const tweet = document.createElement('div');
+    tweet.style.whiteSpace = 'pre-line';
+    tweet.textContent = 'First paragraph of the announcement.\n\nSecond paragraph with key details.';
+    document.body.appendChild(tweet);
+
+    const tweetTokens = tokenizeParagraph(tweet);
+    expect(tweetTokens.text).toBe(
+      'First paragraph of the announcement.\n\nSecond paragraph with key details.',
+    );
+
+    const indentedP = document.createElement('p');
+    indentedP.innerHTML = `
+      Formatted HTML source
+      with indentation line breaks
+      that render as spaces.
+    `;
+    document.body.appendChild(indentedP);
+
+    const pTokens = tokenizeParagraph(indentedP);
+    expect(pTokens.text).toBe(
+      'Formatted HTML source with indentation line breaks that render as spaces.',
+    );
+
+    const headingWithBtn = document.createElement('h2');
+    headingWithBtn.innerHTML = 'Architecture Overview <button type="button">Copy</button>';
+    const nestedLi = document.createElement('li');
+    nestedLi.innerHTML = 'Parent item title <ul><li>Nested child bullet</li></ul>';
+    document.body.append(headingWithBtn, nestedLi);
+
+    expect(tokenizeParagraph(headingWithBtn).text).toBe('Architecture Overview');
+    expect(tokenizeParagraph(nestedLi).text).toBe('Parent item title');
+  });
 });

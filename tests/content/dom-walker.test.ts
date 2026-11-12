@@ -124,4 +124,81 @@ describe('dom-walker: smart paragraph extraction & math/code protection', () => 
     expect(ctx.summary).toContain('Clean-room browser translation architecture.');
     expect(ctx.summary).toContain('Margin Design Overview');
   });
+
+  it('excludes X/Twitter UI chrome (@handles, User-Name, timestamps, counters, action groups, targetLang prose, .sr-only) while extracting real tweetText', () => {
+    document.body.innerHTML = `
+      <nav role="navigation"><a href="/home">Home</a><a href="/explore">Explore</a></nav>
+      <article>
+        <div data-testid="User-Avatar-Container-ubuntu">Avatar</div>
+        <div data-testid="User-Name">
+          <span>Ubuntu</span>
+          <span>@ubuntu</span>
+          <time datetime="2026-11-12T00:00:00Z">8h</time>
+        </div>
+        <div id="tweet-en" data-testid="tweetText">
+          Ubuntu 26.04 LTS introduces faster container sandboxing and kernel-level observability.
+        </div>
+        <div data-testid="tweet-text-show-more-link">Show more</div>
+        <div role="group" aria-label="42K views">
+          <span>312</span>
+          <span>1.4K</span>
+          <span>8.8K</span>
+          <span>42K</span>
+        </div>
+      </article>
+      <article>
+        <div id="tweet-zh" data-testid="tweetText">这是一条已经是简体中文的推文内容，无需再次重复翻译。</div>
+      </article>
+      <span class="sr-only" id="sr-noise">Screen reader status announcement</span>
+      <p id="standalone-handle">@torvalds</p>
+      <p id="standalone-reltime">14m</p>
+    `;
+
+    const blocks = extractParagraphBlocks(document.body, { targetLang: 'zh-CN' });
+    expect(blocks.map((b) => b.id)).toEqual(['tweet-en']);
+  });
+
+  it('preserves headings with <button>, labels with <input>, parent text in nested <li>, mixed <div>, <summary>, <caption>, and flex card <span>', () => {
+    document.body.innerHTML = `
+      <h2 id="h2-btn">Quickstart Guide <button type="button">Copy link</button></h2>
+      <label id="lbl-input"><input type="checkbox" /> Enable automatic background sync</label>
+      <ul>
+        <li id="parent-li">
+          Core consensus invariants
+          <ul>
+            <li id="child-li">Election safety across quorums</li>
+          </ul>
+        </li>
+      </ul>
+      <div id="mixed-div">
+        Direct introductory prose inside wrapper
+        <div id="nested-div">Nested callout explanation</div>
+      </div>
+      <details open>
+        <summary id="sum-el">Advanced networking options</summary>
+        <section id="sec-el">Configure custom DNS over HTTPS resolvers.</section>
+      </details>
+      <table>
+        <caption id="cap-el">Quarterly latency percentiles</caption>
+      </table>
+      <div style="display:flex">
+        <span id="card-span">Zero-dependency streaming parser</span>
+        <button type="button">Open</button>
+      </div>
+    `;
+
+    const blocks = extractParagraphBlocks(document.body, { targetLang: 'zh-CN' });
+    expect(blocks.map((b) => b.id)).toEqual([
+      'h2-btn',
+      'lbl-input',
+      'parent-li',
+      'child-li',
+      'mixed-div',
+      'nested-div',
+      'sum-el',
+      'sec-el',
+      'cap-el',
+      'card-span',
+    ]);
+  });
 });

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import { BRAND } from '@shared/brand';
 import {
   SUPPORTED_LANGUAGES,
@@ -14,6 +14,7 @@ import {
 import type {
   DisplayMode,
   MarginConfig,
+  TabPageState,
   TranslationTheme,
   UiColorMode,
 } from '@shared/types';
@@ -28,8 +29,6 @@ import {
   createSaveTracker,
   formatLanguageOption,
   labelForDisplayMode,
-  labelForTheme,
-  shortLabelForColorMode,
   useUiColorMode,
 } from '../components';
 
@@ -41,6 +40,55 @@ export interface ActiveTabInfo {
 export interface PopupAppProps {
   /** Optional injected active tab for deterministic unit testing. */
   initialActiveTab?: ActiveTabInfo;
+  /** Optional initial live page state for deterministic unit testing. */
+  initialPageState?: TabPageState;
+}
+
+const IDLE_PAGE_STATE: TabPageState = {
+  active: false,
+  inFlightBlocks: 0,
+  translatedBlocks: 0,
+  maskRevealed: false,
+};
+
+const COLOR_CYCLE_ORDER: readonly UiColorMode[] = ['paper', 'night', 'system'];
+
+function nextUiColorMode(current: UiColorMode): UiColorMode {
+  const idx = COLOR_CYCLE_ORDER.indexOf(current);
+  return COLOR_CYCLE_ORDER[(idx + 1) % COLOR_CYCLE_ORDER.length] ?? 'paper';
+}
+
+function formatThemeCycleLabel(mode: UiColorMode, lang: 'zh-CN' | 'en'): string {
+  switch (mode) {
+    case 'paper':
+      return lang === 'en' ? '☀ Paper' : '☀ 纸白';
+    case 'night':
+      return lang === 'en' ? '☾ Night' : '☾ 夜读';
+    case 'system':
+      return lang === 'en' ? '◐ Auto' : '◐ 自动';
+  }
+}
+
+function isTabPageStateObject(val: unknown): val is TabPageState {
+  return (
+    Boolean(val) &&
+    typeof val === 'object' &&
+    typeof (val as TabPageState).active === 'boolean' &&
+    typeof (val as TabPageState).inFlightBlocks === 'number'
+  );
+}
+
+function extractDispatchedPageState(raw: unknown): TabPageState | null {
+  if (isTabPageStateObject(raw)) {
+    return raw;
+  }
+  if (raw && typeof raw === 'object') {
+    const nested = (raw as { state?: unknown }).state;
+    if (isTabPageStateObject(nested)) {
+      return nested;
+    }
+  }
+  return null;
 }
 
 async function queryActiveBrowserTab(): Promise<ActiveTabInfo> {
@@ -61,7 +109,9 @@ async function queryActiveBrowserTab(): Promise<ActiveTabInfo> {
   return {};
 }
 
-function parseTabOriginInfo(url?: string): { hostname: string; originGlob: string } | null {
+function parseTabOriginInfo(
+  url?: string,
+): { hostname: string; originGlob: string } | null {
   if (!url || isUnsupportedBrowserUrl(url)) return null;
   try {
     const parsed = new URL(url);
@@ -75,16 +125,58 @@ function parseTabOriginInfo(url?: string): { hostname: string; originGlob: strin
   }
 }
 
-export function PopupApp({ initialActiveTab }: PopupAppProps = {}) {
-  const [config, setConfig] = useState<MarginConfig>(() => createDefaultMarginConfig());
+export function PopupApp({
+  initialActiveTab,
+  initialPageState,
+}: PopupAppProps = {}) {
+  const [config, setConfig] = useState<MarginConfig>(() =>
+    createDefaultMarginConfig(),
+  );
+  const configRef = useRef<MarginConfig>(config);
+  const hydratedRef = useRef(false);
+  const saveSeqRef = useRef(0);
+
   const [hydrated, setHydrated] = useState(false);
-  const [activeTab, setActiveTab] = useState<ActiveTabInfo>(initialActiveTab ?? {});
-  const [commandNotice, setCommandNotice] = useState<string | null>(null);
+  const [activeTab, setActiveTab] = useState<ActiveTabInfo>(
+    initialActiveTab ?? {},
+  );
+  const [pageState, setPageState] = useState<TabPageState>(
+    initialPageState ?? IDLE_PAGE_STATE,
+  );
+  const [commandNotice, setCommandNotice] = useState<{
+    text: string;
+    isError?: boolean;
+  } | null>(null);
 
   const trackerRef = useRef(createSaveTracker());
-  const [saveState, setSaveState] = useState(() => trackerRef.current.getState());
+  const [saveState, setSaveState] = useState(() =>
+    trackerRef.current.getState(),
+  );
 
   useUiColorMode(config.uiColorMode);
+
+  const syncConfigState = useCallback((next: MarginConfig) => {
+    configRef.current = next;
+    setConfig(next);
+  }, []);
+
+  const refreshTabPageState = useCallback(async (tab: ActiveTabInfo) => {
+    if (
+      tab.id === undefined ||
+      (tab.url !== undefined && isUnsupportedBrowserUrl(tab.url))
+    ) {
+      return;
+    }
+    const res = await sendTabCommand(tab.id, {
+      type: 'margin:cmd:get-page-state',
+    });
+    if (res.ok) {
+      const parsed = extractDispatchedPageState(res.result);
+      if (parsed) {
+        setPageState(parsed);
+      }
+    }
+  }, []);
 
   useEffect(() => {
     const tracker = trackerRef.current;
@@ -94,20 +186,25 @@ export function PopupApp({ initialActiveTab }: PopupAppProps = {}) {
     void getMarginConfig().then((loaded) => {
       if (!active) return;
       tracker.hydrateReadOnly(loaded);
-      setConfig(loaded);
+      syncConfigState(loaded);
+      hydratedRef.current = true;
       setHydrated(true);
     });
 
     if (!initialActiveTab) {
       void queryActiveBrowserTab().then((tab) => {
-        if (active) setActiveTab(tab);
+        if (!active) return;
+        setActiveTab(tab);
+        void refreshTabPageState(tab);
       });
+    } else if (!initialPageState) {
+      void refreshTabPageState(initialActiveTab);
     }
 
     const unsubStorage = onMarginConfigChanged((incoming) => {
       if (!active) return;
       tracker.observePersisted(incoming);
-      setConfig(incoming);
+      syncConfigState(incoming);
     });
 
     return () => {
@@ -116,54 +213,80 @@ export function PopupApp({ initialActiveTab }: PopupAppProps = {}) {
       unsubStorage();
       tracker.dispose();
     };
-  }, [initialActiveTab]);
+  }, [
+    initialActiveTab,
+    initialPageState,
+    refreshTabPageState,
+    syncConfigState,
+  ]);
+
+  // Poll live progress while blocks are actively translating in the current tab
+  useEffect(() => {
+    if (
+      activeTab.id === undefined ||
+      (!pageState.active && pageState.inFlightBlocks === 0)
+    ) {
+      return undefined;
+    }
+    if (pageState.inFlightBlocks <= 0) {
+      return undefined;
+    }
+    const timer = setInterval(() => {
+      void refreshTabPageState(activeTab);
+    }, 650);
+    return () => clearInterval(timer);
+  }, [
+    activeTab,
+    pageState.active,
+    pageState.inFlightBlocks,
+    refreshTabPageState,
+  ]);
 
   const lang = config.interfaceLang;
 
   const persistUserPatch = async (mutator: (draft: MarginConfig) => void) => {
-    const draft = structuredClone(config);
+    if (!hydratedRef.current) return;
+
+    const draft = structuredClone(configRef.current);
     mutator(draft);
-    setConfig(draft);
+    syncConfigState(draft);
 
     const normalized = trackerRef.current.beginUserSave(draft);
     if (!normalized) return;
 
+    const seq = ++saveSeqRef.current;
     try {
       await saveMarginConfig(normalized);
       const persisted = await getMarginConfig();
       trackerRef.current.observePersisted(persisted);
-      setConfig(persisted);
+      if (seq === saveSeqRef.current) {
+        syncConfigState(persisted);
+      }
     } catch (err) {
-      trackerRef.current.failSave(err instanceof Error ? err.message : String(err));
+      trackerRef.current.failSave(
+        err instanceof Error ? err.message : String(err),
+      );
     }
   };
 
   const webpageProviderId = useMemo(
-    () => resolveProviderIdForScene('webpage', config.routing, config.providers),
+    () =>
+      resolveProviderIdForScene('webpage', config.routing, config.providers),
     [config.routing, config.providers],
   );
-  const inputProviderId = useMemo(
-    () => resolveProviderIdForScene('input', config.routing, config.providers),
-    [config.routing, config.providers],
-  );
-
   const webpageProvider = config.providers[webpageProviderId];
-  const inputProvider = config.providers[inputProviderId];
-
   const webpageSummary = webpageProvider
     ? `${webpageProvider.name} · ${webpageProvider.model}`
     : webpageProviderId;
 
-  const inputInherits = !config.routing.input || config.routing.input === 'inherit';
-  const inputSummary = inputInherits
-    ? lang === 'en'
-      ? `Follow Webpage · ${webpageProvider?.model ?? ''}`
-      : `跟随网页 · ${webpageProvider?.model ?? ''}`
-    : inputProvider
-      ? `${inputProvider.name} · ${inputProvider.model}`
-      : inputProviderId;
-
-  const tabDomain = useMemo(() => parseTabOriginInfo(activeTab.url), [activeTab.url]);
+  const tabDomain = useMemo(
+    () => parseTabOriginInfo(activeTab.url),
+    [activeTab.url],
+  );
+  const isUnsupportedTab = useMemo(
+    () => Boolean(activeTab.url && isUnsupportedBrowserUrl(activeTab.url)),
+    [activeTab.url],
+  );
   const isDomainExcluded = useMemo(() => {
     if (!activeTab.url || !tabDomain) return false;
     return matchesAnyUrlGlob(activeTab.url, config.urlRules.excludeMatches);
@@ -172,6 +295,7 @@ export function PopupApp({ initialActiveTab }: PopupAppProps = {}) {
   const handleToggleDomainExclude = () => {
     if (!activeTab.url || !tabDomain) return;
     const targetUrl = activeTab.url;
+    const nextExcluded = !isDomainExcluded;
     void persistUserPatch((draft) => {
       if (isDomainExcluded) {
         draft.urlRules.excludeMatches = draft.urlRules.excludeMatches.filter(
@@ -184,24 +308,47 @@ export function PopupApp({ initialActiveTab }: PopupAppProps = {}) {
         ];
       }
     });
+    if (nextExcluded) {
+      setPageState(IDLE_PAGE_STATE);
+      setCommandNotice(null);
+    }
   };
 
-  const handleOpenSettings = () => {
+  const openOptionsTarget = (tabQuery?: string) => {
+    const relative = tabQuery ? `options.html?tab=${tabQuery}` : 'options.html';
     if (
+      !tabQuery &&
       typeof globalThis.chrome !== 'undefined' &&
       typeof chrome.runtime?.openOptionsPage === 'function'
     ) {
       void chrome.runtime.openOptionsPage();
       return;
     }
+    const resolvedUrl =
+      typeof globalThis.chrome !== 'undefined' &&
+      typeof chrome.runtime?.getURL === 'function'
+        ? chrome.runtime.getURL(relative)
+        : relative;
+    if (
+      typeof globalThis.chrome !== 'undefined' &&
+      typeof chrome.tabs?.create === 'function'
+    ) {
+      void chrome.tabs.create({ url: resolvedUrl });
+      return;
+    }
     if (typeof window !== 'undefined') {
-      window.open('options.html', '_blank', 'noopener');
+      window.open(resolvedUrl, '_blank', 'noopener');
     }
   };
 
   const handleOpenPdfReader = () => {
-    const isPdfTab = Boolean(activeTab.url && /\.pdf(?:[?#]|$)/i.test(activeTab.url));
-    const query = isPdfTab && activeTab.url ? `?file=${encodeURIComponent(activeTab.url)}` : '';
+    const isPdfTab = Boolean(
+      activeTab.url && /\.pdf(?:[?#]|$)/i.test(activeTab.url),
+    );
+    const query =
+      isPdfTab && activeTab.url
+        ? `?file=${encodeURIComponent(activeTab.url)}`
+        : '';
     const targetPath = `pdf.html${query}`;
     const resolvedUrl =
       typeof globalThis.chrome !== 'undefined' &&
@@ -225,21 +372,80 @@ export function PopupApp({ initialActiveTab }: PopupAppProps = {}) {
     type:
       | 'margin:cmd:toggle-page'
       | 'margin:cmd:translate-whole-page'
-      | 'margin:cmd:toggle-mask'
-      | 'margin:cmd:translate-input',
-    feedback: string,
+      | 'margin:cmd:toggle-mask',
   ) => {
-    if (activeTab.id !== undefined) {
-      await sendTabCommand(activeTab.id, { type });
+    if (isUnsupportedTab) {
+      setCommandNotice({
+        text:
+          lang === 'en'
+            ? 'This browser page does not allow extension scripts.'
+            : '当前为浏览器受限页面，无法注入翻译脚本',
+        isError: true,
+      });
+      return;
     }
-    setCommandNotice(feedback);
-  };
 
-  const colorOptions: Array<{ value: UiColorMode; label: string }> = [
-    { value: 'paper', label: shortLabelForColorMode('paper', lang) },
-    { value: 'night', label: shortLabelForColorMode('night', lang) },
-    { value: 'system', label: shortLabelForColorMode('system', lang) },
-  ];
+    if (activeTab.id === undefined) {
+      return;
+    }
+
+    const res = await sendTabCommand(activeTab.id, { type });
+    if (!res.ok) {
+      setCommandNotice({
+        text:
+          res.unsupportedPage
+            ? lang === 'en'
+              ? 'This page does not support content script injection.'
+              : '当前页面不支持注入翻译脚本'
+            : res.error ||
+              (lang === 'en'
+                ? 'Could not reach active tab.'
+                : '无法连接当前标签页，请刷新网页后重试'),
+        isError: true,
+      });
+      return;
+    }
+
+    const returnedState = extractDispatchedPageState(res.result);
+    if (returnedState) {
+      setPageState(returnedState);
+      if (type === 'margin:cmd:toggle-page') {
+        setCommandNotice({
+          text: returnedState.active
+            ? lang === 'en'
+              ? 'Bilingual page translation enabled'
+              : '已开启当前页面双语翻译'
+            : lang === 'en'
+              ? 'Restored original webpage'
+              : '已还原网页原文',
+        });
+      } else if (type === 'margin:cmd:translate-whole-page') {
+        setCommandNotice({
+          text:
+            lang === 'en'
+              ? 'Whole-page translation started'
+              : '正在翻译整页全部段落…',
+        });
+      } else {
+        setCommandNotice({
+          text: returnedState.maskRevealed
+            ? lang === 'en'
+              ? 'Revealed masked translations'
+              : '已显示全部遮罩译文'
+            : lang === 'en'
+              ? 'Re-masked translations'
+              : '已恢复遮罩隐藏',
+        });
+      }
+      return;
+    }
+
+    // Fallback when running in minimal test environments without chrome.tabs
+    if (type === 'margin:cmd:toggle-page') {
+      setPageState((prev) => ({ ...prev, active: !prev.active }));
+    }
+    setCommandNotice(null);
+  };
 
   const displayOptions: Array<{ value: DisplayMode; label: string }> = [
     { value: 'bilingual', label: labelForDisplayMode('bilingual', lang) },
@@ -247,25 +453,46 @@ export function PopupApp({ initialActiveTab }: PopupAppProps = {}) {
   ];
 
   const themeOptions: Array<{ value: TranslationTheme; label: string }> = [
-    { value: 'none', label: labelForTheme('none', lang) },
-    { value: 'mask', label: lang === 'en' ? 'Mask' : '模糊遮罩 Mask' },
-    { value: 'opacity', label: labelForTheme('opacity', lang) },
-    { value: 'weakening', label: labelForTheme('weakening', lang) },
+    { value: 'none', label: lang === 'en' ? 'None' : '无' },
+    { value: 'mask', label: lang === 'en' ? 'Mask' : '遮罩' },
+    { value: 'opacity', label: lang === 'en' ? 'Fade' : '淡化' },
+    { value: 'weakening', label: lang === 'en' ? 'Soft' : '弱化' },
   ];
 
-  const targetLanguageList = SUPPORTED_LANGUAGES.filter((item) => item.code !== 'auto');
+  const targetLanguageList = SUPPORTED_LANGUAGES.filter(
+    (item) => item.code !== 'auto',
+  );
+
+  const bannerError = pageState.lastError || (commandNotice?.isError ? commandNotice.text : null);
+  const bannerInfo = !bannerError ? commandNotice?.text : null;
 
   return (
     <div class="mp-popup-sheet" data-hydrated={hydrated ? 'true' : 'false'}>
-      {/* Header: Editorial wordmark + Paper/Night/System switch + Settings button */}
+      {/* Header: Serif wordmark + Live state badge + 1-button Theme Cycler + Settings */}
       <header class="mp-popup-header">
-        <div style={{ display: 'flex', alignItems: 'baseline', gap: '7px' }}>
-          <span class="mp-wordmark" style={{ fontSize: '21px' }}>
+        <div class="mp-popup-header-brand">
+          <span class="mp-wordmark" style={{ fontSize: '20px' }}>
             {BRAND.name}
           </span>
           {saveState.status === 'saved' ? (
             <StatusPill tone="ok" dataTestId="popup-save-pill">
               {lang === 'en' ? 'Saved' : '已保存'}
+            </StatusPill>
+          ) : pageState.lastError ? (
+            <StatusPill tone="danger" dataTestId="popup-page-badge">
+              {lang === 'en' ? 'Error' : '翻译异常'}
+            </StatusPill>
+          ) : pageState.inFlightBlocks > 0 ? (
+            <StatusPill tone="accent" dataTestId="popup-page-badge">
+              {lang === 'en'
+                ? `Translating · ${pageState.translatedBlocks}`
+                : `翻译中 · ${pageState.translatedBlocks}`}
+            </StatusPill>
+          ) : pageState.active ? (
+            <StatusPill tone="ok" dataTestId="popup-page-badge">
+              {lang === 'en'
+                ? `Active · ${pageState.translatedBlocks}`
+                : `双语已开启${pageState.translatedBlocks > 0 ? ` · ${pageState.translatedBlocks}` : ''}`}
             </StatusPill>
           ) : (
             <span class="mp-muted" style={{ fontSize: '11px' }}>
@@ -274,64 +501,136 @@ export function PopupApp({ initialActiveTab }: PopupAppProps = {}) {
           )}
         </div>
 
-        <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-          <SegmentedControl
-            ariaLabel={lang === 'en' ? 'Color Theme' : '界面主题'}
-            options={colorOptions}
-            value={config.uiColorMode}
-            onChange={(mode) => void persistUserPatch((d) => { d.uiColorMode = mode; })}
-          />
+        <div class="mp-popup-header-actions">
           <button
             type="button"
             class="mp-btn mp-btn--sm"
+            data-testid="popup-theme-cycle"
+            aria-label={lang === 'en' ? 'Switch Color Theme' : '切换界面外观主题'}
+            title={
+              lang === 'en'
+                ? 'Cycle Paper / Night / System theme'
+                : '点击切换 纸白 / 夜读 / 跟随系统'
+            }
+            onClick={() =>
+              void persistUserPatch((d) => {
+                d.uiColorMode = nextUiColorMode(d.uiColorMode);
+              })
+            }
+          >
+            {formatThemeCycleLabel(config.uiColorMode, lang)}
+          </button>
+          <button
+            type="button"
+            class="mp-btn mp-btn--sm"
+            data-testid="popup-open-settings"
             aria-label={lang === 'en' ? 'Open Settings' : '打开设置'}
-            title={lang === 'en' ? 'Open Margin Studio (options.html)' : '打开详细设置 (options.html)'}
-            onClick={handleOpenSettings}
+            title={
+              lang === 'en'
+                ? 'Open Margin Studio (options.html)'
+                : '打开详细设置 (options.html)'
+            }
+            onClick={() => openOptionsTarget()}
           >
             ⚙
           </button>
         </div>
       </header>
 
-      {/* Primary Action + Quick Display Mode & Theme */}
-      <section class="mp-popup-primary">
-        <div style={{ display: 'flex', gap: '6px' }}>
+      {/* Tier 1: Primary Page Action Hero */}
+      <section class="mp-popup-hero">
+        <div class="mp-popup-hero-row">
           <button
             type="button"
-            class="mp-btn mp-btn--solid"
-            style={{ flex: 1, padding: '9px 12px', fontSize: '13.5px' }}
-            onClick={() =>
-              void dispatchTabAction(
-                'margin:cmd:toggle-page',
-                lang === 'en' ? 'Toggled page translation' : '已触发当前页面双语翻译',
-              )
+            data-testid="popup-toggle-page"
+            disabled={isUnsupportedTab}
+            class={
+              pageState.active
+                ? 'mp-btn mp-popup-hero-btn mp-popup-hero-btn--active'
+                : 'mp-btn mp-btn--solid mp-popup-hero-btn'
             }
+            onClick={() => void dispatchTabAction('margin:cmd:toggle-page')}
           >
-            {lang === 'en' ? 'Translate Current Page (Alt+A)' : '翻译当前页面 (Alt+A)'}
+            <span>
+              {pageState.active
+                ? lang === 'en'
+                  ? 'Restore Original'
+                  : '还原网页原文'
+                : lang === 'en'
+                  ? 'Translate Current Page'
+                  : '翻译当前页面'}
+            </span>
+            <kbd class="mp-popup-kbd">Alt+A</kbd>
           </button>
+
           <button
             type="button"
             class="mp-btn"
-            title={lang === 'en' ? 'Translate whole page immediately (Alt+W)' : '立即全文翻译 (Alt+W)'}
+            data-testid="popup-whole-page"
+            disabled={isUnsupportedTab}
+            title={
+              lang === 'en'
+                ? 'Translate whole page immediately (Alt+W)'
+                : '立即全文翻译 (Alt+W)'
+            }
             onClick={() =>
-              void dispatchTabAction(
-                'margin:cmd:translate-whole-page',
-                lang === 'en' ? 'Whole-page translation started' : '已触发全文翻译',
-              )
+              void dispatchTabAction('margin:cmd:translate-whole-page')
             }
           >
-            {lang === 'en' ? 'Full (Alt+W)' : '全文'}
+            {lang === 'en' ? 'Full' : '全文'}
           </button>
         </div>
 
-        {commandNotice ? (
-          <div class="mp-muted" style={{ fontSize: '11.5px' }} role="status">
-            {commandNotice}
+        {bannerError ? (
+          <div
+            class="mp-popup-banner mp-popup-banner--error"
+            data-testid="popup-status-banner"
+            role="alert"
+          >
+            {bannerError}
+          </div>
+        ) : bannerInfo ? (
+          <div
+            class="mp-popup-banner"
+            data-testid="popup-status-banner"
+            role="status"
+          >
+            {bannerInfo}
           </div>
         ) : null}
+      </section>
 
-        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '8px' }}>
-          <span class="mp-muted" style={{ fontSize: '12px' }}>
+      {/* Tier 2: Core Reading Controls Card */}
+      <section
+        class="mp-popup-card"
+        aria-label={lang === 'en' ? 'Reading Preferences' : '阅读与排版偏好'}
+      >
+        <div class="mp-popup-control-row">
+          <label class="mp-popup-control-label" htmlFor="popup-target-lang">
+            {lang === 'en' ? 'Target Language' : '目标语言'}
+          </label>
+          <select
+            id="popup-target-lang"
+            class="mp-select"
+            style={{ padding: '4px 8px', fontSize: '12px', maxWidth: '198px' }}
+            value={config.targetLang}
+            onChange={(e) => {
+              const val = (e.currentTarget as HTMLSelectElement).value;
+              void persistUserPatch((d) => {
+                d.targetLang = val;
+              });
+            }}
+          >
+            {targetLanguageList.map((entry) => (
+              <option key={entry.code} value={entry.code}>
+                {formatLanguageOption(entry.code, lang)}
+              </option>
+            ))}
+          </select>
+        </div>
+
+        <div class="mp-popup-control-row">
+          <span class="mp-popup-control-label">
             {lang === 'en' ? 'Display' : '显示模式'}
           </span>
           <SegmentedControl
@@ -347,20 +646,16 @@ export function PopupApp({ initialActiveTab }: PopupAppProps = {}) {
         </div>
 
         <div style={{ display: 'flex', flexDirection: 'column', gap: '5px' }}>
-          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-            <span class="mp-muted" style={{ fontSize: '12px' }}>
-              {lang === 'en' ? 'Translation Style' : '译文样式'}
+          <div class="mp-popup-control-row">
+            <span class="mp-popup-control-label">
+              {lang === 'en' ? 'Style' : '译文样式'}
             </span>
             {config.webpage.theme === 'mask' ? (
               <button
                 type="button"
                 class="mp-btn mp-btn--ghost mp-btn--sm"
-                onClick={() =>
-                  void dispatchTabAction(
-                    'margin:cmd:toggle-mask',
-                    lang === 'en' ? 'Mask toggled' : '已切换遮罩显隐',
-                  )
-                }
+                data-testid="popup-toggle-mask"
+                onClick={() => void dispatchTabAction('margin:cmd:toggle-mask')}
               >
                 {lang === 'en' ? 'Reveal Mask (Alt+M)' : '显隐遮罩 (Alt+M)'}
               </button>
@@ -380,120 +675,109 @@ export function PopupApp({ initialActiveTab }: PopupAppProps = {}) {
         </div>
       </section>
 
-      {/* Active Scene Routing Summary + Quick Target Language */}
-      <section class="mp-popup-routing" aria-label={lang === 'en' ? 'Scene Routing' : '当前渠道路由'}>
-        <div class="mp-popup-route-line">
-          <span class="mp-muted">{lang === 'en' ? 'Webpage:' : '网页:'}</span>
-          <StatusPill tone="accent" dataTestId="popup-route-webpage">
-            {webpageSummary}
-          </StatusPill>
-        </div>
-
-        <div class="mp-popup-route-line">
-          <span class="mp-muted">{lang === 'en' ? 'Input Box:' : '输入框:'}</span>
-          <StatusPill tone="neutral" dataTestId="popup-route-input">
-            {inputSummary}
-          </StatusPill>
-        </div>
-
-        <div class="mp-popup-route-line" style={{ paddingTop: '2px' }}>
-          <label class="mp-muted" htmlFor="popup-target-lang">
-            {lang === 'en' ? 'Target Language' : '目标语言'}
-          </label>
-          <select
-            id="popup-target-lang"
-            class="mp-select"
-            style={{ padding: '4px 8px', fontSize: '12px', maxWidth: '196px' }}
-            value={config.targetLang}
-            onChange={(e) => {
-              const val = (e.currentTarget as HTMLSelectElement).value;
-              void persistUserPatch((d) => {
-                d.targetLang = val;
-              });
-            }}
-          >
-            {targetLanguageList.map((entry) => (
-              <option key={entry.code} value={entry.code}>
-                {formatLanguageOption(entry.code, lang)}
-              </option>
-            ))}
-          </select>
-        </div>
-      </section>
-
-      {/* Bottom Editorial Strip: PDF Reader + Input Quick Hint + 1-Click Domain Rule */}
+      {/* Tier 3: Active Channel + Quick Feature Toggles + Site Rule Footer */}
       <footer class="mp-popup-footer">
         <button
           type="button"
-          class="mp-btn"
-          style={{ width: '100%', justifyContent: 'space-between' }}
-          onClick={handleOpenPdfReader}
+          class="mp-popup-channel-bar"
+          data-testid="popup-route-webpage"
+          onClick={() => openOptionsTarget('providers')}
+          title={
+            lang === 'en'
+              ? 'Configure translation provider & model'
+              : '点击配置翻译服务渠道与模型'
+          }
         >
-          <span>{lang === 'en' ? 'Open Bilingual PDF Reader' : '打开双语 PDF 阅读器'}</span>
-          <span class="mp-muted mp-mono">PDF ↗</span>
+          <span class="mp-popup-control-label">
+            {lang === 'en' ? 'Channel' : '主力渠道'}
+          </span>
+          <span class="mp-popup-channel-value">
+            <span class="mp-popup-channel-summary">{webpageSummary}</span>
+            <span class="mp-popup-channel-arrow" aria-hidden="true">
+              {lang === 'en' ? 'Config ↗' : '配置 ↗'}
+            </span>
+          </span>
         </button>
 
-        <div
-          style={{
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'space-between',
-            gap: '6px',
-            fontSize: '11.5px',
-          }}
-        >
-          <span class="mp-muted">
-            {lang === 'en'
-              ? 'Translate Input (Triple-Space / Alt+I)'
-              : '翻译输入框 (连按3次空格 / Alt+I)'}
-          </span>
+        <div class="mp-popup-quick-row">
           <button
             type="button"
-            class="mp-btn mp-btn--ghost mp-btn--sm"
+            class="mp-popup-toggle-pill"
+            data-testid="popup-toggle-selection"
+            aria-pressed={config.selection.enabled ? 'true' : 'false'}
             onClick={() =>
-              void dispatchTabAction(
-                'margin:cmd:translate-input',
-                lang === 'en' ? 'Triggered input translation' : '已触发输入框翻译',
-              )
+              void persistUserPatch((d) => {
+                d.selection.enabled = !d.selection.enabled;
+                if (d.selection.enabled && d.selection.triggerMode === 'off') {
+                  d.selection.triggerMode = 'icon';
+                }
+              })
             }
           >
-            {lang === 'en' ? 'Run' : '触发'}
+            <span class="mp-popup-toggle-dot" />
+            <span>{lang === 'en' ? 'Selection' : '划词翻译'}</span>
+          </button>
+
+          <button
+            type="button"
+            class="mp-popup-toggle-pill"
+            data-testid="popup-toggle-hover"
+            aria-pressed={config.hover.enabled ? 'true' : 'false'}
+            onClick={() =>
+              void persistUserPatch((d) => {
+                d.hover.enabled = !d.hover.enabled;
+              })
+            }
+          >
+            <span class="mp-popup-toggle-dot" />
+            <span>{lang === 'en' ? 'Ctrl+Hover' : 'Ctrl+悬停'}</span>
+          </button>
+
+          <button
+            type="button"
+            class="mp-btn mp-btn--sm"
+            data-testid="popup-open-pdf"
+            onClick={handleOpenPdfReader}
+            title={
+              lang === 'en'
+                ? 'Open Bilingual PDF Reader'
+                : '打开双语 PDF 阅读器'
+            }
+          >
+            {lang === 'en' ? 'PDF ↗' : '双语 PDF ↗'}
           </button>
         </div>
 
-        <div
-          style={{
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'space-between',
-            gap: '8px',
-            paddingTop: '4px',
-            borderTop: '1px solid var(--rule-soft)',
-          }}
-        >
+        <div class="mp-popup-site-bar">
           {tabDomain ? (
             <>
-              <span class="mp-mono mp-muted" style={{ overflow: 'hidden', textOverflow: 'ellipsis' }}>
+              <span class="mp-popup-site-host" title={tabDomain.hostname}>
                 {tabDomain.hostname}
               </span>
               <button
                 type="button"
                 data-testid="popup-domain-toggle"
-                class={isDomainExcluded ? 'mp-btn mp-btn--solid mp-btn--sm' : 'mp-btn mp-btn--sm'}
+                class={
+                  isDomainExcluded
+                    ? 'mp-btn mp-btn--solid mp-btn--sm'
+                    : 'mp-btn mp-btn--sm'
+                }
                 onClick={handleToggleDomainExclude}
               >
                 {isDomainExcluded
                   ? lang === 'en'
-                    ? 'Allow Current Domain'
-                    : '允许当前域名'
+                    ? 'Disabled · Enable'
+                    : '已禁用 · 点击恢复'
                   : lang === 'en'
-                    ? 'Exclude Current Domain'
-                    : '排除当前域名'}
+                    ? 'Disable on site'
+                    : '在此网站禁用'}
               </button>
             </>
           ) : (
-            <span class="mp-muted" style={{ fontSize: '11.5px' }}>
-              {lang === 'en' ? 'Browser internal page' : '当前标签页不支持注入脚本'}
+            <span class="mp-muted">
+              {lang === 'en'
+                ? 'Browser internal page — script injection unavailable'
+                : '当前浏览器内部页面不支持注入脚本'}
             </span>
           )}
         </div>

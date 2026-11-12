@@ -82,6 +82,28 @@ export function normalizeConfigForSave(config: MarginConfig): MarginConfig {
     }
   }
 
+  const clampSubScale = (value: unknown, fallback: number): number => {
+    const n = Number(value);
+    if (!Number.isFinite(n)) return fallback;
+    return Math.max(50, Math.min(160, Math.round(n)));
+  };
+  next.subtitles.sourceScalePercent = clampSubScale(
+    next.subtitles.sourceScalePercent,
+    100,
+  );
+  next.subtitles.translationScalePercent = clampSubScale(
+    next.subtitles.translationScalePercent ?? next.subtitles.fontSizePercent,
+    70,
+  );
+  next.subtitles.fontSizePercent = next.subtitles.translationScalePercent;
+  if (
+    next.subtitles.stylePreset !== 'youtube-native' &&
+    next.subtitles.stylePreset !== 'cinema-outline' &&
+    next.subtitles.stylePreset !== 'warm-paper'
+  ) {
+    next.subtitles.stylePreset = 'youtube-native';
+  }
+
   return next;
 }
 
@@ -156,13 +178,12 @@ export class SaveTracker {
   }
 
   /**
-   * Starts a user-initiated save transaction for `targetConfig`.
-   * Returns normalized config to persist, or `null` if another save is still in flight.
+   * Starts or supersedes a user-initiated save transaction for `targetConfig`.
+   * Always returns the normalized config to persist and updates `pendingSnapshot`
+   * to the latest write so rapid consecutive edits coalesce without ever dropping
+   * user saves or confirming stale earlier readbacks prematurely.
    */
-  beginUserSave(targetConfig: MarginConfig): MarginConfig | null {
-    if (this.pendingSnapshot !== null) {
-      return null;
-    }
+  beginUserSave(targetConfig: MarginConfig): MarginConfig {
     const normalized = normalizeConfigForSave(targetConfig);
     this.pendingSnapshot = JSON.stringify(stableCloneValue(normalized));
     this.setState({ status: 'saving', savedAt: this.state.savedAt });

@@ -15,32 +15,82 @@ import {
   type NavRailItem,
 } from '../components';
 import { GeneralTab } from './tabs/GeneralTab';
-import { MigrationDiagnosticsTab } from './tabs/MigrationDiagnosticsTab';
+import {
+  MigrationDiagnosticsTab,
+  type StagedMigrationState,
+} from './tabs/MigrationDiagnosticsTab';
 import { PromptsGlossaryTab } from './tabs/PromptsGlossaryTab';
 import { ProvidersTab } from './tabs/ProvidersTab';
 import { ScenesRulesTab } from './tabs/ScenesRulesTab';
+import { SiteRulesTab } from './tabs/SiteRulesTab';
 
-export type OptionsTabId =
+export type CanonicalOptionsTabId =
   | 'general'
   | 'providers'
+  | 'subtitles'
   | 'prompts'
-  | 'scenes'
+  | 'rules'
   | 'migration';
+
+export type OptionsTabId = CanonicalOptionsTabId | 'scenes';
 
 export interface OptionsAppProps {
   initialTab?: OptionsTabId;
 }
 
-export function OptionsApp({ initialTab = 'general' }: OptionsAppProps = {}) {
-  const [activeTab, setActiveTab] = useState<OptionsTabId>(initialTab);
+function normalizeTabId(tab?: string | null): CanonicalOptionsTabId {
+  if (tab === 'scenes' || tab === 'subtitles') return 'subtitles';
+  if (
+    tab === 'general' ||
+    tab === 'providers' ||
+    tab === 'prompts' ||
+    tab === 'rules' ||
+    tab === 'migration'
+  ) {
+    return tab;
+  }
+  return 'general';
+}
+
+function resolveInitialTab(explicitTab?: OptionsTabId): CanonicalOptionsTabId {
+  if (explicitTab) return normalizeTabId(explicitTab);
+  if (typeof window !== 'undefined') {
+    const params = new URLSearchParams(window.location.search);
+    const fromQuery = params.get('tab');
+    if (fromQuery) return normalizeTabId(fromQuery);
+    const fromHash = window.location.hash.replace(/^#/, '');
+    if (fromHash) return normalizeTabId(fromHash);
+  }
+  return 'general';
+}
+
+export function OptionsApp({ initialTab }: OptionsAppProps = {}) {
+  const [activeTab, setActiveTab] = useState<CanonicalOptionsTabId>(() =>
+    resolveInitialTab(initialTab),
+  );
   const [draft, setDraft] = useState<MarginConfig>(() => createDefaultMarginConfig());
   const [persistedBaseline, setPersistedBaseline] = useState<MarginConfig | null>(null);
   const [capabilityCache, setCapabilityCache] = useState<ModelCapabilityMap>({});
   const [hydrated, setHydrated] = useState(false);
 
+  // Lifted staged migration state so switching tabs never discards uploaded JSON previews
+  const [stagedImport, setStagedImport] = useState<StagedMigrationState>({
+    rawImportText: '',
+    importError: null,
+    importPreview: null,
+    importApplied: false,
+  });
+
   const trackerRef = useRef(createSaveTracker());
   const draftRef = useRef(draft);
   draftRef.current = draft;
+  const hydratedRef = useRef(hydrated);
+  hydratedRef.current = hydrated;
+  const pendingFlushRef = useRef<(() => void) | null>(null);
+
+  const registerPendingFlush = useCallback((fn: (() => void) | null) => {
+    pendingFlushRef.current = fn;
+  }, []);
 
   const [saveState, setSaveState] = useState(() => trackerRef.current.getState());
 
@@ -54,7 +104,10 @@ export function OptionsApp({ initialTab = 'general' }: OptionsAppProps = {}) {
     void Promise.all([getMarginConfig(), getCapabilityCache()]).then(([loaded, caps]) => {
       if (!mounted) return;
       tracker.hydrateReadOnly(loaded);
-      setDraft(loaded);
+      const cloned = structuredClone(loaded);
+      draftRef.current = cloned;
+      hydratedRef.current = true;
+      setDraft(cloned);
       setPersistedBaseline(structuredClone(loaded));
       setCapabilityCache(caps);
       setHydrated(true);
@@ -66,7 +119,9 @@ export function OptionsApp({ initialTab = 'general' }: OptionsAppProps = {}) {
       const matchedUserSave = tracker.observePersisted(incoming);
       setPersistedBaseline(structuredClone(incoming));
       if (matchedUserSave || !wasDirtyBeforeSync) {
-        setDraft(structuredClone(incoming));
+        const nextClone = structuredClone(incoming);
+        draftRef.current = nextClone;
+        setDraft(nextClone);
       }
     });
 
@@ -78,67 +133,82 @@ export function OptionsApp({ initialTab = 'general' }: OptionsAppProps = {}) {
     };
   }, []);
 
+  const mutateDraft = useCallback((mutator: (next: MarginConfig) => void) => {
+    if (!hydratedRef.current) return;
+    const next = structuredClone(draftRef.current);
+    mutator(next);
+    draftRef.current = next;
+    setDraft(next);
+  }, []);
+
   const isDirty = hydrated && trackerRef.current.isDirty(draft);
 
   const commitConfigSave = useCallback(async (targetConfig: MarginConfig) => {
+    if (!hydratedRef.current) return;
     const normalized = trackerRef.current.beginUserSave(targetConfig);
-    if (!normalized) return;
-
+    draftRef.current = normalized;
     setDraft(normalized);
+
     try {
       await saveMarginConfig(normalized);
       const persisted = await getMarginConfig();
-      trackerRef.current.observePersisted(persisted);
-      setPersistedBaseline(structuredClone(persisted));
-      setDraft(structuredClone(persisted));
+      const confirmedLatest = trackerRef.current.observePersisted(persisted);
+      if (confirmedLatest) {
+        const synced = structuredClone(persisted);
+        setPersistedBaseline(structuredClone(persisted));
+        draftRef.current = synced;
+        setDraft(synced);
+      }
     } catch (err) {
       trackerRef.current.failSave(err instanceof Error ? err.message : String(err));
     }
   }, []);
 
   const handleSaveChanges = useCallback(async () => {
+    if (!hydratedRef.current) return;
+    pendingFlushRef.current?.();
     await commitConfigSave(draftRef.current);
   }, [commitConfigSave]);
 
   const handleRevertDraft = () => {
     if (!persistedBaseline) return;
-    setDraft(structuredClone(persistedBaseline));
+    const reverted = structuredClone(persistedBaseline);
+    draftRef.current = reverted;
+    setDraft(reverted);
   };
 
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
       if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's') {
         e.preventDefault();
+        pendingFlushRef.current?.();
         if (trackerRef.current.isDirty(draftRef.current)) {
-          void handleSaveChanges();
+          void commitConfigSave(draftRef.current);
         }
       }
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [handleSaveChanges]);
-
-  const mutateDraft = useCallback((mutator: (next: MarginConfig) => void) => {
-    setDraft((prev) => {
-      const next = structuredClone(prev);
-      mutator(next);
-      return next;
-    });
-  }, []);
+  }, [commitConfigSave]);
 
   const lang = draft.interfaceLang;
 
-  const navItems: readonly NavRailItem<OptionsTabId>[] = useMemo(
+  const navItems: readonly NavRailItem<CanonicalOptionsTabId>[] = useMemo(
     () => [
       {
         id: 'general',
-        label: lang === 'en' ? 'General & Appearance' : '常规与外观',
-        subtitle: lang === 'en' ? 'Theme & Scene Routing' : '主题、语言与场景路由',
+        label: lang === 'en' ? 'Reading & General' : '常规与阅读',
+        subtitle: lang === 'en' ? 'Languages, Style & Routing' : '语言、排版样式与渠道路由',
       },
       {
         id: 'providers',
         label: lang === 'en' ? 'AI & Translation Channels' : 'AI 与翻译渠道',
-        subtitle: lang === 'en' ? 'Models, Keys & Temperature' : '端点、密钥与温度防呆',
+        subtitle: lang === 'en' ? 'Endpoints, Keys & Models' : '接口、密钥池与连通测试',
+      },
+      {
+        id: 'subtitles',
+        label: lang === 'en' ? 'Subtitles & Interaction' : '视频字幕与交互',
+        subtitle: lang === 'en' ? '16:9 Preview, Input & Hover' : '字幕比例预览、三击空格与划词',
       },
       {
         id: 'prompts',
@@ -146,21 +216,36 @@ export function OptionsApp({ initialTab = 'general' }: OptionsAppProps = {}) {
         subtitle: lang === 'en' ? '<yaml>, %% & Keep-Terms' : '自定义助手与原词保护',
       },
       {
-        id: 'scenes',
-        label: lang === 'en' ? 'Input, Subtitles & Rules' : '输入·字幕·站点规则',
-        subtitle: lang === 'en' ? 'Triple-Space, PiP & URLs' : '三击空格、双语字幕与排除',
+        id: 'rules',
+        label: lang === 'en' ? 'Site URL Rules' : '站点规则',
+        subtitle: lang === 'en' ? 'Auto-Translate & Exclusions' : '白名单与排除域名规则',
       },
       {
         id: 'migration',
         label: lang === 'en' ? 'Migration & Diagnostics' : '配置迁移与诊断',
-        subtitle: lang === 'en' ? '1-Click Import & Logs' : '旧版导入、脱敏导出与日志',
+        subtitle: lang === 'en' ? '1-Click Import & Logs' : '一键导入、备份导出与日志',
       },
     ],
     [lang],
   );
 
+  const hasUnappliedImport = Boolean(
+    stagedImport.importPreview && !stagedImport.importApplied,
+  );
+
   const headerActions = (
     <>
+      {hasUnappliedImport && activeTab !== 'migration' ? (
+        <button
+          type="button"
+          class="mp-btn mp-btn--sm"
+          style={{ borderColor: 'var(--action-solid)', color: 'var(--link)' }}
+          onClick={() => setActiveTab('migration')}
+        >
+          {lang === 'en' ? '1 Import Pending Apply →' : '有待应用的导入配置 →'}
+        </button>
+      ) : null}
+
       {saveState.status === 'saving' ? (
         <StatusPill tone="accent" dataTestId="options-save-status">
           {lang === 'en' ? 'Saving…' : '正在保存…'}
@@ -189,7 +274,7 @@ export function OptionsApp({ initialTab = 'general' }: OptionsAppProps = {}) {
         type="button"
         class="mp-btn mp-btn--solid"
         data-testid="options-save-btn"
-        disabled={!isDirty || saveState.status === 'saving'}
+        disabled={!hydrated || !isDirty || saveState.status === 'saving'}
         onClick={() => void handleSaveChanges()}
       >
         {lang === 'en' ? 'Save Changes' : '保存设置'}
@@ -208,7 +293,10 @@ export function OptionsApp({ initialTab = 'general' }: OptionsAppProps = {}) {
         headerActions={headerActions}
         navItems={navItems}
         activeNav={activeTab}
-        onSelectNav={setActiveTab}
+        onSelectNav={(nextTab) => {
+          pendingFlushRef.current?.();
+          setActiveTab(nextTab);
+        }}
       >
         {activeTab === 'general' ? (
           <GeneralTab draft={draft} onMutate={mutateDraft} />
@@ -220,7 +308,9 @@ export function OptionsApp({ initialTab = 'general' }: OptionsAppProps = {}) {
             capabilityCache={capabilityCache}
             onRefreshCapabilityCache={setCapabilityCache}
             onMutate={mutateDraft}
+            registerPendingFlush={registerPendingFlush}
             onEnsureSavedBeforeTest={async () => {
+              pendingFlushRef.current?.();
               if (trackerRef.current.isDirty(draftRef.current)) {
                 await commitConfigSave(draftRef.current);
               }
@@ -228,12 +318,20 @@ export function OptionsApp({ initialTab = 'general' }: OptionsAppProps = {}) {
           />
         ) : null}
 
-        {activeTab === 'prompts' ? (
-          <PromptsGlossaryTab draft={draft} onMutate={mutateDraft} />
+        {activeTab === 'subtitles' ? (
+          <ScenesRulesTab draft={draft} onMutate={mutateDraft} />
         ) : null}
 
-        {activeTab === 'scenes' ? (
-          <ScenesRulesTab draft={draft} onMutate={mutateDraft} />
+        {activeTab === 'prompts' ? (
+          <PromptsGlossaryTab
+            draft={draft}
+            onMutate={mutateDraft}
+            registerPendingFlush={registerPendingFlush}
+          />
+        ) : null}
+
+        {activeTab === 'rules' ? (
+          <SiteRulesTab draft={draft} onMutate={mutateDraft} />
         ) : null}
 
         {activeTab === 'migration' ? (
@@ -241,6 +339,8 @@ export function OptionsApp({ initialTab = 'general' }: OptionsAppProps = {}) {
             draft={draft}
             capabilityCache={capabilityCache}
             onRefreshCapabilityCache={setCapabilityCache}
+            stagedImport={stagedImport}
+            onStagedImportChange={setStagedImport}
             onApplyImportedConfig={async (importedConfig) => {
               await commitConfigSave(importedConfig);
             }}

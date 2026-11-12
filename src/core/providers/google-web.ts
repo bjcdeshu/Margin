@@ -1,5 +1,9 @@
 import type { ProviderConfig } from '@shared/types';
 import { joinMtBatchChunk, splitMtBatchChunk } from './deeplx';
+import {
+  DEFAULT_MT_REQUEST_TIMEOUT_MS,
+  createLinkedTimeoutScope,
+} from './timeout';
 import { ProviderHttpError } from './types';
 
 export const DEFAULT_GOOGLE_WEB_MAX_CHARS = 2800;
@@ -59,6 +63,7 @@ export async function executeGoogleWebCall(params: {
   toLang: string;
   fetchImpl: typeof fetch;
   signal?: AbortSignal;
+  requestTimeoutMs?: number;
   maxCharsPerChunk?: number;
 }): Promise<{ translations: string[]; httpStatus: number }> {
   const {
@@ -69,6 +74,7 @@ export async function executeGoogleWebCall(params: {
     toLang,
     fetchImpl,
     signal,
+    requestTimeoutMs = DEFAULT_MT_REQUEST_TIMEOUT_MS,
     maxCharsPerChunk = DEFAULT_GOOGLE_WEB_MAX_CHARS,
   } = params;
 
@@ -92,16 +98,26 @@ export async function executeGoogleWebCall(params: {
     url.searchParams.set('dt', 't');
     url.searchParams.set('q', payloadText);
 
-    const response = await fetchImpl(url.toString(), {
-      method: 'GET',
-      headers: {
-        ...(provider.extraHeaders ?? {}),
-      },
-      signal,
-    });
-
-    lastStatus = response.status;
-    const rawBody = new TextDecoder('utf-8').decode(await response.arrayBuffer());
+    const scope = createLinkedTimeoutScope(requestTimeoutMs, signal, 'connect');
+    let response: Response;
+    let rawBody: string;
+    try {
+      response = await scope.race(
+        fetchImpl(url.toString(), {
+          method: 'GET',
+          headers: {
+            ...(provider.extraHeaders ?? {}),
+          },
+          signal: scope.signal,
+        }),
+      );
+      lastStatus = response.status;
+      rawBody = new TextDecoder('utf-8').decode(
+        await scope.race(response.arrayBuffer()),
+      );
+    } finally {
+      scope.cleanup();
+    }
 
     if (!response.ok) {
       throw new ProviderHttpError({

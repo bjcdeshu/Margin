@@ -40,6 +40,8 @@ export interface ProviderRuntimeEnv {
   fetchImpl?: typeof fetch;
   pool?: ProviderExecutionPool;
   retryBaseDelayMs?: number;
+  requestTimeoutMs?: number;
+  streamIdleTimeoutMs?: number;
   signal?: AbortSignal;
 }
 
@@ -54,6 +56,8 @@ export interface AiCompletionRequestParams {
   stream: boolean;
   onDelta?: (delta: string) => void;
   fetchImpl: typeof fetch;
+  requestTimeoutMs?: number;
+  streamIdleTimeoutMs?: number;
   signal?: AbortSignal;
 }
 

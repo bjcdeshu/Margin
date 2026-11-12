@@ -25,7 +25,9 @@ import {
   clampFontSizePercent,
   extractYoutubeVideoId,
   normalizeActiveCueState,
+  normalizeSubtitleStylePreset,
   PIP_CLEAR_DELAY_MS,
+  resolveEffectiveTranslationScale,
   resolveRenderedCueLines,
   type YoutubeExtendedBridgeMessage,
 } from './shared';
@@ -100,9 +102,26 @@ export function createSubtitleIsolatedController(
   let playheadPollTimer: ReturnType<typeof setInterval> | null = null;
   let unsubConfig: (() => void) | null = null;
   let domObserver: MutationObserver | null = null;
+  let playerResizeObserver: ResizeObserver | null = null;
+  let observedPlayerContainer: HTMLElement | null = null;
   let boundHtml5Video: HTMLVideoElement | null = null;
   let detachHtml5Listeners: (() => void) | null = null;
   let destroyed = false;
+
+  function buildConfiguredCueDefaults(): Partial<MarginActiveCueState> {
+    const transScale = resolveEffectiveTranslationScale(config.subtitles);
+    return {
+      mode: config.subtitles.displayMode,
+      fontSizePercent: config.subtitles.fontSizePercent ?? transScale,
+      sourceScalePercent: clampFontSizePercent(
+        config.subtitles.sourceScalePercent,
+        100,
+      ),
+      translationScalePercent: transScale,
+      stylePreset: normalizeSubtitleStylePreset(config.subtitles.stylePreset),
+      position: config.subtitles.position,
+    };
+  }
 
   const isYoutube = isYoutubeHostname(win.location?.hostname ?? '');
 
@@ -213,6 +232,39 @@ export function createSubtitleIsolatedController(
     return null;
   }
 
+  function syncOverlayBaseFontSize(
+    container: HTMLElement,
+    wrapper: HTMLElement,
+  ): void {
+    const playerHeight =
+      container.clientHeight ||
+      container.getBoundingClientRect?.().height ||
+      0;
+    const basePx =
+      playerHeight > 0
+        ? Math.max(16, Math.min(34, Math.round(playerHeight * 0.042)))
+        : doc.fullscreenElement
+          ? 26
+          : 18;
+    wrapper.style.setProperty('--margin-sub-base-px', `${basePx}px`);
+  }
+
+  function ensurePlayerResizeObserver(container: HTMLElement): void {
+    if (typeof ResizeObserver === 'undefined') return;
+    if (observedPlayerContainer === container && playerResizeObserver) return;
+    playerResizeObserver?.disconnect();
+    observedPlayerContainer = container;
+    playerResizeObserver = new ResizeObserver(() => {
+      if (destroyed) return;
+      const host = doc.getElementById(SUBTITLE_OVERLAY_HOST_ID);
+      const wrapper = host?.shadowRoot?.getElementById('margin-sub-wrap');
+      if (wrapper) {
+        syncOverlayBaseFontSize(container, wrapper);
+      }
+    });
+    playerResizeObserver.observe(container);
+  }
+
   function ensureOverlayShadowRoot(): ShadowRoot | null {
     const container = findOverlayMountContainer();
     if (!container) return null;
@@ -230,17 +282,26 @@ export function createSubtitleIsolatedController(
       const wrapper = doc.createElement('div');
       wrapper.id = 'margin-sub-wrap';
       wrapper.dataset.position = config.subtitles.position;
+      wrapper.dataset.stylePreset = normalizeSubtitleStylePreset(
+        config.subtitles.stylePreset,
+      );
       wrapper.hidden = true;
 
       const origLine = doc.createElement('div');
       origLine.id = 'margin-sub-original';
       origLine.className = 'margin-sub-line margin-sub-original';
       origLine.hidden = true;
+      const origSeg = doc.createElement('span');
+      origSeg.className = 'margin-sub-seg';
+      origLine.appendChild(origSeg);
 
       const transLine = doc.createElement('div');
       transLine.id = 'margin-sub-translated';
       transLine.className = 'margin-sub-line margin-sub-translated';
       transLine.hidden = true;
+      const transSeg = doc.createElement('span');
+      transSeg.className = 'margin-sub-seg';
+      transLine.appendChild(transSeg);
 
       wrapper.append(origLine, transLine);
       shadow.append(style, wrapper);
@@ -248,6 +309,12 @@ export function createSubtitleIsolatedController(
 
     if (host.parentElement !== container) {
       container.appendChild(host);
+    }
+
+    ensurePlayerResizeObserver(container);
+    const wrapper = host.shadowRoot?.getElementById('margin-sub-wrap');
+    if (wrapper) {
+      syncOverlayBaseFontSize(container, wrapper);
     }
 
     const isFullscreen = Boolean(doc.fullscreenElement);
@@ -258,6 +325,9 @@ export function createSubtitleIsolatedController(
   }
 
   function removeOverlayHost(): void {
+    playerResizeObserver?.disconnect();
+    playerResizeObserver = null;
+    observedPlayerContainer = null;
     doc.getElementById(SUBTITLE_OVERLAY_HOST_ID)?.remove();
     setNativeYoutubeCaptionSuppression(false);
   }
@@ -279,18 +349,36 @@ export function createSubtitleIsolatedController(
     const transEl = shadow.getElementById('margin-sub-translated');
     if (!wrapper || !origEl || !transEl) return;
 
-    const pct = clampFontSizePercent(cue.fontSizePercent, 70);
-    const scale = (pct / 70).toFixed(3);
-    wrapper.style.setProperty('--margin-sub-scale', scale);
+    const origPct = clampFontSizePercent(cue.sourceScalePercent, 100);
+    const transPct = clampFontSizePercent(
+      cue.translationScalePercent ?? cue.fontSizePercent,
+      70,
+    );
+    const preset = normalizeSubtitleStylePreset(cue.stylePreset);
+    wrapper.style.setProperty('--margin-sub-orig-scale', (origPct / 100).toFixed(3));
+    wrapper.style.setProperty('--margin-sub-trans-scale', (transPct / 100).toFixed(3));
+    wrapper.dataset.stylePreset = preset;
     wrapper.dataset.position = cue.position;
     wrapper.toggleAttribute('data-fullscreen', Boolean(doc.fullscreenElement));
 
     const { originalLine, translatedLine } = resolveRenderedCueLines(cue);
 
-    origEl.textContent = originalLine;
+    let origSeg = origEl.querySelector<HTMLElement>('.margin-sub-seg');
+    if (!origSeg) {
+      origSeg = doc.createElement('span');
+      origSeg.className = 'margin-sub-seg';
+      origEl.replaceChildren(origSeg);
+    }
+    origSeg.textContent = originalLine;
     origEl.hidden = !originalLine;
 
-    transEl.textContent = translatedLine;
+    let transSeg = transEl.querySelector<HTMLElement>('.margin-sub-seg');
+    if (!transSeg) {
+      transSeg = doc.createElement('span');
+      transSeg.className = 'margin-sub-seg';
+      transEl.replaceChildren(transSeg);
+    }
+    transSeg.textContent = translatedLine;
     transEl.hidden = !translatedLine;
 
     wrapper.hidden = !originalLine && !translatedLine;
@@ -305,9 +393,7 @@ export function createSubtitleIsolatedController(
 
   function commitActiveCue(nextRaw: Partial<MarginActiveCueState>): void {
     const normalized = normalizeActiveCueState({
-      mode: config.subtitles.displayMode,
-      fontSizePercent: config.subtitles.fontSizePercent,
-      position: config.subtitles.position,
+      ...buildConfiguredCueDefaults(),
       ...nextRaw,
     });
 
@@ -318,6 +404,9 @@ export function createSubtitleIsolatedController(
       normalized.endMs !== activeCueState.endMs ||
       normalized.mode !== activeCueState.mode ||
       normalized.fontSizePercent !== activeCueState.fontSizePercent ||
+      normalized.sourceScalePercent !== activeCueState.sourceScalePercent ||
+      normalized.translationScalePercent !== activeCueState.translationScalePercent ||
+      normalized.stylePreset !== activeCueState.stylePreset ||
       normalized.position !== activeCueState.position;
 
     activeCueState = normalized;
@@ -346,13 +435,7 @@ export function createSubtitleIsolatedController(
     if (clearTimer === null) {
       clearTimer = setTimeout(() => {
         clearTimer = null;
-        applyOverlayDom(
-          normalizeActiveCueState({
-            mode: config.subtitles.displayMode,
-            fontSizePercent: config.subtitles.fontSizePercent,
-            position: config.subtitles.position,
-          }),
-        );
+        applyOverlayDom(normalizeActiveCueState(buildConfiguredCueDefaults()));
       }, PIP_CLEAR_DELAY_MS);
     }
   }
@@ -361,11 +444,7 @@ export function createSubtitleIsolatedController(
     if (!isSubtitlesEnabledForSite()) {
       cancelClearTimer();
       removeOverlayHost();
-      const empty = normalizeActiveCueState({
-        mode: config.subtitles.displayMode,
-        fontSizePercent: config.subtitles.fontSizePercent,
-        position: config.subtitles.position,
-      });
+      const empty = normalizeActiveCueState(buildConfiguredCueDefaults());
       activeCueState = empty;
       broadcastActiveCue(empty);
       return;
@@ -727,60 +806,108 @@ function buildInPlayerOverlayCss(): string {
       overflow: hidden !important;
     }
     #margin-sub-wrap {
-      --margin-sub-scale: 1;
+      --margin-sub-base-px: 18px;
+      --margin-sub-orig-scale: 1;
+      --margin-sub-trans-scale: 0.7;
       position: absolute;
-      left: 6%;
-      right: 6%;
-      bottom: 54px;
+      left: 5%;
+      right: 5%;
+      bottom: 52px;
       display: flex;
       flex-direction: column;
       align-items: center;
-      gap: 4px;
+      gap: 2px;
       text-align: center;
       pointer-events: none;
+      font-family: "YouTube Noto", Roboto, Arial, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Noto Sans SC", sans-serif;
     }
     #margin-sub-wrap[data-position="top"] {
       bottom: auto;
-      top: 36px;
+      top: 34px;
     }
     #margin-sub-wrap[data-fullscreen] {
-      bottom: 72px;
+      bottom: 70px;
     }
     #margin-sub-wrap[data-fullscreen][data-position="top"] {
       bottom: auto;
-      top: 48px;
+      top: 46px;
     }
     #margin-sub-wrap[hidden],
     .margin-sub-line[hidden] {
       display: none !important;
     }
     .margin-sub-line {
+      width: fit-content;
       max-width: min(92%, 960px);
-      padding: 4px 12px 5px;
-      border-radius: 5px;
-      background: rgba(21, 20, 17, 0.80);
-      border: 1px solid rgba(201, 148, 85, 0.18);
+      padding: 0;
+      margin: 0;
+      background: transparent;
+      border: none;
       white-space: pre-wrap;
       overflow-wrap: anywhere;
-      text-shadow: 0 1px 2px rgba(0, 0, 0, 0.88);
+      text-shadow: none;
+      box-sizing: border-box;
+      line-height: 1.48;
+    }
+    .margin-sub-seg {
+      display: inline;
+      background: rgba(8, 8, 8, 0.75);
+      color: #ffffff;
+      padding: 2px 7px;
+      border-radius: 2px;
+      border: none;
+      box-decoration-break: clone;
+      -webkit-box-decoration-break: clone;
     }
     .margin-sub-original {
-      color: rgba(236, 228, 210, 0.88);
-      font-size: calc(16px * var(--margin-sub-scale, 1));
+      color: #ffffff;
+      font-size: calc(var(--margin-sub-base-px, 18px) * var(--margin-sub-orig-scale, 1));
       font-weight: 500;
-      line-height: 1.38;
     }
     .margin-sub-translated {
+      color: rgba(255, 255, 255, 0.96);
+      font-size: calc(var(--margin-sub-base-px, 18px) * var(--margin-sub-trans-scale, 0.7));
+      font-weight: 500;
+    }
+    .margin-sub-translated .margin-sub-seg {
+      color: rgba(255, 255, 255, 0.96);
+    }
+    #margin-sub-wrap[data-style-preset="cinema-outline"] {
+      gap: 3px;
+    }
+    #margin-sub-wrap[data-style-preset="cinema-outline"] .margin-sub-seg {
+      background: transparent;
+      border: none;
+      padding: 1px 6px;
+      text-shadow:
+        0 1px 3px rgba(0, 0, 0, 0.95),
+        0 0 6px rgba(0, 0, 0, 0.9),
+        -1px -1px 0 rgba(0, 0, 0, 0.85),
+        1px -1px 0 rgba(0, 0, 0, 0.85),
+        -1px 1px 0 rgba(0, 0, 0, 0.85),
+        1px 1px 0 rgba(0, 0, 0, 0.85);
+    }
+    #margin-sub-wrap[data-style-preset="warm-paper"] {
+      gap: 4px;
+    }
+    #margin-sub-wrap[data-style-preset="warm-paper"] .margin-sub-line {
+      padding: 3px 10px 4px;
+      border-radius: 5px;
+      background: rgba(21, 20, 17, 0.82);
+      border: 1px solid rgba(201, 148, 85, 0.24);
+      text-shadow: 0 1px 2px rgba(0, 0, 0, 0.88);
+      line-height: 1.36;
+    }
+    #margin-sub-wrap[data-style-preset="warm-paper"] .margin-sub-seg {
+      background: transparent;
+      padding: 0;
+      color: inherit;
+    }
+    #margin-sub-wrap[data-style-preset="warm-paper"] .margin-sub-original {
+      color: rgba(236, 228, 210, 0.90);
+    }
+    #margin-sub-wrap[data-style-preset="warm-paper"] .margin-sub-translated {
       color: #fbfaf6;
-      font-size: calc(19px * var(--margin-sub-scale, 1));
-      font-weight: 600;
-      line-height: 1.42;
-    }
-    #margin-sub-wrap[data-fullscreen] .margin-sub-original {
-      font-size: calc(22px * var(--margin-sub-scale, 1));
-    }
-    #margin-sub-wrap[data-fullscreen] .margin-sub-translated {
-      font-size: calc(26px * var(--margin-sub-scale, 1));
     }
   `;
 }

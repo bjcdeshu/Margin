@@ -244,6 +244,7 @@ export interface SelectionPopoverOptions {
   now?: () => number;
   transport?: SelectionTransportFn;
   clipboardWrite?: (text: string) => Promise<void>;
+  isUrlExcluded?: () => boolean;
 }
 
 let selectionReqSeq = 0;
@@ -254,6 +255,7 @@ export class SelectionPopover {
   private readonly now: () => number;
   private readonly transport: SelectionTransportFn;
   private readonly clipboardWrite: (text: string) => Promise<void>;
+  private readonly isUrlExcluded?: () => boolean;
 
   private hostEl: HTMLElement | null = null;
   private shadow: ShadowRoot | null = null;
@@ -294,6 +296,7 @@ export class SelectionPopover {
           await navigator.clipboard.writeText(text);
         }
       });
+    this.isUrlExcluded = options.isUrlExcluded;
   }
 
   get state(): 'closed' | 'trigger' | 'card' {
@@ -382,7 +385,8 @@ export class SelectionPopover {
   private isFeatureEnabled(): boolean {
     return (
       this.config.selection.enabled &&
-      this.config.selection.triggerMode !== 'off'
+      this.config.selection.triggerMode !== 'off' &&
+      !this.isUrlExcluded?.()
     );
   }
 
@@ -477,6 +481,8 @@ export class SelectionPopover {
     host.setAttribute('data-margin-host', 'selection-popover');
     host.setAttribute('data-margin-floating', 'true');
     host.setAttribute('data-display-mode', this.config.uiColorMode);
+    host.hidden = true;
+    host.style.display = 'none';
 
     const shadow = host.attachShadow({ mode: 'open' });
     const style = this.doc.createElement('style');
@@ -690,6 +696,7 @@ export class SelectionPopover {
     this.activeAbortController = null;
 
     this.uiState = 'trigger';
+    this.hostEl.hidden = false;
     this.hostEl.style.display = 'block';
     this.cardEl.style.display = 'none';
 
@@ -732,6 +739,7 @@ export class SelectionPopover {
     this.activeAbortController = controller;
 
     this.uiState = 'card';
+    this.hostEl.hidden = false;
     this.hostEl.style.display = 'block';
     if (this.triggerIconBtn) this.triggerIconBtn.style.display = 'none';
     if (this.triggerDotBtn) this.triggerDotBtn.style.display = 'none';
@@ -859,7 +867,10 @@ export class SelectionPopover {
     }
     if (this.triggerIconBtn) this.triggerIconBtn.style.display = 'none';
     if (this.triggerDotBtn) this.triggerDotBtn.style.display = 'none';
-    if (this.hostEl) this.hostEl.style.display = 'none';
+    if (this.hostEl) {
+      this.hostEl.hidden = true;
+      this.hostEl.style.display = 'none';
+    }
   }
 
   updateConfig(nextConfig: MarginConfig): void {

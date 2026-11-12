@@ -1,4 +1,5 @@
 export * from './types';
+export * from './timeout';
 export * from './endpoint';
 export * from './pool';
 export * from './sse';

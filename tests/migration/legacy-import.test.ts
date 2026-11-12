@@ -388,6 +388,9 @@ describe('importLegacyConfig — full structural replica of user v1 config', () 
       preTranslate: true,
       displayMode: 'bilingual',
       fontSizePercent: 70,
+      sourceScalePercent: 100,
+      translationScalePercent: 70,
+      stylePreset: 'youtube-native',
       position: 'bottom',
     });
     expect(config.urlRules.excludeMatches).toEqual(['https://linux.do/*']);

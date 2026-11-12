@@ -1,4 +1,8 @@
 import type { ProviderConfig } from '@shared/types';
+import {
+  DEFAULT_MT_REQUEST_TIMEOUT_MS,
+  createLinkedTimeoutScope,
+} from './timeout';
 import { ProviderHttpError } from './types';
 
 const DEEPLX_LANG_MAP: Readonly<Record<string, string>> = {
@@ -103,6 +107,7 @@ export async function executeDeepLXCall(params: {
   toLang: string;
   fetchImpl: typeof fetch;
   signal?: AbortSignal;
+  requestTimeoutMs?: number;
 }): Promise<{ translations: string[]; httpStatus: number }> {
   const {
     provider,
@@ -113,6 +118,7 @@ export async function executeDeepLXCall(params: {
     toLang,
     fetchImpl,
     signal,
+    requestTimeoutMs = DEFAULT_MT_REQUEST_TIMEOUT_MS,
   } = params;
 
   if (texts.length === 0) {
@@ -133,14 +139,24 @@ export async function executeDeepLXCall(params: {
     target_lang: mapToDeepLXLang(toLang, 'target'),
   };
 
-  const response = await fetchImpl(endpoint, {
-    method: 'POST',
-    headers,
-    body: JSON.stringify(payload),
-    signal,
-  });
-
-  const rawBody = new TextDecoder('utf-8').decode(await response.arrayBuffer());
+  const scope = createLinkedTimeoutScope(requestTimeoutMs, signal, 'connect');
+  let response: Response;
+  let rawBody: string;
+  try {
+    response = await scope.race(
+      fetchImpl(endpoint, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(payload),
+        signal: scope.signal,
+      }),
+    );
+    rawBody = new TextDecoder('utf-8').decode(
+      await scope.race(response.arrayBuffer()),
+    );
+  } finally {
+    scope.cleanup();
+  }
 
   if (!response.ok) {
     throw new ProviderHttpError({

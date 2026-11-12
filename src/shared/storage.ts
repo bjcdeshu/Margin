@@ -35,6 +35,59 @@ async function rawSet(key: string, value: unknown): Promise<void> {
   memoryFallback.set(key, structuredClone(value));
 }
 
+function clampSubtitleScale(value: unknown, fallback: number): number {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.max(50, Math.min(160, Math.round(n)));
+}
+
+function backfillStoredConfig(stored: MarginConfig): {
+  config: MarginConfig;
+  mutated: boolean;
+} {
+  let mutated = false;
+  const defaults = createDefaultMarginConfig();
+
+  if (!stored.subtitles) {
+    stored.subtitles = structuredClone(defaults.subtitles);
+    mutated = true;
+    return { config: stored, mutated };
+  }
+
+  const sub = stored.subtitles as Partial<MarginConfig['subtitles']>;
+  const legacyTransScale = clampSubtitleScale(sub.fontSizePercent, 70);
+  const nextSourceScale = clampSubtitleScale(sub.sourceScalePercent, 100);
+  const nextTransScale = clampSubtitleScale(
+    sub.translationScalePercent,
+    legacyTransScale,
+  );
+  const nextPreset =
+    sub.stylePreset === 'youtube-native' ||
+    sub.stylePreset === 'cinema-outline' ||
+    sub.stylePreset === 'warm-paper'
+      ? sub.stylePreset
+      : 'youtube-native';
+
+  if (
+    sub.sourceScalePercent !== nextSourceScale ||
+    sub.translationScalePercent !== nextTransScale ||
+    sub.fontSizePercent !== nextTransScale ||
+    sub.stylePreset !== nextPreset
+  ) {
+    stored.subtitles = {
+      ...defaults.subtitles,
+      ...sub,
+      sourceScalePercent: nextSourceScale,
+      translationScalePercent: nextTransScale,
+      fontSizePercent: nextTransScale,
+      stylePreset: nextPreset,
+    };
+    mutated = true;
+  }
+
+  return { config: stored, mutated };
+}
+
 export async function getMarginConfig(): Promise<MarginConfig> {
   const stored = await rawGet<MarginConfig>(BRAND.storageKeyConfig);
   if (!stored || stored.schemaVersion !== 2) {
@@ -42,7 +95,11 @@ export async function getMarginConfig(): Promise<MarginConfig> {
     await rawSet(BRAND.storageKeyConfig, defaults);
     return defaults;
   }
-  return stored;
+  const { config, mutated } = backfillStoredConfig(stored);
+  if (mutated) {
+    await rawSet(BRAND.storageKeyConfig, config);
+  }
+  return config;
 }
 
 export async function saveMarginConfig(config: MarginConfig): Promise<void> {

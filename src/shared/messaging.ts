@@ -1,9 +1,11 @@
 import { BRAND } from './brand';
 import type {
+  AnyTabMessage,
   FetchImageDataUrlRequest,
   FetchImageDataUrlResponse,
   RuntimeRpcRequest,
-  TabCommandMessage,
+  TabCommandDispatchResult,
+  TabPageState,
   TranslateBatchRequest,
   TranslateBatchResponse,
   TranslateImageRequest,
@@ -140,16 +142,90 @@ export function streamBatchTranslation(
   });
 }
 
+function isMissingReceiverError(message: string): boolean {
+  return /Receiving end does not exist|Could not establish connection|message port closed/i.test(
+    message,
+  );
+}
+
+function isRestrictedBrowserPageError(message: string): boolean {
+  return /Cannot access|chrome:\/\/|edge:\/\/|about:|chrome-extension:\/\/|extensions gallery|webstore/i.test(
+    message,
+  );
+}
+
 export async function sendTabCommand(
   tabId: number,
-  command: TabCommandMessage,
-): Promise<void> {
+  command: AnyTabMessage,
+): Promise<TabCommandDispatchResult> {
   if (typeof globalThis.chrome === 'undefined' || !chrome.tabs?.sendMessage) {
-    return;
+    return {
+      ok: false,
+      error: 'Browser tab messaging is unavailable in this context.',
+    };
   }
+
   try {
-    await chrome.tabs.sendMessage(tabId, command);
-  } catch {
-    // Ignore tabs without content script (e.g. chrome:// pages)
+    const result = await chrome.tabs.sendMessage(tabId, command);
+    return { ok: true, result };
+  } catch (err) {
+    const errMsg = err instanceof Error ? err.message : String(err);
+
+    if (isRestrictedBrowserPageError(errMsg)) {
+      return {
+        ok: false,
+        unsupportedPage: true,
+        error: errMsg,
+      };
+    }
+
+    if (isMissingReceiverError(errMsg)) {
+      // Passive state read or cache flush on an uninjected tab needs no script injection
+      if (command.type === 'margin:cmd:get-page-state') {
+        const idleState: TabPageState = {
+          active: false,
+          inFlightBlocks: 0,
+          translatedBlocks: 0,
+          maskRevealed: false,
+        };
+        return { ok: true, result: idleState };
+      }
+      if (command.type === 'margin:cmd:clear-page-cache') {
+        return { ok: true };
+      }
+
+      // Actionable user command on a pre-existing tab: dynamically inject content scripts and retry once!
+      if (typeof chrome.scripting?.executeScript === 'function') {
+        try {
+          await chrome.scripting.executeScript({
+            target: { tabId },
+            files: ['content.js', 'image-translate.js'],
+          });
+          await new Promise<void>((resolve) => setTimeout(resolve, 60));
+          const retryResult = await chrome.tabs.sendMessage(tabId, command);
+          return { ok: true, autoInjected: true, result: retryResult };
+        } catch (injectErr) {
+          const injectMsg =
+            injectErr instanceof Error ? injectErr.message : String(injectErr);
+          return {
+            ok: false,
+            unsupportedPage: true,
+            error: injectMsg,
+          };
+        }
+      }
+
+      return {
+        ok: false,
+        unsupportedPage: true,
+        error: errMsg,
+      };
+    }
+
+    return {
+      ok: false,
+      unsupportedPage: isRestrictedBrowserPageError(errMsg),
+      error: errMsg,
+    };
   }
 }

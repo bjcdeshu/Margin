@@ -36,12 +36,14 @@ export interface HoverTranslatorOptions {
   config: MarginConfig;
   renderer: WebpageRenderer;
   doc?: Document;
+  isUrlExcluded?: () => boolean;
 }
 
 export class HoverTranslator {
   private config: MarginConfig;
   private readonly renderer: WebpageRenderer;
   private readonly doc: Document;
+  private readonly isUrlExcluded?: () => boolean;
 
   private hoveredTarget: EventTarget | null = null;
   private currentBlock: HTMLElement | null = null;
@@ -60,6 +62,7 @@ export class HoverTranslator {
     this.config = options.config;
     this.renderer = options.renderer;
     this.doc = options.doc ?? document;
+    this.isUrlExcluded = options.isUrlExcluded;
   }
 
   mount(): void {
@@ -168,6 +171,7 @@ export class HoverTranslator {
     this.clearHoverTimer();
 
     if (!this.config.hover.enabled) return;
+    if (this.isUrlExcluded?.()) return;
     if (this.comboTainted) return;
 
     const block =
@@ -184,7 +188,9 @@ export class HoverTranslator {
     const delayMs = Math.max(40, this.config.hover.delayMs ?? 180);
     this.hoverTimer = setTimeout(() => {
       this.hoverTimer = null;
-      if (!this.config.hover.enabled || this.comboTainted) return;
+      if (!this.config.hover.enabled || this.comboTainted || this.isUrlExcluded?.()) {
+        return;
+      }
       if (!block.isConnected) return;
       if (!matchesHoverModifier(this.config.hover.modifierKey, this.modifierState)) {
         return;

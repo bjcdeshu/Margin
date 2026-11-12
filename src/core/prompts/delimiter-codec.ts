@@ -7,6 +7,7 @@ import type {
 } from '@shared/types';
 import {
   buildExpandedPromptVariables,
+  ensureRichTagInstruction,
   extractStreamableVisibleText,
   interpolateTemplate,
   selectPromptsForBatch,
@@ -131,9 +132,21 @@ export class DelimiterPromptCodec implements PromptCodec {
       input.items.length,
     );
 
+    const rawSystemPrompt = interpolateTemplate(systemTemplate, vars).trim();
+    const userPrompt = interpolateTemplate(userTemplate, vars).trim();
+    const userTemplateInstructionsOnly = interpolateTemplate(userTemplate, {
+      ...vars,
+      text: '',
+      yaml: '',
+    }).trim();
+
     return {
-      systemPrompt: interpolateTemplate(systemTemplate, vars).trim(),
-      userPrompt: interpolateTemplate(userTemplate, vars).trim(),
+      systemPrompt: ensureRichTagInstruction(
+        rawSystemPrompt,
+        userTemplateInstructionsOnly,
+        input.items,
+      ),
+      userPrompt,
     };
   }
 

@@ -60,14 +60,16 @@ describe('Quiet Paper 5-Tab Settings Studio (OptionsApp)', () => {
     // No Saved status pill on initial hydration
     expect(container.querySelector('[data-testid="options-save-status"]')).toBeNull();
 
-    // All 5 tabs present in navigation rail
+    // All 6 editorial tabs present in navigation rail
     const navLabels = Array.from(container.querySelectorAll('.mp-nav-item')).map(
       (el) => el.textContent ?? '',
     );
-    expect(navLabels.some((t) => t.includes('常规与外观'))).toBe(true);
+    expect(navLabels).toHaveLength(6);
+    expect(navLabels.some((t) => t.includes('常规与阅读'))).toBe(true);
     expect(navLabels.some((t) => t.includes('AI 与翻译渠道'))).toBe(true);
+    expect(navLabels.some((t) => t.includes('视频字幕与交互'))).toBe(true);
     expect(navLabels.some((t) => t.includes('提示词与术语库'))).toBe(true);
-    expect(navLabels.some((t) => t.includes('输入·字幕·站点规则'))).toBe(true);
+    expect(navLabels.some((t) => t.includes('站点规则'))).toBe(true);
     expect(navLabels.some((t) => t.includes('配置迁移与诊断'))).toBe(true);
 
     // Live resolved badge for `input: "inherit"` -> `→ OpenAI (gpt-6-luna)`
@@ -361,5 +363,123 @@ describe('Quiet Paper 5-Tab Settings Studio (OptionsApp)', () => {
     } finally {
       (globalThis as Record<string, unknown>).chrome = origChrome;
     }
+  });
+
+  it('renders 16:9 live subtitle preview stage, preserves multi-key raw input, clears stale multiplePrompt on reset, and retains staged migration across tabs', async () => {
+    const cfg = createDefaultMarginConfig();
+    cfg.providers['openai-pool'] = {
+      ...cfg.providers['google-free'],
+      id: 'openai-pool',
+      name: 'OpenAI Pool',
+      preset: 'openai',
+      protocol: 'openai-chat',
+      baseUrl: 'https://api.example.com',
+      apiKeys: ['sk-alpha'],
+      model: 'gpt-6-luna',
+      models: ['gpt-6-luna'],
+    };
+    cfg.providerOrder = ['openai-pool', 'google-free'];
+    cfg.routing.webpage = 'openai-pool';
+    cfg.assistants['builtin-yaml'].multiplePrompt = '<yaml>{{yaml}}</yaml>';
+    await saveMarginConfig(cfg);
+
+    await act(async () => {
+      render(<OptionsApp initialTab="subtitles" />, container);
+    });
+    await flushMicrotasks();
+
+    // 1. Live 16:9 subtitle preview renders 100% / 70% and youtube-native preset
+    const previewStage = container.querySelector('[data-testid="subtitle-live-preview"]');
+    const previewStack = container.querySelector('[data-testid="subtitle-preview-stack"]');
+    expect(previewStage?.textContent).toContain('100%');
+    expect(previewStage?.textContent).toContain('70%');
+    expect(previewStack?.getAttribute('data-preset')).toBe('youtube-native');
+
+    const transSlider = container.querySelector(
+      '[data-testid="subtitle-trans-scale-slider"]',
+    ) as HTMLInputElement;
+    await act(async () => {
+      transSlider.value = '85';
+      transSlider.dispatchEvent(new Event('input', { bubbles: true }));
+    });
+    expect(previewStage?.textContent).toContain('85%');
+
+    // 2. Switch to Providers tab & verify raw multi-key textarea preserves trailing comma/newline
+    const navButtons = () =>
+      Array.from(container.querySelectorAll('.mp-nav-item')) as HTMLButtonElement[];
+    await act(async () => {
+      navButtons().find((b) => b.textContent?.includes('AI 与翻译渠道'))!.click();
+    });
+
+    const revealBtn = container.querySelector(
+      '[data-testid="toggle-reveal-keys-btn"]',
+    ) as HTMLButtonElement;
+    await act(async () => {
+      revealBtn.click();
+    });
+
+    const keysTa = container.querySelector(
+      '[data-testid="api-keys-textarea"]',
+    ) as HTMLTextAreaElement;
+    await act(async () => {
+      keysTa.value = 'sk-alpha,\nsk-beta, ';
+      keysTa.dispatchEvent(new Event('input', { bubbles: true }));
+    });
+    expect(keysTa.value).toBe('sk-alpha,\nsk-beta, ');
+
+    // 3. Switch to Prompts tab & reset assistant with stale multiplePrompt -> delimiter preset clears multiplePrompt
+    await act(async () => {
+      navButtons().find((b) => b.textContent?.includes('提示词与术语库'))!.click();
+    });
+    const resetDelimBtn = container.querySelector(
+      '[data-testid="reset-delimiter-btn"]',
+    ) as HTMLButtonElement;
+    await act(async () => {
+      resetDelimBtn.click();
+    });
+
+    // Save changes and confirm persisted state
+    const saveBtn = container.querySelector(
+      '[data-testid="options-save-btn"]',
+    ) as HTMLButtonElement;
+    await act(async () => {
+      saveBtn.click();
+    });
+    await flushMicrotasks();
+
+    const saved = await getMarginConfig();
+    expect(saved.subtitles.translationScalePercent).toBe(85);
+    expect(saved.subtitles.fontSizePercent).toBe(85);
+    expect(saved.providers['openai-pool'].apiKeys).toEqual(['sk-alpha', 'sk-beta']);
+    expect(saved.assistants['builtin-yaml'].codec).toBe('delimiter');
+    expect(saved.assistants['builtin-yaml'].multiplePrompt).toBeUndefined();
+
+    // 4. Switch to Migration tab, parse JSON without applying, switch tabs away and back -> preview persists!
+    await act(async () => {
+      navButtons().find((b) => b.textContent?.includes('配置迁移与诊断'))!.click();
+    });
+    const jsonTa = container.querySelector(
+      '[data-testid="legacy-json-textarea"]',
+    ) as HTMLTextAreaElement;
+    const parseBtn = container.querySelector(
+      '[data-testid="parse-legacy-json-btn"]',
+    ) as HTMLButtonElement;
+    await act(async () => {
+      jsonTa.value = JSON.stringify({ translationService: 'deeplx' });
+      jsonTa.dispatchEvent(new Event('input', { bubbles: true }));
+    });
+    await act(async () => {
+      parseBtn.click();
+    });
+    expect(container.querySelector('[data-testid="import-audit-summary"]')).not.toBeNull();
+
+    // Switch to Site Rules tab and back to Migration tab
+    await act(async () => {
+      navButtons().find((b) => b.textContent?.includes('站点规则'))!.click();
+    });
+    await act(async () => {
+      navButtons().find((b) => b.textContent?.includes('配置迁移与诊断'))!.click();
+    });
+    expect(container.querySelector('[data-testid="import-audit-summary"]')).not.toBeNull();
   });
 });

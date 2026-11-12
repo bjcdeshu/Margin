@@ -341,8 +341,8 @@ export function createYoutubeMainController(
     svg.setAttribute('height', '100%');
     svg.setAttribute('aria-hidden', 'true');
     Object.assign(svg.style, {
-      width: '28px',
-      height: '28px',
+      width: '22px',
+      height: '22px',
       display: 'block',
       pointerEvents: 'none',
     });
@@ -384,8 +384,8 @@ export function createYoutubeMainController(
     svg.setAttribute('height', '100%');
     svg.setAttribute('aria-hidden', 'true');
     Object.assign(svg.style, {
-      width: '28px',
-      height: '28px',
+      width: '22px',
+      height: '22px',
       display: 'block',
       pointerEvents: 'none',
     });
@@ -420,9 +420,15 @@ export function createYoutubeMainController(
     button.className = 'ytp-button';
     button.type = 'button';
     Object.assign(button.style, {
-      width: '44px',
+      appearance: 'none',
+      background: 'transparent',
+      border: 'none',
+      outline: 'none',
+      cursor: 'pointer',
+      width: '36px',
+      flex: '0 0 36px',
       height: '100%',
-      padding: '0 6px',
+      padding: '0',
       display: 'inline-flex',
       alignItems: 'center',
       justifyContent: 'center',

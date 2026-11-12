@@ -68,63 +68,47 @@ export function GeneralTab({ draft, onMutate }: GeneralTabProps) {
 
   return (
     <div>
-      {/* Section 1: Interface & Languages */}
+      {/* Section 1 (Primary): Webpage Reading Experience & Languages */}
       <section class="mp-section">
         <div class="mp-section-head">
           <div>
             <h2 class="mp-section-title">
-              {lang === 'en' ? 'Appearance & Language' : '界面外观与默认语言'}
+              {lang === 'en' ? 'Webpage Bilingual Reading' : '网页双语阅读与语言'}
             </h2>
             <p class="mp-section-desc">
               {lang === 'en'
-                ? 'Warm editorial reading canvas synced across Popup, Options, PDF Studio, and in-page widgets.'
-                : '温暖纸质编辑部视觉规范，统一应用于工具栏弹窗、设置中心、双语 PDF 与页内浮层。'}
+                ? 'Core target language, bilingual typography, and controlled <mN> rich-text protection for daily reading.'
+                : '日常网页、PDF、字幕与图片翻译的核心语言及排版样式，默认安全保护内联超链接与数学公式。'}
             </p>
           </div>
         </div>
 
         <FieldRow
-          label={lang === 'en' ? 'Interface Language' : '界面语言'}
-          hint={lang === 'en' ? 'UI label language for Margin controls' : '设置页、弹窗与双语阅读器操作语言'}
+          label={lang === 'en' ? 'Target Language' : '默认目标语言'}
+          hint={lang === 'en' ? 'Primary language for webpage, PDF, subtitles & images' : '网页、PDF、视频字幕与图片翻译的目标语言'}
         >
-          <SegmentedControl
-            ariaLabel={lang === 'en' ? 'Interface Language' : '界面语言'}
-            options={[
-              { value: 'zh-CN', label: '中文' },
-              { value: 'en', label: 'English' },
-            ]}
-            value={draft.interfaceLang}
-            onChange={(next) =>
+          <select
+            class="mp-select"
+            aria-label={lang === 'en' ? 'Target Language' : '默认目标语言'}
+            value={draft.targetLang}
+            onChange={(e) => {
+              const val = (e.currentTarget as HTMLSelectElement).value;
               onMutate((d) => {
-                d.interfaceLang = next;
-              })
-            }
-          />
-        </FieldRow>
-
-        <FieldRow
-          label={lang === 'en' ? 'Color Theme' : '色彩主题'}
-          hint={
-            lang === 'en'
-              ? 'Warm Paper (#fbfaf6), Warm Charcoal Night (#151411), or follow OS'
-              : '暖纸白 (#fbfaf6)、暖炭黑夜读 (#151411) 或自动跟随系统深浅色'
-          }
-        >
-          <SegmentedControl
-            ariaLabel={lang === 'en' ? 'Color Theme' : '色彩主题'}
-            options={colorModeOptions}
-            value={draft.uiColorMode}
-            onChange={(next) =>
-              onMutate((d) => {
-                d.uiColorMode = next;
-              })
-            }
-          />
+                d.targetLang = val;
+              });
+            }}
+          >
+            {targetLangOptions.map((entry) => (
+              <option key={entry.code} value={entry.code}>
+                {formatLanguageOption(entry.code, lang)}
+              </option>
+            ))}
+          </select>
         </FieldRow>
 
         <FieldRow
           label={lang === 'en' ? 'Source Language' : '默认源语言'}
-          hint={lang === 'en' ? 'Auto-detect recommended for mixed reading' : '日常网页阅读建议保持自动检测'}
+          hint={lang === 'en' ? 'Auto-detect recommended for mixed reading' : '日常混合语言阅读建议保持自动检测'}
         >
           <select
             class="mp-select"
@@ -145,123 +129,6 @@ export function GeneralTab({ draft, onMutate }: GeneralTabProps) {
           </select>
         </FieldRow>
 
-        <FieldRow
-          label={lang === 'en' ? 'Target Language' : '默认目标语言'}
-          hint={lang === 'en' ? 'Primary language for webpage, PDF, subtitles & images' : '网页、PDF、字幕与图片翻译的目标语言'}
-        >
-          <select
-            class="mp-select"
-            aria-label={lang === 'en' ? 'Target Language' : '默认目标语言'}
-            value={draft.targetLang}
-            onChange={(e) => {
-              const val = (e.currentTarget as HTMLSelectElement).value;
-              onMutate((d) => {
-                d.targetLang = val;
-              });
-            }}
-          >
-            {targetLangOptions.map((entry) => (
-              <option key={entry.code} value={entry.code}>
-                {formatLanguageOption(entry.code, lang)}
-              </option>
-            ))}
-          </select>
-        </FieldRow>
-      </section>
-
-      {/* Section 2: Live Scene Routing Matrix */}
-      <section class="mp-section">
-        <div class="mp-section-head">
-          <div>
-            <h2 class="mp-section-title">
-              {lang === 'en' ? 'Scene Routing Matrix' : '分场景翻译渠道路由'}
-            </h2>
-            <p class="mp-section-desc">
-              {lang === 'en'
-                ? 'Sub-scenes set to "Follow Primary Webpage Service (inherit)" dynamically track changes to your primary channel.'
-                : '设为「跟随主翻译服务 (inherit)」的场景会自动联动网页主服务，切换主模型时无需逐项重配。'}
-            </p>
-          </div>
-        </div>
-
-        {SCENES_ORDER.map((scene) => {
-          const isPrimary = scene === 'webpage';
-          const rawValue = draft.routing[scene];
-          const resolvedId = resolveProviderIdForScene(scene, draft.routing, draft.providers);
-          const resolvedProvider = draft.providers[resolvedId];
-          const resolvedText = resolvedProvider
-            ? `→ ${resolvedProvider.name} (${resolvedProvider.model})`
-            : `→ ${resolvedId}`;
-
-          return (
-            <FieldRow
-              key={scene}
-              label={labelForScene(scene, lang)}
-              badge={
-                <StatusPill
-                  tone={isPrimary || rawValue !== 'inherit' ? 'accent' : 'mono'}
-                  dataTestId={`scene-resolved-${scene}`}
-                >
-                  {resolvedText}
-                </StatusPill>
-              }
-              hint={
-                isPrimary
-                  ? lang === 'en'
-                    ? 'Primary service inherited by other scenes'
-                    : '全局主翻译渠道，供勾选「跟随主翻译服务」的子场景实时继承'
-                  : undefined
-              }
-            >
-              <select
-                class="mp-select"
-                aria-label={`${labelForScene(scene, lang)} routing`}
-                data-testid={`scene-select-${scene}`}
-                value={rawValue}
-                onChange={(e) => {
-                  const val = (e.currentTarget as HTMLSelectElement).value;
-                  onMutate((d) => {
-                    if (scene === 'webpage') {
-                      d.routing.webpage = val;
-                    } else {
-                      d.routing[scene] = val;
-                    }
-                  });
-                }}
-              >
-                {!isPrimary ? (
-                  <option value="inherit">
-                    {lang === 'en'
-                      ? 'Follow Primary Webpage Service (inherit)'
-                      : '跟随主翻译服务 (inherit)'}
-                  </option>
-                ) : null}
-                {fallbackProviders.map((prov) => (
-                  <option key={prov.id} value={prov.id}>
-                    {prov.name} ({prov.model}){!prov.enabled ? ' [已停用]' : ''}
-                  </option>
-                ))}
-              </select>
-            </FieldRow>
-          );
-        })}
-      </section>
-
-      {/* Section 3: Webpage Typography & Themes */}
-      <section class="mp-section">
-        <div class="mp-section-head">
-          <div>
-            <h2 class="mp-section-title">
-              {lang === 'en' ? 'Webpage Typography & Theme' : '网页译文排版与样式'}
-            </h2>
-            <p class="mp-section-desc">
-              {lang === 'en'
-                ? 'Controlled rich-text keeps inline links, emphasis, and math formulas intact without innerHTML risks.'
-                : '受控富文本引擎默认在双语与仅译文模式下同时保护内联链接、粗体与数学公式。'}
-            </p>
-          </div>
-        </div>
-
         <FieldRow label={lang === 'en' ? 'Display Mode' : '默认显示模式'}>
           <SegmentedControl
             ariaLabel={lang === 'en' ? 'Webpage Display Mode' : '默认显示模式'}
@@ -280,7 +147,7 @@ export function GeneralTab({ draft, onMutate }: GeneralTabProps) {
           hint={
             lang === 'en'
               ? 'Blur Mask blurs translations until hovered or toggled via Alt+M (great for language learning)'
-              : '模糊遮罩 (Mask) 默认轻度模糊译文，悬停或按 Alt+M 清晰显现，适合沉浸学习阅读'
+              : '模糊遮罩 (Mask) 默认轻度模糊译文，悬停或按 Alt+M 清晰显现，适合沉浸对照学习'
           }
         >
           <SegmentedControl
@@ -314,31 +181,257 @@ export function GeneralTab({ draft, onMutate }: GeneralTabProps) {
           />
         </FieldRow>
 
+        {/* Per-domain theme overrides (compact disclosure) */}
+        <details
+          class="mp-advanced-details"
+          open={draft.webpage.themePatterns.length > 0}
+        >
+          <summary class="mp-advanced-summary">
+            <span>
+              {lang === 'en'
+                ? 'Per-Site Translation Style Overrides'
+                : '按站点定制译文样式 (themePatterns)'}
+            </span>
+            <span style={{ display: 'inline-flex', alignItems: 'center', gap: '8px' }}>
+              <StatusPill tone="mono">
+                {draft.webpage.themePatterns.length}
+              </StatusPill>
+              <span class="mp-advanced-chevron">▸</span>
+            </span>
+          </summary>
+          <div class="mp-advanced-body" style={{ paddingTop: '8px' }}>
+            <div class="mp-flat-list">
+              {draft.webpage.themePatterns.map((rule, idx) => (
+                <div key={idx} class="mp-flat-item">
+                  <input
+                    type="text"
+                    class="mp-input mp-input--mono"
+                    style={{ flex: 1 }}
+                    placeholder="https://arxiv.org/*"
+                    value={rule.pattern}
+                    onInput={(e) => {
+                      const val = (e.currentTarget as HTMLInputElement).value;
+                      onMutate((d) => {
+                        if (d.webpage.themePatterns[idx]) {
+                          d.webpage.themePatterns[idx].pattern = val;
+                        }
+                      });
+                    }}
+                  />
+                  <select
+                    class="mp-select"
+                    value={rule.theme}
+                    onChange={(e) => {
+                      const val = (e.currentTarget as HTMLSelectElement).value as TranslationTheme;
+                      onMutate((d) => {
+                        if (d.webpage.themePatterns[idx]) {
+                          d.webpage.themePatterns[idx].theme = val;
+                        }
+                      });
+                    }}
+                  >
+                    {themeOptions.map((opt) => (
+                      <option key={opt.value} value={opt.value}>
+                        {opt.label}
+                      </option>
+                    ))}
+                  </select>
+                  <button
+                    type="button"
+                    class="mp-btn mp-btn--ghost mp-btn--sm"
+                    aria-label={`Remove theme rule ${idx}`}
+                    onClick={() =>
+                      onMutate((d) => {
+                        d.webpage.themePatterns = d.webpage.themePatterns.filter(
+                          (_, i) => i !== idx,
+                        );
+                      })
+                    }
+                  >
+                    ×
+                  </button>
+                </div>
+              ))}
+            </div>
+            <div style={{ paddingTop: '8px' }}>
+              <button
+                type="button"
+                class="mp-btn mp-btn--sm"
+                onClick={() =>
+                  onMutate((d) => {
+                    d.webpage.themePatterns = [
+                      ...d.webpage.themePatterns,
+                      { pattern: '', theme: 'none' },
+                    ];
+                  })
+                }
+              >
+                + {lang === 'en' ? 'Add Site Style Rule' : '添加站点样式规则'}
+              </button>
+            </div>
+          </div>
+        </details>
+      </section>
+
+      {/* Section 2: Scene Routing Matrix (Primary prominent, inherited sub-scenes calm) */}
+      <section class="mp-section">
+        <div class="mp-section-head">
+          <div>
+            <h2 class="mp-section-title">
+              {lang === 'en' ? 'Scene Channel Routing' : '分场景翻译渠道路由'}
+            </h2>
+            <p class="mp-section-desc">
+              {lang === 'en'
+                ? 'Sub-scenes set to "Follow Primary Webpage Service" automatically track your active primary channel.'
+                : '子场景保持「跟随网页主服务」即可自动联动主渠道；已停用渠道会自动安全回退至可用渠道。'}
+            </p>
+          </div>
+        </div>
+
+        {SCENES_ORDER.map((scene) => {
+          const isPrimary = scene === 'webpage';
+          const rawValue = draft.routing[scene];
+          const explicitProv =
+            rawValue !== 'inherit' ? draft.providers[rawValue] : undefined;
+          const isConfiguredDisabled = Boolean(explicitProv && !explicitProv.enabled);
+          const resolvedId = resolveProviderIdForScene(
+            scene,
+            draft.routing,
+            draft.providers,
+          );
+          const resolvedProvider = draft.providers[resolvedId];
+          const resolvedText = resolvedProvider
+            ? `→ ${resolvedProvider.name} (${resolvedProvider.model})`
+            : `→ ${resolvedId}`;
+
+          return (
+            <FieldRow
+              key={scene}
+              label={labelForScene(scene, lang)}
+              badge={
+                isConfiguredDisabled ? (
+                  <StatusPill
+                    tone="danger"
+                    dataTestId={`scene-resolved-${scene}`}
+                  >
+                    {lang === 'en'
+                      ? `Disabled · Fallback ${resolvedText}`
+                      : `已停用 · 自动回退 ${resolvedText}`}
+                  </StatusPill>
+                ) : isPrimary || rawValue !== 'inherit' ? (
+                  <StatusPill
+                    tone="accent"
+                    dataTestId={`scene-resolved-${scene}`}
+                  >
+                    {resolvedText}
+                  </StatusPill>
+                ) : (
+                  <span
+                    class="mp-route-quiet"
+                    data-testid={`scene-resolved-${scene}`}
+                  >
+                    {resolvedText}
+                  </span>
+                )
+              }
+              hint={
+                isPrimary
+                  ? lang === 'en'
+                    ? 'Primary service inherited by sub-scenes below'
+                    : '全局主翻译渠道，供下方「跟随网页主服务」的子场景实时继承'
+                  : undefined
+              }
+            >
+              <select
+                class="mp-select"
+                aria-label={`${labelForScene(scene, lang)} routing`}
+                data-testid={`scene-select-${scene}`}
+                value={rawValue}
+                onChange={(e) => {
+                  const val = (e.currentTarget as HTMLSelectElement).value;
+                  onMutate((d) => {
+                    if (scene === 'webpage') {
+                      d.routing.webpage = val;
+                    } else {
+                      d.routing[scene] = val;
+                    }
+                  });
+                }}
+              >
+                {!isPrimary ? (
+                  <option value="inherit">
+                    {lang === 'en'
+                      ? 'Follow Primary Webpage Service'
+                      : '跟随网页主服务'}
+                  </option>
+                ) : null}
+                {fallbackProviders.map((prov) => (
+                  <option key={prov.id} value={prov.id}>
+                    {prov.name} ({prov.model})
+                    {!prov.enabled
+                      ? lang === 'en'
+                        ? ' [Disabled]'
+                        : ' [已停用]'
+                      : ''}
+                  </option>
+                ))}
+              </select>
+            </FieldRow>
+          );
+        })}
+      </section>
+
+      {/* Section 3: Compact Studio Appearance */}
+      <section class="mp-section">
+        <div class="mp-section-head">
+          <div>
+            <h2 class="mp-section-title">
+              {lang === 'en' ? 'Studio Appearance' : '界面外观与色彩'}
+            </h2>
+            <p class="mp-section-desc">
+              {lang === 'en'
+                ? 'Warm Paper editorial canvas synced across Popup, Options Studio, PDF Reader, and in-page popovers.'
+                : '温暖纸感视觉规范统一应用于工具栏弹窗、设置工作台、双语 PDF 与页内交互卡片。'}
+            </p>
+          </div>
+        </div>
+
         <FieldRow
-          label={
-            lang === 'en'
-              ? 'Inline Line-Break Threshold (chars)'
-              : '短段落换行字数阈值 (lineBreakMaxTextCount)'
-          }
+          label={lang === 'en' ? 'Color Theme' : '工作台色彩主题'}
           hint={
             lang === 'en'
-              ? 'Paragraphs longer than this count always break onto a dedicated bilingual block (default 280)'
-              : '超过该字符数的段落始终独立换行排版（默认 280）'
+              ? 'Warm Paper (#fbfaf6), Warm Charcoal Night (#151411), or follow OS'
+              : '暖纸白 (#fbfaf6)、暖炭黑夜读 (#151411) 或跟随系统深浅色'
           }
         >
-          <input
-            type="number"
-            class="mp-input mp-input--mono"
-            style={{ width: '96px' }}
-            min={0}
-            max={5000}
-            value={draft.webpage.lineBreakMaxTextCount}
-            onInput={(e) => {
-              const parsed = Number.parseInt((e.currentTarget as HTMLInputElement).value, 10);
+          <SegmentedControl
+            ariaLabel={lang === 'en' ? 'Color Theme' : '工作台色彩主题'}
+            options={colorModeOptions}
+            value={draft.uiColorMode}
+            onChange={(next) =>
               onMutate((d) => {
-                d.webpage.lineBreakMaxTextCount = Number.isFinite(parsed) ? Math.max(0, parsed) : 280;
-              });
-            }}
+                d.uiColorMode = next;
+              })
+            }
+          />
+        </FieldRow>
+
+        <FieldRow
+          label={lang === 'en' ? 'Interface Language' : '界面显示语言'}
+          hint={lang === 'en' ? 'UI label language for Margin controls' : '设置页、弹窗与双语阅读器操作语言'}
+        >
+          <SegmentedControl
+            ariaLabel={lang === 'en' ? 'Interface Language' : '界面显示语言'}
+            options={[
+              { value: 'zh-CN', label: '中文' },
+              { value: 'en', label: 'English' },
+            ]}
+            value={draft.interfaceLang}
+            onChange={(next) =>
+              onMutate((d) => {
+                d.interfaceLang = next;
+              })
+            }
           />
         </FieldRow>
       </section>

@@ -16,7 +16,7 @@ async function flushMicrotasks(): Promise<void> {
   });
 }
 
-describe('Quiet Paper Popup Sheet (PopupApp)', () => {
+describe('Quiet Paper Popup Sheet (PopupApp — 3-Tier Editorial Hierarchy)', () => {
   let container: HTMLDivElement;
 
   beforeEach(() => {
@@ -30,7 +30,7 @@ describe('Quiet Paper Popup Sheet (PopupApp)', () => {
     container.remove();
   });
 
-  it('renders editorial controls, live scene routing summary, and toggles domain exclusion with snapshot-verified save', async () => {
+  it('renders 3-tier hierarchy, cycles Paper/Night/Auto theme, toggles Selection/Hover pills, and persists domain exclusion safely', async () => {
     const seeded = createDefaultMarginConfig();
     seeded.providers['openai-bytb6BIB'] = {
       ...seeded.providers['google-free'],
@@ -42,7 +42,6 @@ describe('Quiet Paper Popup Sheet (PopupApp)', () => {
     };
     seeded.providerOrder = ['openai-bytb6BIB', 'google-free'];
     seeded.routing.webpage = 'openai-bytb6BIB';
-    seeded.routing.input = 'inherit';
     await saveMarginConfig(seeded);
 
     await act(async () => {
@@ -61,24 +60,50 @@ describe('Quiet Paper Popup Sheet (PopupApp)', () => {
     // Must NOT show Saved pill on initial read-only hydration
     expect(container.querySelector('[data-testid="popup-save-pill"]')).toBeNull();
 
-    // Renders primary action & PDF reader link
+    // Tier 1 Hero + Tier 2 Reading Controls + Tier 3 Channel/Quick/Site bar
     expect(container.textContent).toContain('Margin');
-    expect(container.textContent).toContain('翻译当前页面 (Alt+A)');
-    expect(container.textContent).toContain('打开双语 PDF 阅读器');
-    expect(container.textContent).toContain('模糊遮罩 Mask');
+    const heroBtn = container.querySelector(
+      '[data-testid="popup-toggle-page"]',
+    ) as HTMLButtonElement;
+    expect(heroBtn.textContent).toContain('翻译当前页面');
+    expect(heroBtn.textContent).toContain('Alt+A');
+    expect(container.textContent).toContain('双语 PDF ↗');
+    expect(container.textContent).toContain('遮罩');
 
-    // Renders live resolved scene routing summary
+    // Clickable active channel bar shows primary provider & model
     const webRoute = container.querySelector('[data-testid="popup-route-webpage"]');
-    const inputRoute = container.querySelector('[data-testid="popup-route-input"]');
     expect(webRoute?.textContent).toContain('OpenAI · gpt-6-luna');
-    expect(inputRoute?.textContent).toContain('跟随网页 · gpt-6-luna');
+    expect(webRoute?.textContent).toContain('配置 ↗');
 
-    // Domain is currently allowed -> click 1-click Exclude Current Domain
+    // Theme cycler switches Paper -> Night -> System
+    const themeBtn = container.querySelector(
+      '[data-testid="popup-theme-cycle"]',
+    ) as HTMLButtonElement;
+    expect(themeBtn.textContent).toContain('纸白');
+    await act(async () => {
+      themeBtn.click();
+    });
+    await flushMicrotasks();
+    expect(themeBtn.textContent).toContain('夜读');
+    expect((await getMarginConfig()).uiColorMode).toBe('night');
+
+    // Quick toggle pills for Selection & Hover
+    const selectionToggle = container.querySelector(
+      '[data-testid="popup-toggle-selection"]',
+    ) as HTMLButtonElement;
+    expect(selectionToggle.getAttribute('aria-pressed')).toBe('true');
+    await act(async () => {
+      selectionToggle.click();
+    });
+    await flushMicrotasks();
+    expect(selectionToggle.getAttribute('aria-pressed')).toBe('false');
+    expect((await getMarginConfig()).selection.enabled).toBe(false);
+
+    // 1-click site rule toggle: 在此网站禁用 -> 已禁用 · 点击恢复
     const domainBtn = container.querySelector(
       '[data-testid="popup-domain-toggle"]',
     ) as HTMLButtonElement;
-    expect(domainBtn).not.toBeNull();
-    expect(domainBtn.textContent).toContain('排除当前域名');
+    expect(domainBtn.textContent).toContain('在此网站禁用');
 
     await act(async () => {
       domainBtn.click();
@@ -86,11 +111,48 @@ describe('Quiet Paper Popup Sheet (PopupApp)', () => {
     await flushMicrotasks();
 
     const updatedCfg = await getMarginConfig();
-    expect(updatedCfg.urlRules.excludeMatches).toContain('https://news.ycombinator.com/*');
-    expect(domainBtn.textContent).toContain('允许当前域名');
+    expect(updatedCfg.urlRules.excludeMatches).toContain(
+      'https://news.ycombinator.com/*',
+    );
+    expect(domainBtn.textContent).toContain('已禁用 · 点击恢复');
 
     // Snapshot-verified Save pill appears after user-initiated action
     const savePill = container.querySelector('[data-testid="popup-save-pill"]');
     expect(savePill?.textContent).toBe('已保存');
+  });
+
+  it('reflects active bilingual page state (还原网页原文) and surfaces upstream errors clearly', async () => {
+    await saveMarginConfig(createDefaultMarginConfig());
+
+    await act(async () => {
+      render(
+        <PopupApp
+          initialActiveTab={{
+            id: 77,
+            url: 'https://x.com/ubuntu/status/123',
+          }}
+          initialPageState={{
+            active: true,
+            inFlightBlocks: 0,
+            translatedBlocks: 12,
+            maskRevealed: false,
+            lastError: 'HTTP 401: Invalid API key',
+          }}
+        />,
+        container,
+      );
+    });
+    await flushMicrotasks();
+
+    const heroBtn = container.querySelector(
+      '[data-testid="popup-toggle-page"]',
+    ) as HTMLButtonElement;
+    expect(heroBtn.textContent).toContain('还原网页原文');
+
+    const banner = container.querySelector('[data-testid="popup-status-banner"]');
+    expect(banner?.textContent).toContain('HTTP 401: Invalid API key');
+
+    const badge = container.querySelector('[data-testid="popup-page-badge"]');
+    expect(badge?.textContent).toBe('翻译异常');
   });
 });

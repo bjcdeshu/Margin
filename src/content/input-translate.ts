@@ -46,6 +46,10 @@ ${SHADOW_HOST_RESET_CSS}
   pointer-events: auto;
 }
 
+.pill[hidden] {
+  display: none !important;
+}
+
 .pill[data-error="true"] {
   border-color: rgba(180, 65, 46, 0.45);
 }
@@ -140,6 +144,79 @@ export function resolveEditableTarget(candidate: Element | null): HTMLElement | 
   return null;
 }
 
+const EDITABLE_BLOCK_TAGS: ReadonlySet<string> = new Set([
+  'DIV',
+  'P',
+  'LI',
+  'UL',
+  'OL',
+  'BLOCKQUOTE',
+  'PRE',
+  'H1',
+  'H2',
+  'H3',
+  'H4',
+  'H5',
+  'H6',
+  'SECTION',
+  'ARTICLE',
+  'TR',
+]);
+
+function extractContentEditableText(root: HTMLElement): string {
+  let out = '';
+  let pendingBlockBreak = false;
+
+  const flushPendingBreak = () => {
+    if (pendingBlockBreak && out.length > 0 && !out.endsWith('\n')) {
+      out += '\n';
+    }
+    pendingBlockBreak = false;
+  };
+
+  const walk = (node: Node): void => {
+    for (let child = node.firstChild; child; child = child.nextSibling) {
+      if (child.nodeType === Node.TEXT_NODE) {
+        const val = child.nodeValue ?? '';
+        if (val.length > 0) {
+          flushPendingBreak();
+          out += val;
+        }
+        continue;
+      }
+      if (child.nodeType !== Node.ELEMENT_NODE) continue;
+      const el = child as HTMLElement;
+      const tag = el.tagName.toUpperCase();
+      if (tag === 'BR') {
+        const isTrailingPlaceholderBr =
+          el.nextSibling === null &&
+          el.previousSibling !== null &&
+          el.previousSibling.nodeName.toUpperCase() !== 'BR' &&
+          node !== root &&
+          node instanceof HTMLElement &&
+          EDITABLE_BLOCK_TAGS.has(node.tagName.toUpperCase());
+        if (!isTrailingPlaceholderBr) {
+          flushPendingBreak();
+          out += '\n';
+        }
+        continue;
+      }
+
+      const isBlock = EDITABLE_BLOCK_TAGS.has(tag);
+      if (isBlock && out.length > 0 && !out.endsWith('\n')) {
+        pendingBlockBreak = true;
+      }
+      walk(el);
+      if (isBlock && out.length > 0) {
+        pendingBlockBreak = true;
+      }
+    }
+  };
+
+  walk(root);
+  return out;
+}
+
 export function readEditableText(target: HTMLElement): string {
   if (
     target instanceof HTMLInputElement ||
@@ -147,7 +224,7 @@ export function readEditableText(target: HTMLElement): string {
   ) {
     return target.value;
   }
-  return target.textContent ?? '';
+  return extractContentEditableText(target);
 }
 
 /**
@@ -255,7 +332,22 @@ function setContentEditableValueWithEvents(
   }
 
   if (readEditableText(el) !== nextValue) {
-    el.textContent = nextValue;
+    if (nextValue.includes('\n')) {
+      const doc = el.ownerDocument || document;
+      const frag = doc.createDocumentFragment();
+      const lines = nextValue.split('\n');
+      lines.forEach((line, idx) => {
+        if (idx > 0) {
+          frag.appendChild(doc.createElement('br'));
+        }
+        if (line.length > 0) {
+          frag.appendChild(doc.createTextNode(line));
+        }
+      });
+      el.replaceChildren(frag);
+    } else {
+      el.textContent = nextValue;
+    }
     const inputEv =
       typeof InputEvent === 'function'
         ? new InputEvent('input', {
@@ -390,6 +482,7 @@ export interface InputQuickTranslatorOptions {
   doc?: Document;
   now?: () => number;
   transport?: InputBatchTransportFn;
+  isUrlExcluded?: () => boolean;
 }
 
 let inputReqCounter = 0;
@@ -399,6 +492,7 @@ export class InputQuickTranslator {
   private readonly doc: Document;
   private readonly now: () => number;
   private readonly transport: InputBatchTransportFn;
+  private readonly isUrlExcluded?: () => boolean;
 
   private spaceTimestamps: number[] = [];
   private lastSpaceTarget: HTMLElement | null = null;
@@ -419,6 +513,7 @@ export class InputQuickTranslator {
     this.doc = options.doc ?? document;
     this.now = options.now ?? (() => Date.now());
     this.transport = options.transport ?? defaultInputTransport;
+    this.isUrlExcluded = options.isUrlExcluded;
   }
 
   mount(): void {
@@ -468,11 +563,16 @@ export class InputQuickTranslator {
   }
 
   private handleKeyDown(ev: KeyboardEvent): void {
-    // 1. Esc cancels in-flight input translation without touching draft
-    if (ev.key === 'Escape' && this.activeAbortController) {
+    // 1. Esc cancels in-flight input translation or dismisses visible status/error pill without touching draft
+    if (
+      ev.key === 'Escape' &&
+      (this.activeAbortController || (this.pillHost && !this.pillHost.hidden))
+    ) {
       ev.preventDefault();
       ev.stopPropagation();
-      this.cancelInFlight();
+      if (!this.cancelInFlight()) {
+        this.hidePill();
+      }
       return;
     }
 
@@ -526,7 +626,11 @@ export class InputQuickTranslator {
       return;
     }
 
-    if (!this.config.input.enabled || !this.config.input.tripleSpaceTrigger) {
+    if (
+      !this.config.input.enabled ||
+      !this.config.input.tripleSpaceTrigger ||
+      this.isUrlExcluded?.()
+    ) {
       this.spaceTimestamps = [];
       return;
     }
@@ -579,7 +683,7 @@ export class InputQuickTranslator {
    * Translates the currently focused editable field (`Alt+I` / `margin:cmd:translate-input`).
    */
   async translateActiveElement(): Promise<boolean> {
-    if (!this.config.input.enabled) return false;
+    if (!this.config.input.enabled || this.isUrlExcluded?.()) return false;
     const editable = resolveEditableTarget(deepActiveElement(this.doc));
     if (!editable) return false;
     const raw = readEditableText(editable);
@@ -592,7 +696,7 @@ export class InputQuickTranslator {
     editable: HTMLElement,
     explicitSourceText?: string,
   ): Promise<boolean> {
-    if (!this.config.input.enabled) return false;
+    if (!this.config.input.enabled || this.isUrlExcluded?.()) return false;
 
     const rawText = explicitSourceText ?? readEditableText(editable);
     const sourceText = rawText.trim();
@@ -686,6 +790,8 @@ export class InputQuickTranslator {
     host.setAttribute('data-margin-host', 'input-pill');
     host.setAttribute('data-margin-floating', 'true');
     host.setAttribute('data-display-mode', this.config.uiColorMode);
+    host.hidden = true;
+    host.style.display = 'none';
 
     const shadow = host.attachShadow({ mode: 'open' });
     const style = this.doc.createElement('style');
@@ -693,6 +799,7 @@ export class InputQuickTranslator {
 
     const pill = this.doc.createElement('div');
     pill.className = 'pill';
+    pill.hidden = true;
     pill.setAttribute('role', 'status');
     pill.setAttribute('aria-live', 'polite');
 
@@ -719,7 +826,9 @@ export class InputQuickTranslator {
     cancelBtn.addEventListener('click', (ev) => {
       ev.preventDefault();
       ev.stopPropagation();
-      this.cancelInFlight();
+      if (!this.cancelInFlight()) {
+        this.hidePill();
+      }
     });
 
     pill.append(dot, label, cancelBtn);
@@ -767,7 +876,9 @@ export class InputQuickTranslator {
     if (!this.pillHost || !this.pillRootEl || !this.pillLabelEl || !this.pillCancelBtn) {
       return;
     }
+    this.pillHost.hidden = false;
     this.pillHost.style.display = 'block';
+    this.pillRootEl.hidden = false;
     if (isError) {
       this.pillRootEl.setAttribute('data-error', 'true');
       this.pillCancelBtn.style.display = 'none';
@@ -795,7 +906,11 @@ export class InputQuickTranslator {
       clearTimeout(this.errorDismissTimer);
       this.errorDismissTimer = null;
     }
+    if (this.pillRootEl) {
+      this.pillRootEl.hidden = true;
+    }
     if (this.pillHost) {
+      this.pillHost.hidden = true;
       this.pillHost.style.display = 'none';
     }
   }

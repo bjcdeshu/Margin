@@ -4,11 +4,14 @@ import {
   streamBatchTranslation,
   type StreamBatchCallbacks,
 } from '@shared/messaging';
+import { SHADOW_HOST_RESET_CSS } from '@shared/shadow-styles';
 import type {
   BatchItemOutput,
   DisplayMode,
+  GlossaryEntry,
   MarginConfig,
   PageContextPayload,
+  TabPageState,
   TranslateBatchRequest,
   TranslateBatchResponse,
   TranslationScene,
@@ -18,6 +21,7 @@ import { resolveThemeForUrl } from '@shared/url-match';
 import {
   extractPageContext,
   extractParagraphBlocks,
+  findFirstDirectBlockBoundaryChild,
 } from './dom-walker';
 import {
   reconstructRichDom,
@@ -29,6 +33,13 @@ export const DEFAULT_LRU_CAPACITY = 2000;
 export const VIEWPORT_ROOT_MARGIN = '600px 0px';
 
 const STYLE_ELEMENT_ID = 'margin-webpage-styles';
+
+const INLINE_SHORT_CELL_TAGS: ReadonlySet<string> = new Set([
+  'TH',
+  'TD',
+  'DT',
+  'SUMMARY',
+]);
 
 export const WEBPAGE_INJECTED_CSS = /* css */ `
 .margin-orig-source[data-margin-orig-wrap="true"] {
@@ -49,13 +60,15 @@ export const WEBPAGE_INJECTED_CSS = /* css */ `
 }
 
 .margin-trans-root[data-margin-layout="block"] {
-  display: block;
-  margin-top: 0.38em;
-  margin-bottom: 0.12em;
+  display: block !important;
+  margin-top: 0.5em;
+  margin-bottom: 0.18em;
+  white-space: pre-line;
 }
 
 .margin-trans-root[data-margin-layout="replace"] {
   display: inline;
+  white-space: pre-line;
 }
 
 .margin-trans-root[data-margin-injected="true"] a {
@@ -67,6 +80,40 @@ export const WEBPAGE_INJECTED_CSS = /* css */ `
 
 .margin-trans-root[data-margin-injected="true"] a:hover {
   text-decoration-color: currentColor;
+}
+
+/* Immediate per-block in-progress loading indicator */
+.margin-trans-loading[data-margin-injected="true"] {
+  display: flex !important;
+  align-items: center;
+  gap: 6px;
+  margin-top: 0.42em;
+  margin-bottom: 0.12em;
+  font-family: "Segoe UI Variable", "Segoe UI", "PingFang SC", "Microsoft YaHei", ui-sans-serif, system-ui, sans-serif;
+  font-size: 12px;
+  font-weight: 400;
+  line-height: 1.4;
+  color: #8c5a21;
+  opacity: 0.86;
+  user-select: none;
+  pointer-events: none;
+}
+
+.margin-trans-spinner {
+  display: inline-block;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  border: 1.6px solid rgba(185, 131, 61, 0.28);
+  border-top-color: #b9833d;
+  animation: margin-spin 0.78s linear infinite;
+  flex-shrink: 0;
+}
+
+@keyframes margin-spin {
+  to {
+    transform: rotate(360deg);
+  }
 }
 
 /* Theme: mask (Quiet Paper smooth blur reveal) */
@@ -151,6 +198,122 @@ html[data-margin-mask-revealed="true"] .margin-trans-root[data-margin-theme="mas
   .margin-inline-retry[data-margin-injected="true"] {
     transition: none !important;
   }
+  .margin-trans-spinner {
+    animation: none !important;
+  }
+}
+`;
+
+const PAGE_STATUS_PILL_CSS = /* css */ `
+${SHADOW_HOST_RESET_CSS}
+
+.status-pill {
+  position: fixed;
+  right: 18px;
+  bottom: 18px;
+  z-index: 2147483644;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  max-width: min(420px, calc(100vw - 32px));
+  padding: 6px 12px;
+  background: var(--paper);
+  color: var(--ink);
+  border: 1px solid var(--rule-strong);
+  border-radius: 999px;
+  box-shadow: 0 6px 20px rgba(21, 20, 17, 0.14);
+  font-size: 12.5px;
+  line-height: 18px;
+  pointer-events: auto;
+  user-select: none;
+}
+
+.status-pill[hidden] {
+  display: none !important;
+}
+
+.status-pill[data-tone="error"] {
+  border-color: rgba(188, 76, 62, 0.45);
+}
+
+.spinner {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  border: 1.75px solid var(--rule);
+  border-top-color: var(--accent);
+  animation: status-spin 0.8s linear infinite;
+  flex-shrink: 0;
+}
+
+.spinner[hidden] {
+  display: none !important;
+}
+
+@keyframes status-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.label {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.hint {
+  color: var(--muted);
+  font-size: 11.5px;
+  flex-shrink: 0;
+}
+
+.hint[hidden] {
+  display: none !important;
+}
+
+.action-btn {
+  all: unset;
+  box-sizing: border-box;
+  cursor: pointer;
+  font-size: 11.5px;
+  font-weight: 500;
+  line-height: 16px;
+  padding: 2px 7px;
+  border-radius: 999px;
+  color: var(--link);
+  border: 1px solid var(--rule);
+  background: var(--paper-soft);
+  flex-shrink: 0;
+}
+
+.action-btn:hover {
+  background: var(--state-hover-surface);
+  border-color: var(--rule-strong);
+  color: var(--link-hover);
+}
+
+.action-btn[hidden] {
+  display: none !important;
+}
+
+.close-btn {
+  all: unset;
+  box-sizing: border-box;
+  cursor: pointer;
+  font-size: 13px;
+  line-height: 16px;
+  padding: 0 4px;
+  color: var(--muted);
+  flex-shrink: 0;
+}
+
+.close-btn:hover {
+  color: var(--ink);
+}
+
+.close-btn[hidden] {
+  display: none !important;
 }
 `;
 
@@ -240,27 +403,93 @@ export function packIntoBatches<T extends BatchPackableItem>(
   return batches;
 }
 
+/**
+ * Packs first-viewport items using progressive wave sizing (`[3/800, 5/1600, 10/max]`)
+ * for AI/LLM channels so top-of-screen paragraphs paint 4x-6x faster while saturating
+ * `maxConcurrency: 4` parallel streams.
+ */
+export function packIntoProgressiveBatches<T extends BatchPackableItem>(
+  items: readonly T[],
+  maxBatchCount: number,
+  maxCharsPerBatch: number,
+  useProgressiveWaves = true,
+): T[][] {
+  if (!useProgressiveWaves) {
+    return packIntoBatches(items, maxBatchCount, maxCharsPerBatch);
+  }
+
+  const globalMaxCount = Math.max(1, Math.floor(maxBatchCount || 17));
+  const globalMaxChars = Math.max(64, Math.floor(maxCharsPerBatch || 4096));
+
+  const limitsForBatchIndex = (
+    batchIdx: number,
+  ): { count: number; chars: number } => {
+    if (batchIdx === 0) {
+      return {
+        count: Math.min(3, globalMaxCount),
+        chars: Math.min(800, globalMaxChars),
+      };
+    }
+    if (batchIdx === 1) {
+      return {
+        count: Math.min(5, globalMaxCount),
+        chars: Math.min(1600, globalMaxChars),
+      };
+    }
+    return {
+      count: Math.min(10, globalMaxCount),
+      chars: globalMaxChars,
+    };
+  };
+
+  const batches: T[][] = [];
+  let current: T[] = [];
+  let currentChars = 0;
+  let activeLimits = limitsForBatchIndex(0);
+
+  for (const item of items) {
+    const itemChars = Math.max(1, item.charCount);
+    const wouldOverflowCount = current.length >= activeLimits.count;
+    const wouldOverflowChars =
+      current.length > 0 && currentChars + itemChars > activeLimits.chars;
+
+    if (wouldOverflowCount || wouldOverflowChars) {
+      batches.push(current);
+      current = [];
+      currentChars = 0;
+      activeLimits = limitsForBatchIndex(batches.length);
+    }
+
+    current.push(item);
+    currentChars += itemChars;
+  }
+
+  if (current.length > 0) {
+    batches.push(current);
+  }
+
+  return batches;
+}
+
 export function isDocumentFullscreen(doc: Document = document): boolean {
   const anyDoc = doc as Document & { webkitFullscreenElement?: Element | null };
   return Boolean(doc.fullscreenElement || anyDoc.webkitFullscreenElement);
 }
 
 /**
- * Syncs `data-margin-fullscreen-hidden="true"` across all floating Margin UI hosts
- * whenever `document.fullscreenElement` changes.
+ * Hides or restores floating Shadow hosts (`[data-margin-floating="true"]`) when HTML5
+ * fullscreen video/slideshows activate so popovers never obstruct fullscreen playback.
  */
-export function syncFullscreenFloatingVisibility(doc: Document = document): boolean {
-  const active = isDocumentFullscreen(doc);
-  const hosts = doc.querySelectorAll('[data-margin-floating="true"]');
+export function syncFullscreenFloatingVisibility(doc: Document = document): void {
+  const hidden = isDocumentFullscreen(doc);
+  const hosts = doc.querySelectorAll<HTMLElement>('[data-margin-floating="true"]');
   for (let i = 0; i < hosts.length; i++) {
-    const host = hosts[i];
-    if (active) {
-      host.setAttribute('data-margin-fullscreen-hidden', 'true');
+    if (hidden) {
+      hosts[i].setAttribute('data-margin-fullscreen-hidden', 'true');
     } else {
-      host.removeAttribute('data-margin-fullscreen-hidden');
+      hosts[i].removeAttribute('data-margin-fullscreen-hidden');
     }
   }
-  return active;
 }
 
 export type BatchTransportFn = (
@@ -290,6 +519,19 @@ interface PreparedBlockTask {
 interface MountedBlockMeta {
   plainTextLength: number;
   fallbackPlain: boolean;
+}
+
+function hashGlossaryFingerprint(entries: readonly GlossaryEntry[]): string {
+  if (!entries || entries.length === 0) return '0';
+  let h = 2166136261;
+  for (const e of entries) {
+    const row = `${e.k}=>${e.v}@${e.domain ?? ''}:${e.caseSensitive ? 1 : 0};`;
+    for (let i = 0; i < row.length; i++) {
+      h ^= row.charCodeAt(i);
+      h = Math.imul(h, 16777619);
+    }
+  }
+  return (h >>> 0).toString(36);
 }
 
 let requestSeq = 0;
@@ -330,10 +572,26 @@ export class WebpageRenderer {
   private mutationObserver: MutationObserver | null = null;
   private fullscreenCleanup: (() => void) | null = null;
 
-  private readonly observedBlocks = new WeakSet<HTMLElement>();
+  private observedBlocks = new WeakSet<HTMLElement>();
   private readonly inFlightBlocks = new WeakSet<HTMLElement>();
+  private readonly inFlightBlockSet = new Set<HTMLElement>();
+  private readonly translatedBlockSet = new Set<HTMLElement>();
+  private readonly failedBlockTasks = new Map<HTMLElement, PreparedBlockTask>();
   private readonly mountedMeta = new WeakMap<HTMLElement, MountedBlockMeta>();
   private readonly pendingViewportQueue = new Map<HTMLElement, TranslationScene>();
+
+  private sessionTotalBlocks = 0;
+  private sessionDoneBlocks = 0;
+  private lastError: string | undefined;
+
+  private statusHost: HTMLElement | null = null;
+  private statusPillEl: HTMLElement | null = null;
+  private statusSpinnerEl: HTMLElement | null = null;
+  private statusLabelEl: HTMLElement | null = null;
+  private statusHintEl: HTMLElement | null = null;
+  private statusActionBtn: HTMLButtonElement | null = null;
+  private statusCloseBtn: HTMLButtonElement | null = null;
+  private statusHideTimer: ReturnType<typeof setTimeout> | null = null;
 
   private flushTimer: ReturnType<typeof setTimeout> | null = null;
   private spaMutationTimer: ReturnType<typeof setTimeout> | null = null;
@@ -346,7 +604,9 @@ export class WebpageRenderer {
     this.doc = options.doc ?? document;
     this.getUrl =
       options.getUrl ??
-      (() => this.doc.location?.href || (typeof location !== 'undefined' ? location.href : ''));
+      (() =>
+        this.doc.location?.href ||
+        (typeof location !== 'undefined' ? location.href : ''));
     this.cache = options.cache ?? new LruTranslationCache(DEFAULT_LRU_CAPACITY);
     this.transport = options.transport ?? defaultBatchTransport;
     this.flushDelayMs = options.flushDelayMs ?? 32;
@@ -362,6 +622,25 @@ export class WebpageRenderer {
     return this.maskRevealedGlobally;
   }
 
+  getPageState(): TabPageState {
+    for (const blk of Array.from(this.translatedBlockSet)) {
+      if (!blk.isConnected || !this.hasMountedTranslation(blk)) {
+        this.translatedBlockSet.delete(blk);
+      }
+    }
+    return {
+      active: this.active,
+      inFlightBlocks: this.inFlightBlockSet.size + this.pendingViewportQueue.size,
+      translatedBlocks: this.translatedBlockSet.size,
+      maskRevealed: this.maskRevealedGlobally,
+      ...(this.lastError ? { lastError: this.lastError } : {}),
+    };
+  }
+
+  clearCache(): void {
+    this.cache.clear();
+  }
+
   private runInternalDomMutation<T>(fn: () => T): T {
     this.internalDomDepth += 1;
     try {
@@ -371,30 +650,29 @@ export class WebpageRenderer {
     }
   }
 
-  private ensureStylesInjected(): void {
+  private bindFullscreenListener(): void {
+    if (this.fullscreenCleanup) return;
+    const onFsChange = () => syncFullscreenFloatingVisibility(this.doc);
+    this.doc.addEventListener('fullscreenchange', onFsChange);
+    this.doc.addEventListener('webkitfullscreenchange', onFsChange);
+    this.fullscreenCleanup = () => {
+      this.doc.removeEventListener('fullscreenchange', onFsChange);
+      this.doc.removeEventListener('webkitfullscreenchange', onFsChange);
+    };
+  }
+
+  ensureStylesInjected(): void {
     if (this.doc.getElementById(STYLE_ELEMENT_ID)) return;
-    const parent = this.doc.head || this.doc.documentElement || this.doc.body;
-    if (!parent) return;
+    const targetParent = this.doc.head ?? this.doc.documentElement;
+    if (!targetParent) return;
+
     this.runInternalDomMutation(() => {
       const style = this.doc.createElement('style');
       style.id = STYLE_ELEMENT_ID;
       style.setAttribute('data-margin-injected', 'true');
       style.textContent = WEBPAGE_INJECTED_CSS;
-      parent.appendChild(style);
+      targetParent.appendChild(style);
     });
-  }
-
-  private bindFullscreenListener(): void {
-    const handler = () => {
-      syncFullscreenFloatingVisibility(this.doc);
-    };
-    this.doc.addEventListener('fullscreenchange', handler);
-    this.doc.addEventListener('webkitfullscreenchange', handler);
-    syncFullscreenFloatingVisibility(this.doc);
-    this.fullscreenCleanup = () => {
-      this.doc.removeEventListener('fullscreenchange', handler);
-      this.doc.removeEventListener('webkitfullscreenchange', handler);
-    };
   }
 
   resolveEffectiveTheme(): TranslationTheme {
@@ -406,15 +684,19 @@ export class WebpageRenderer {
   }
 
   private computeLayoutMode(
+    blockEl: HTMLElement | null,
     plainTextLength: number,
     displayMode: DisplayMode = this.config.webpage.displayMode,
   ): 'inline' | 'block' | 'replace' {
     if (displayMode === 'target-only') {
       return 'replace';
     }
-    const maxInline = this.config.webpage.lineBreakMaxTextCount;
-    if (maxInline > 0 && plainTextLength <= maxInline) {
-      return 'inline';
+    const tag = blockEl?.tagName.toUpperCase() ?? 'P';
+    if (INLINE_SHORT_CELL_TAGS.has(tag) && plainTextLength <= 20) {
+      const text = blockEl?.textContent ?? '';
+      if (!/[\n.!?。！？]/.test(text)) {
+        return 'inline';
+      }
     }
     return 'block';
   }
@@ -429,11 +711,22 @@ export class WebpageRenderer {
       this.config.routing,
       this.config.providers,
     );
-    const model = this.config.providers[providerId]?.model ?? '';
-    return `${providerId}:${model}:${this.config.targetLang}:${enableRichHtml ? '1' : '0'}:${tokenizedText}`;
+    const provider = this.config.providers[providerId];
+    const model = provider?.model ?? '';
+    const assistantId = provider?.assistantId ?? '';
+    const glossaryFp = hashGlossaryFingerprint(this.config.glossary);
+    return `${providerId}:${model}:${assistantId}:${this.config.sourceLang}->${this.config.targetLang}:${enableRichHtml ? '1' : '0'}:${glossaryFp}:${tokenizedText}`;
   }
 
   private getPageContext(scene: TranslationScene): PageContextPayload | undefined {
+    const currentUrl = this.getUrl();
+    let domain = '';
+    try {
+      domain = currentUrl ? new URL(currentUrl).hostname : '';
+    } catch {
+      domain = '';
+    }
+
     const providerId = resolveProviderIdForScene(
       scene,
       this.config.routing,
@@ -441,21 +734,27 @@ export class WebpageRenderer {
     );
     const provider = this.config.providers[providerId];
     if (provider && !provider.enableContext) {
-      return undefined;
+      return currentUrl || domain ? { url: currentUrl, domain } : undefined;
     }
-    const currentUrl = this.getUrl();
+
     if (this.pageContextCache && this.pageContextCache.url === currentUrl) {
       return this.pageContextCache.payload;
     }
     const extracted = extractPageContext(this.doc);
-    this.pageContextCache = { url: currentUrl, payload: extracted };
-    return extracted;
+    const payload: PageContextPayload = {
+      ...extracted,
+      url: currentUrl || extracted.url,
+      domain: domain || extracted.domain,
+    };
+    this.pageContextCache = { url: currentUrl, payload };
+    return payload;
   }
 
   private resolveBatchLimits(scene: TranslationScene): {
     maxBatchCount: number;
     maxCharsPerBatch: number;
     preferStream: boolean;
+    useProgressiveWaves: boolean;
     providerId: string;
   } {
     const providerId = resolveProviderIdForScene(
@@ -473,11 +772,15 @@ export class WebpageRenderer {
     const maxCharsPerBatch =
       provider?.maxCharsPerBatch ?? assistant?.maxCharsPerBatch ?? 4096;
     const preferStream = provider ? provider.stream !== 'off' : false;
+    const useProgressiveWaves =
+      provider?.protocol === 'openai-chat' ||
+      provider?.protocol === 'anthropic-messages';
 
     return {
       maxBatchCount,
       maxCharsPerBatch,
       preferStream,
+      useProgressiveWaves,
       providerId,
     };
   }
@@ -495,14 +798,244 @@ export class WebpageRenderer {
     return false;
   }
 
+  private insertInjectedIntoBlock(blockEl: HTMLElement, node: Element): void {
+    const firstNestedBlock = findFirstDirectBlockBoundaryChild(blockEl);
+    if (firstNestedBlock && firstNestedBlock.parentElement === blockEl) {
+      blockEl.insertBefore(node, firstNestedBlock);
+    } else {
+      blockEl.appendChild(node);
+    }
+  }
+
+  private mountBlockLoadingIndicator(blockEl: HTMLElement): void {
+    if (!blockEl.isConnected || this.hasMountedTranslation(blockEl)) return;
+    for (let i = 0; i < blockEl.children.length; i++) {
+      if (blockEl.children[i].classList.contains('margin-trans-loading')) {
+        return;
+      }
+    }
+
+    this.ensureStylesInjected();
+    this.runInternalDomMutation(() => {
+      const loading = this.doc.createElement('span');
+      loading.className = 'margin-trans-loading';
+      loading.setAttribute('data-margin-injected', 'true');
+      loading.setAttribute('role', 'status');
+
+      const spinner = this.doc.createElement('span');
+      spinner.className = 'margin-trans-spinner';
+      spinner.setAttribute('aria-hidden', 'true');
+
+      const label = this.doc.createElement('span');
+      label.className = 'margin-trans-loading-label';
+      label.textContent =
+        this.config.interfaceLang === 'en' ? 'Translating…' : '正在翻译…';
+
+      loading.append(spinner, label);
+      this.insertInjectedIntoBlock(blockEl, loading);
+    });
+  }
+
+  private ensureStatusPillMounted(): void {
+    if (this.statusHost?.isConnected && this.statusPillEl) return;
+    const mountParent = this.doc.body ?? this.doc.documentElement;
+    if (!mountParent) return;
+
+    this.runInternalDomMutation(() => {
+      const host = this.doc.createElement('div');
+      host.setAttribute('data-margin-host', 'page-status');
+      host.setAttribute('data-margin-floating', 'true');
+      host.setAttribute('data-display-mode', this.config.uiColorMode);
+      host.hidden = true;
+
+      const shadow = host.attachShadow({ mode: 'open' });
+      const style = this.doc.createElement('style');
+      style.textContent = PAGE_STATUS_PILL_CSS;
+
+      const pill = this.doc.createElement('div');
+      pill.className = 'status-pill';
+      pill.setAttribute('role', 'status');
+      pill.setAttribute('aria-live', 'polite');
+      pill.hidden = true;
+
+      const spinner = this.doc.createElement('span');
+      spinner.className = 'spinner';
+      spinner.setAttribute('aria-hidden', 'true');
+
+      const label = this.doc.createElement('span');
+      label.className = 'label';
+
+      const hint = this.doc.createElement('span');
+      hint.className = 'hint';
+      hint.hidden = true;
+
+      const actionBtn = this.doc.createElement('button');
+      actionBtn.type = 'button';
+      actionBtn.className = 'action-btn';
+      actionBtn.addEventListener('click', (ev) => {
+        ev.preventDefault();
+        ev.stopPropagation();
+        const action = actionBtn.dataset.action;
+        if (action === 'stop') {
+          this.restorePage();
+        } else if (action === 'retry-failed') {
+          const failed = Array.from(this.failedBlockTasks.values());
+          this.failedBlockTasks.clear();
+          this.lastError = undefined;
+          if (failed.length > 0) {
+            for (const task of failed) {
+              this.clearBlockInjectedElements(task.block);
+              this.mountBlockLoadingIndicator(task.block);
+            }
+            this.sessionTotalBlocks += failed.length;
+            this.refreshStatusPill();
+            void this.executeBatch(failed);
+          }
+        }
+      });
+
+      const closeBtn = this.doc.createElement('button');
+      closeBtn.type = 'button';
+      closeBtn.className = 'close-btn';
+      closeBtn.textContent = '×';
+      closeBtn.setAttribute('aria-label', 'Dismiss');
+      closeBtn.addEventListener('click', (ev) => {
+        ev.preventDefault();
+        ev.stopPropagation();
+        this.hideStatusPill();
+      });
+
+      pill.append(spinner, label, hint, actionBtn, closeBtn);
+      shadow.append(style, pill);
+      mountParent.appendChild(host);
+
+      this.statusHost = host;
+      this.statusPillEl = pill;
+      this.statusSpinnerEl = spinner;
+      this.statusLabelEl = label;
+      this.statusHintEl = hint;
+      this.statusActionBtn = actionBtn;
+      this.statusCloseBtn = closeBtn;
+      syncFullscreenFloatingVisibility(this.doc);
+    });
+  }
+
+  private clearStatusHideTimer(): void {
+    if (this.statusHideTimer !== null) {
+      clearTimeout(this.statusHideTimer);
+      this.statusHideTimer = null;
+    }
+  }
+
+  private hideStatusPill(): void {
+    this.clearStatusHideTimer();
+    if (this.statusPillEl) {
+      this.statusPillEl.hidden = true;
+    }
+    if (this.statusHost) {
+      this.statusHost.hidden = true;
+    }
+  }
+
+  private refreshStatusPill(): void {
+    if (!this.active) {
+      this.hideStatusPill();
+      return;
+    }
+
+    this.ensureStatusPillMounted();
+    if (
+      !this.statusHost ||
+      !this.statusPillEl ||
+      !this.statusSpinnerEl ||
+      !this.statusLabelEl ||
+      !this.statusHintEl ||
+      !this.statusActionBtn ||
+      !this.statusCloseBtn
+    ) {
+      return;
+    }
+
+    this.statusHost.setAttribute('data-display-mode', this.config.uiColorMode);
+    const isEn = this.config.interfaceLang === 'en';
+    const inFlight = this.inFlightBlockSet.size + this.pendingViewportQueue.size;
+    const effectiveTheme = this.resolveEffectiveTheme();
+
+    if (inFlight > 0) {
+      this.clearStatusHideTimer();
+      const total = Math.max(this.sessionTotalBlocks, this.sessionDoneBlocks + inFlight);
+      this.statusPillEl.dataset.tone = 'progress';
+      this.statusSpinnerEl.hidden = false;
+      this.statusLabelEl.textContent = isEn
+        ? `Margin · Translating (${this.sessionDoneBlocks}/${total})`
+        : `Margin · 正在翻译 (${this.sessionDoneBlocks}/${total})`;
+      if (effectiveTheme === 'mask') {
+        this.statusHintEl.textContent = isEn ? '(Mask on)' : '(遮罩模式)';
+        this.statusHintEl.hidden = false;
+      } else {
+        this.statusHintEl.hidden = true;
+      }
+      this.statusActionBtn.dataset.action = 'stop';
+      this.statusActionBtn.textContent = isEn ? 'Stop' : '停止';
+      this.statusActionBtn.hidden = false;
+      this.statusCloseBtn.hidden = true;
+      this.statusPillEl.hidden = false;
+      this.statusHost.hidden = false;
+      return;
+    }
+
+    if (this.failedBlockTasks.size > 0 && this.lastError) {
+      this.clearStatusHideTimer();
+      const shortErr =
+        this.lastError.length > 36
+          ? `${this.lastError.slice(0, 36)}…`
+          : this.lastError;
+      this.statusPillEl.dataset.tone = 'error';
+      this.statusSpinnerEl.hidden = true;
+      this.statusLabelEl.textContent = isEn
+        ? `Margin · Error: ${shortErr}`
+        : `Margin · 翻译受阻：${shortErr}`;
+      this.statusHintEl.hidden = true;
+      this.statusActionBtn.dataset.action = 'retry-failed';
+      this.statusActionBtn.textContent = isEn ? 'Retry' : '重试失败段落';
+      this.statusActionBtn.hidden = false;
+      this.statusCloseBtn.hidden = false;
+      this.statusPillEl.hidden = false;
+      this.statusHost.hidden = false;
+      return;
+    }
+
+    if (this.sessionDoneBlocks > 0) {
+      this.clearStatusHideTimer();
+      this.statusPillEl.dataset.tone = 'done';
+      this.statusSpinnerEl.hidden = true;
+      this.statusLabelEl.textContent = isEn ? '✓ Translation complete' : '✓ 翻译完成';
+      this.statusHintEl.hidden = effectiveTheme !== 'mask';
+      if (effectiveTheme === 'mask') {
+        this.statusHintEl.textContent = isEn ? '(Hover to reveal)' : '(悬停查看遮罩)';
+      }
+      this.statusActionBtn.hidden = true;
+      this.statusCloseBtn.hidden = true;
+      this.statusPillEl.hidden = false;
+      this.statusHost.hidden = false;
+      this.statusHideTimer = setTimeout(() => {
+        this.statusHideTimer = null;
+        this.hideStatusPill();
+      }, 1200);
+      return;
+    }
+
+    this.hideStatusPill();
+  }
+
   private wrapOriginalContentForTargetOnly(blockEl: HTMLElement): void {
-    // Check if already wrapped
     for (let i = 0; i < blockEl.children.length; i++) {
       if (blockEl.children[i].getAttribute('data-margin-orig-wrap') === 'true') {
         return;
       }
     }
 
+    const firstNestedBlock = findFirstDirectBlockBoundaryChild(blockEl);
     const wrapper = this.doc.createElement('span');
     wrapper.className = 'margin-orig-source';
     wrapper.setAttribute('data-margin-orig-wrap', 'true');
@@ -512,6 +1045,9 @@ export class WebpageRenderer {
     const nodesToMove: ChildNode[] = [];
     for (let i = 0; i < blockEl.childNodes.length; i++) {
       const child = blockEl.childNodes[i];
+      if (child === firstNestedBlock) {
+        break;
+      }
       if (
         child.nodeType === Node.ELEMENT_NODE &&
         (child as Element).hasAttribute('data-margin-injected')
@@ -520,6 +1056,8 @@ export class WebpageRenderer {
       }
       nodesToMove.push(child);
     }
+
+    if (nodesToMove.length === 0) return;
 
     for (const node of nodesToMove) {
       wrapper.appendChild(node);
@@ -563,6 +1101,7 @@ export class WebpageRenderer {
       this.unwrapOriginalContent(blockEl);
       blockEl.removeAttribute('data-margin-translated');
       this.mountedMeta.delete(blockEl);
+      this.translatedBlockSet.delete(blockEl);
     });
   }
 
@@ -578,7 +1117,11 @@ export class WebpageRenderer {
       ? 'bilingual'
       : this.config.webpage.displayMode;
     const theme = this.resolveEffectiveTheme();
-    const layout = this.computeLayoutMode(tokenized.plainTextLength, displayMode);
+    const layout = this.computeLayoutMode(
+      blockEl,
+      tokenized.plainTextLength,
+      displayMode,
+    );
 
     this.runInternalDomMutation(() => {
       this.clearBlockInjectedElements(blockEl);
@@ -599,7 +1142,6 @@ export class WebpageRenderer {
       }
       span.appendChild(reconstructed.fragment);
 
-      // Allow clicking a masked span directly to toggle individual reveal without breaking links
       span.addEventListener('click', (ev) => {
         if (span.getAttribute('data-margin-theme') !== 'mask') return;
         const target = ev.target as Element | null;
@@ -613,12 +1155,14 @@ export class WebpageRenderer {
         }
       });
 
-      blockEl.appendChild(span);
+      this.insertInjectedIntoBlock(blockEl, span);
       blockEl.setAttribute('data-margin-translated', 'true');
       this.mountedMeta.set(blockEl, {
         plainTextLength: tokenized.plainTextLength,
         fallbackPlain: reconstructed.fallbackPlain,
       });
+      this.translatedBlockSet.add(blockEl);
+      this.failedBlockTasks.delete(blockEl);
     });
 
     return { fallbackPlain: reconstructed.fallbackPlain };
@@ -630,33 +1174,31 @@ export class WebpageRenderer {
     options: { forceBilingual?: boolean } = {},
   ): void {
     this.ensureStylesInjected();
+    if (errorMessage) {
+      this.lastError = errorMessage;
+    }
+
     this.runInternalDomMutation(() => {
       const retryBatch = () => {
-        // Clear retry buttons ONLY on this failed batch, never wiping translated siblings!
         this.runInternalDomMutation(() => {
           for (const t of batchTasks) {
-            for (let i = t.block.children.length - 1; i >= 0; i--) {
-              const child = t.block.children[i];
-              if (child.classList.contains('margin-inline-retry')) {
-                child.remove();
-              }
-            }
+            this.failedBlockTasks.delete(t.block);
+            this.clearBlockInjectedElements(t.block);
+            this.mountBlockLoadingIndicator(t.block);
           }
         });
+        this.sessionTotalBlocks += batchTasks.length;
+        this.refreshStatusPill();
         void this.executeBatch(batchTasks, options);
       };
 
       for (const task of batchTasks) {
+        this.observedBlocks.delete(task.block);
         if (!task.block.isConnected || this.hasMountedTranslation(task.block)) {
           continue;
         }
-        // Remove any prior retry button on this block
-        for (let i = task.block.children.length - 1; i >= 0; i--) {
-          const child = task.block.children[i];
-          if (child.classList.contains('margin-inline-retry')) {
-            child.remove();
-          }
-        }
+        this.clearBlockInjectedElements(task.block);
+        this.failedBlockTasks.set(task.block, task);
 
         const btn = this.doc.createElement('button');
         btn.type = 'button';
@@ -672,7 +1214,7 @@ export class WebpageRenderer {
           ev.stopPropagation();
           retryBatch();
         });
-        task.block.appendChild(btn);
+        this.insertInjectedIntoBlock(task.block, btn);
       }
     });
   }
@@ -709,10 +1251,15 @@ export class WebpageRenderer {
 
     for (const task of batchTasks) {
       this.inFlightBlocks.add(task.block);
+      this.inFlightBlockSet.add(task.block);
+      this.mountBlockLoadingIndicator(task.block);
+    }
+    if (scene === 'webpage') {
+      this.refreshStatusPill();
     }
 
     const slotMap = new Map<number, PreparedBlockTask>();
-    const renderedSlots = new Set<number>();
+    const renderedTransBySlot = new Map<number, string>();
 
     const requestItems = batchTasks.map((task, idx) => {
       const id = idx + 1;
@@ -737,10 +1284,17 @@ export class WebpageRenderer {
     const applyOutputItem = (item: BatchItemOutput) => {
       if (abortController.signal.aborted) return;
       const task = slotMap.get(item.id);
-      if (!task || renderedSlots.has(item.id)) return;
+      if (!task) return;
       if (typeof item.trans !== 'string' || !item.trans.trim()) return;
 
-      renderedSlots.add(item.id);
+      const prevTrans = renderedTransBySlot.get(item.id);
+      if (prevTrans !== undefined && prevTrans === item.trans) {
+        return;
+      }
+
+      const isFirstRenderForSlot = prevTrans === undefined;
+      renderedTransBySlot.set(item.id, item.trans);
+
       const { fallbackPlain } = this.mountBlockTranslation(
         task.block,
         task.tokenized,
@@ -751,6 +1305,12 @@ export class WebpageRenderer {
         trans: item.trans,
         fallbackPlain: item.fallbackPlain || fallbackPlain,
       });
+
+      if (isFirstRenderForSlot && scene === 'webpage') {
+        this.sessionDoneBlocks += 1;
+        this.inFlightBlockSet.delete(task.block);
+        this.refreshStatusPill();
+      }
     };
 
     try {
@@ -769,7 +1329,7 @@ export class WebpageRenderer {
 
       if (!response.ok) {
         const unrendered = batchTasks.filter(
-          (_, idx) => !renderedSlots.has(idx + 1),
+          (_, idx) => !renderedTransBySlot.has(idx + 1),
         );
         this.mountBatchRetryButtons(
           unrendered,
@@ -784,7 +1344,7 @@ export class WebpageRenderer {
       }
 
       const missingTasks = batchTasks.filter(
-        (_, idx) => !renderedSlots.has(idx + 1),
+        (_, idx) => !renderedTransBySlot.has(idx + 1),
       );
       if (missingTasks.length > 0) {
         this.mountBatchRetryButtons(
@@ -794,23 +1354,67 @@ export class WebpageRenderer {
         );
       }
     } catch (err) {
-      if (abortController.signal.aborted) return;
+      if (abortController.signal.aborted) {
+        for (const task of batchTasks) {
+          if (!renderedTransBySlot.has(
+            requestItems.find((it) => slotMap.get(it.id) === task)?.id ?? -1,
+          )) {
+            this.observedBlocks.delete(task.block);
+            if (!this.hasMountedTranslation(task.block)) {
+              this.clearBlockInjectedElements(task.block);
+            }
+          }
+        }
+        return;
+      }
       const msg = err instanceof Error ? err.message : String(err);
       const unrendered = batchTasks.filter(
-        (_, idx) => !renderedSlots.has(idx + 1),
+        (_, idx) => !renderedTransBySlot.has(idx + 1),
       );
       this.mountBatchRetryButtons(unrendered, msg, options);
     } finally {
       this.activeControllers.delete(abortController);
       for (const task of batchTasks) {
         this.inFlightBlocks.delete(task.block);
+        this.inFlightBlockSet.delete(task.block);
+      }
+      if (scene === 'webpage') {
+        this.refreshStatusPill();
       }
     }
   }
 
+  private sortMissesByViewportPriority(
+    misses: PreparedBlockTask[],
+  ): PreparedBlockTask[] {
+    if (misses.length <= 3) return misses;
+    const win = this.doc.defaultView;
+    const vh = win?.innerHeight || 900;
+
+    const strictlyVisible: PreparedBlockTask[] = [];
+    const nearViewport: PreparedBlockTask[] = [];
+
+    for (const item of misses) {
+      try {
+        const rect = item.block.getBoundingClientRect();
+        if (rect.height > 0 && rect.bottom > 0 && rect.top < vh) {
+          strictlyVisible.push(item);
+        } else {
+          nearViewport.push(item);
+        }
+      } catch {
+        strictlyVisible.push(item);
+      }
+    }
+
+    return strictlyVisible.length > 0
+      ? [...strictlyVisible, ...nearViewport]
+      : misses;
+  }
+
   /**
    * Translates an explicit list of paragraph blocks immediately (checking LRU cache first,
-   * then packing misses into bounded batches).
+   * then packing misses into progressive wave micro-batches).
    */
   async translateBlocks(
     blocks: readonly HTMLElement[],
@@ -842,10 +1446,33 @@ export class WebpageRenderer {
       misses.push(prepared);
     }
 
-    if (misses.length === 0) return;
+    if (misses.length === 0) {
+      if (scene === 'webpage') {
+        this.refreshStatusPill();
+      }
+      return;
+    }
 
-    const { maxBatchCount, maxCharsPerBatch } = this.resolveBatchLimits(scene);
-    const batches = packIntoBatches(misses, maxBatchCount, maxCharsPerBatch);
+    const prioritized =
+      scene === 'webpage' ? this.sortMissesByViewportPriority(misses) : misses;
+
+    for (const m of prioritized) {
+      this.mountBlockLoadingIndicator(m.block);
+    }
+
+    if (scene === 'webpage') {
+      this.sessionTotalBlocks += prioritized.length;
+      this.refreshStatusPill();
+    }
+
+    const { maxBatchCount, maxCharsPerBatch, useProgressiveWaves } =
+      this.resolveBatchLimits(scene);
+    const batches = packIntoProgressiveBatches(
+      prioritized,
+      maxBatchCount,
+      maxCharsPerBatch,
+      scene === 'webpage' && useProgressiveWaves,
+    );
     await Promise.all(
       batches.map((batch) => this.executeBatch(batch, options)),
     );
@@ -896,10 +1523,12 @@ export class WebpageRenderer {
             !this.inFlightBlocks.has(target)
           ) {
             this.pendingViewportQueue.set(target, 'webpage');
+            this.mountBlockLoadingIndicator(target);
             added = true;
           }
         }
         if (added) {
+          this.refreshStatusPill();
           this.scheduleFlushViewportQueue();
         }
       },
@@ -912,13 +1541,26 @@ export class WebpageRenderer {
     return this.intersectionObserver;
   }
 
+  private isImmediatelyInOrNearViewport(block: HTMLElement): boolean {
+    const win =
+      this.doc.defaultView ?? (typeof window !== 'undefined' ? window : null);
+    const vh =
+      win?.innerHeight || this.doc.documentElement?.clientHeight || 800;
+    try {
+      const rect = block.getBoundingClientRect();
+      return rect.bottom >= -180 && rect.top <= vh + 260;
+    } catch {
+      return true;
+    }
+  }
+
   private registerBlocksForViewport(blocks: readonly HTMLElement[]): void {
     const missesForObserver: HTMLElement[] = [];
+    let queuedImmediate = false;
 
     for (const block of blocks) {
       if (!block.isConnected || this.hasMountedTranslation(block)) continue;
 
-      // Instant zero-API re-attachment if already in 2000-entry LRU cache!
       const prepared = this.prepareBlockTask(block, 'webpage');
       if (!prepared) continue;
       const cached = this.cache.get(prepared.cacheKey);
@@ -931,7 +1573,19 @@ export class WebpageRenderer {
         continue;
       }
 
-      missesForObserver.push(block);
+      if (this.isImmediatelyInOrNearViewport(block)) {
+        this.observedBlocks.add(block);
+        this.pendingViewportQueue.set(block, 'webpage');
+        this.mountBlockLoadingIndicator(block);
+        queuedImmediate = true;
+      } else {
+        missesForObserver.push(block);
+      }
+    }
+
+    if (queuedImmediate) {
+      this.refreshStatusPill();
+      this.scheduleFlushViewportQueue();
     }
 
     if (missesForObserver.length === 0) return;
@@ -953,19 +1607,14 @@ export class WebpageRenderer {
     const el = node as Element;
     return (
       el.hasAttribute('data-margin-injected') ||
-      el.hasAttribute('data-margin-orig-wrap') ||
       el.hasAttribute('data-margin-host') ||
-      Boolean(
-        el.closest?.(
-          '[data-margin-injected], [data-margin-orig-wrap], [data-margin-host]',
-        ),
-      )
+      el.getAttribute('data-margin-orig-wrap') === 'true'
     );
   }
 
   private ensureSpaMutationObserver(): void {
     if (this.mutationObserver || typeof MutationObserver === 'undefined') return;
-    const root = this.doc.body || this.doc.documentElement;
+    const root = this.doc.body;
     if (!root) return;
 
     this.mutationObserver = new MutationObserver((mutations) => {
@@ -1002,7 +1651,9 @@ export class WebpageRenderer {
             const discovered = new Set<HTMLElement>();
             for (const r of roots) {
               if (r instanceof Node && !r.isConnected) continue;
-              for (const blk of extractParagraphBlocks(r)) {
+              for (const blk of extractParagraphBlocks(r, {
+                targetLang: this.config.targetLang,
+              })) {
                 discovered.add(blk);
               }
             }
@@ -1025,8 +1676,13 @@ export class WebpageRenderer {
    */
   enablePageTranslation(): void {
     this.active = true;
+    this.lastError = undefined;
+    this.sessionTotalBlocks = 0;
+    this.sessionDoneBlocks = 0;
     this.ensureStylesInjected();
-    const blocks = extractParagraphBlocks(this.doc.body);
+    const blocks = extractParagraphBlocks(this.doc.body, {
+      targetLang: this.config.targetLang,
+    });
     this.registerBlocksForViewport(blocks);
     this.ensureSpaMutationObserver();
   }
@@ -1036,9 +1692,14 @@ export class WebpageRenderer {
    */
   async translateWholePage(): Promise<void> {
     this.active = true;
+    this.lastError = undefined;
+    this.sessionTotalBlocks = 0;
+    this.sessionDoneBlocks = 0;
     this.ensureStylesInjected();
     this.ensureSpaMutationObserver();
-    const blocks = extractParagraphBlocks(this.doc.body);
+    const blocks = extractParagraphBlocks(this.doc.body, {
+      targetLang: this.config.targetLang,
+    });
     await this.translateBlocks(blocks, 'webpage');
   }
 
@@ -1060,47 +1721,51 @@ export class WebpageRenderer {
     this.pendingViewportQueue.clear();
     this.pendingSpaRoots.clear();
 
-    for (const ctrl of this.activeControllers) {
+    this.intersectionObserver?.disconnect();
+    this.intersectionObserver = null;
+
+    this.mutationObserver?.disconnect();
+    this.mutationObserver = null;
+
+    // Reset observedBlocks so re-enabling page translation or switching language re-observes cleanly!
+    this.observedBlocks = new WeakSet<HTMLElement>();
+
+    for (const ctrl of Array.from(this.activeControllers)) {
       ctrl.abort();
     }
     this.activeControllers.clear();
-
-    if (this.intersectionObserver) {
-      this.intersectionObserver.disconnect();
-      this.intersectionObserver = null;
-    }
-    if (this.mutationObserver) {
-      this.mutationObserver.disconnect();
-      this.mutationObserver = null;
-    }
+    this.inFlightBlockSet.clear();
+    this.translatedBlockSet.clear();
+    this.failedBlockTasks.clear();
+    this.sessionTotalBlocks = 0;
+    this.sessionDoneBlocks = 0;
+    this.lastError = undefined;
+    this.hideStatusPill();
 
     this.runInternalDomMutation(() => {
-      // Unwrap all reversible target-only wrappers back to exact original DOM nodes
-      const wrappers = Array.from(
-        this.doc.querySelectorAll('[data-margin-orig-wrap="true"]'),
+      const injectedNodes = Array.from(
+        this.doc.querySelectorAll('[data-margin-injected="true"]'),
       );
-      for (const wrapper of wrappers) {
-        const parent = wrapper.parentElement;
-        if (parent) {
-          while (wrapper.firstChild) {
-            parent.insertBefore(wrapper.firstChild, wrapper);
-          }
-        }
-        wrapper.remove();
-      }
-
-      // Remove all injected translation spans and retry buttons (keep stylesheet cached or remove cleanly)
-      const injected = Array.from(
-        this.doc.querySelectorAll(
-          '[data-margin-injected="true"]:not(#margin-webpage-styles)',
-        ),
-      );
-      for (const node of injected) {
+      for (const node of injectedNodes) {
+        if (node.id === STYLE_ELEMENT_ID) continue;
         node.remove();
       }
 
+      const wrappedBlocks = new Set<HTMLElement>();
+      const wrappers = Array.from(
+        this.doc.querySelectorAll('[data-margin-orig-wrap="true"]'),
+      );
+      for (const w of wrappers) {
+        if (w.parentElement instanceof HTMLElement) {
+          wrappedBlocks.add(w.parentElement);
+        }
+      }
+      for (const blk of wrappedBlocks) {
+        this.unwrapOriginalContent(blk);
+      }
+
       const markedBlocks = Array.from(
-        this.doc.querySelectorAll('[data-margin-translated="true"]'),
+        this.doc.querySelectorAll<HTMLElement>('[data-margin-translated="true"]'),
       );
       for (const blk of markedBlocks) {
         blk.removeAttribute('data-margin-translated');
@@ -1138,13 +1803,52 @@ export class WebpageRenderer {
     return this.maskRevealedGlobally;
   }
 
+  private computeTranslationConfigSignature(cfg: MarginConfig): string {
+    const providerId = resolveProviderIdForScene(
+      'webpage',
+      cfg.routing,
+      cfg.providers,
+    );
+    const provider = cfg.providers[providerId];
+    const assistant = provider?.assistantId
+      ? cfg.assistants[provider.assistantId]
+      : undefined;
+    return JSON.stringify([
+      cfg.sourceLang,
+      cfg.targetLang,
+      cfg.webpage.enableRichHtml,
+      providerId,
+      provider?.model ?? '',
+      provider?.assistantId ?? '',
+      assistant?.codec ?? '',
+      assistant?.systemPrompt ?? '',
+      assistant?.prompt ?? '',
+      assistant?.multiplePrompt ?? '',
+      hashGlossaryFingerprint(cfg.glossary),
+    ]);
+  }
+
   /**
-   * Applies live configuration changes (`theme`, `displayMode`, `lineBreakMaxTextCount`)
-   * onto already-rendered DOM nodes immediately without reloading or re-requesting APIs.
+   * Applies live configuration changes:
+   * - If `targetLang`, `sourceLang`, active provider/model/assistant, or glossary changed while
+   *   page translation is active, cleanly restores and re-runs `enablePageTranslation()`.
+   * - Otherwise updates `theme`, `displayMode`, and `uiColorMode` in place with zero API calls.
    */
   updateConfig(nextConfig: MarginConfig): void {
+    const prevSig = this.computeTranslationConfigSignature(this.config);
+    const nextSig = this.computeTranslationConfigSignature(nextConfig);
     const prevDisplayMode = this.config.webpage.displayMode;
     this.config = nextConfig;
+
+    if (this.statusHost) {
+      this.statusHost.setAttribute('data-display-mode', nextConfig.uiColorMode);
+    }
+
+    if (this.active && prevSig !== nextSig) {
+      this.restorePage();
+      this.enablePageTranslation();
+      return;
+    }
 
     const effectiveTheme = this.resolveEffectiveTheme();
     const newDisplayMode = nextConfig.webpage.displayMode;
@@ -1172,7 +1876,7 @@ export class WebpageRenderer {
         const plainLen = meta?.plainTextLength ?? (span.textContent?.length ?? 0);
         span.setAttribute(
           'data-margin-layout',
-          this.computeLayoutMode(plainLen, newDisplayMode),
+          this.computeLayoutMode(parentBlock, plainLen, newDisplayMode),
         );
       }
     });
@@ -1180,6 +1884,15 @@ export class WebpageRenderer {
 
   destroy(): void {
     this.restorePage();
+    this.clearStatusHideTimer();
+    this.statusHost?.remove();
+    this.statusHost = null;
+    this.statusPillEl = null;
+    this.statusSpinnerEl = null;
+    this.statusLabelEl = null;
+    this.statusHintEl = null;
+    this.statusActionBtn = null;
+    this.statusCloseBtn = null;
     this.fullscreenCleanup?.();
     this.fullscreenCleanup = null;
     this.doc.getElementById(STYLE_ELEMENT_ID)?.remove();

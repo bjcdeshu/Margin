@@ -710,6 +710,16 @@ describe('YouTube Bilingual Document PiP & Guardrail 2 Fallback', () => {
     expect(translateSpy).toHaveBeenCalledTimes(1);
     expect(isolatedCtrl.getCues()[0]?.trans).toBe('保持好奇');
 
+    // Verify YouTube Native default preset (100% original / 70% translation) & compact 36px control buttons
+    const overlayHost = document.getElementById(SUBTITLE_OVERLAY_HOST_ID);
+    const wrap = overlayHost?.shadowRoot?.getElementById('margin-sub-wrap');
+    expect(wrap?.dataset.stylePreset).toBe('youtube-native');
+    expect(wrap?.style.getPropertyValue('--margin-sub-orig-scale')).toBe('1.000');
+
+    const pipBtn = document.getElementById(PIP_BUTTON_ID) as HTMLButtonElement;
+    expect(pipBtn.style.width).toBe('36px');
+    expect(pipBtn.querySelector('svg')?.style.width).toBe('22px');
+
     isolatedCtrl.destroy();
     mainCtrl.destroy();
   });

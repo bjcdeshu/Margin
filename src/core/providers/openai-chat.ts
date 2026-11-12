@@ -1,5 +1,10 @@
 import type { ProviderConfig } from '@shared/types';
 import { readSseStream } from './sse';
+import {
+  DEFAULT_AI_CONNECT_TIMEOUT_MS,
+  DEFAULT_SSE_IDLE_TIMEOUT_MS,
+  createLinkedTimeoutScope,
+} from './timeout';
 import { type AiCompletionRequestParams, ProviderHttpError } from './types';
 
 function extractOpenAiContentString(content: unknown): string {
@@ -150,6 +155,8 @@ export async function executeOpenAiChatCall(
     stream,
     onDelta,
     fetchImpl,
+    requestTimeoutMs = DEFAULT_AI_CONNECT_TIMEOUT_MS,
+    streamIdleTimeoutMs = DEFAULT_SSE_IDLE_TIMEOUT_MS,
     signal,
   } = params;
 
@@ -169,94 +176,106 @@ export async function executeOpenAiChatCall(
     stream,
   });
 
-  const response = await fetchImpl(endpoint, {
-    method: 'POST',
-    headers,
-    body: JSON.stringify(body),
-    signal,
-  });
-
-  if (!response.ok) {
-    const errorText = new TextDecoder('utf-8').decode(
-      await response.arrayBuffer(),
-    );
-    throw new ProviderHttpError({
-      status: response.status,
-      bodyText: errorText,
-      endpoint,
-      usedApiKey: apiKey,
-    });
-  }
-
-  if (stream) {
-    let fullContent = '';
-    await readSseStream(
-      response,
-      (frame) => {
-        const trimmed = frame.data.trim();
-        if (!trimmed) return;
-        let parsed: Record<string, unknown>;
-        try {
-          parsed = JSON.parse(trimmed) as Record<string, unknown>;
-        } catch {
-          return;
-        }
-        if (parsed.error) {
-          throw new ProviderHttpError({
-            status: 502,
-            bodyText: JSON.stringify(parsed.error),
-            endpoint,
-            usedApiKey: apiKey,
-          });
-        }
-        const choices = parsed.choices;
-        if (!Array.isArray(choices) || choices.length === 0) return;
-        const firstChoice = choices[0] as Record<string, unknown> | undefined;
-        const deltaObj = firstChoice?.delta as
-          | Record<string, unknown>
-          | undefined;
-        const deltaText = extractOpenAiContentString(
-          deltaObj?.content ?? firstChoice?.text,
-        );
-        if (deltaText) {
-          fullContent += deltaText;
-          onDelta?.(deltaText);
-        }
-      },
-      signal,
-    );
-
-    return { content: fullContent, httpStatus: response.status };
-  }
-
-  const rawText = new TextDecoder('utf-8').decode(await response.arrayBuffer());
-  let json: Record<string, unknown>;
+  const scope = createLinkedTimeoutScope(requestTimeoutMs, signal, 'connect');
   try {
-    json = JSON.parse(rawText) as Record<string, unknown>;
-  } catch {
-    throw new Error(`Invalid JSON from OpenAI-compatible endpoint: ${rawText.slice(0, 200)}`);
+    const response = await scope.race(
+      fetchImpl(endpoint, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(body),
+        signal: scope.signal,
+      }),
+    );
+
+    if (!response.ok) {
+      const errorText = new TextDecoder('utf-8').decode(
+        await scope.race(response.arrayBuffer()),
+      );
+      throw new ProviderHttpError({
+        status: response.status,
+        bodyText: errorText,
+        endpoint,
+        usedApiKey: apiKey,
+      });
+    }
+
+    if (stream) {
+      // Headers arrived; switch from connect timer to per-chunk SSE idle timer
+      scope.clearTimer();
+      let fullContent = '';
+      await readSseStream(
+        response,
+        (frame) => {
+          const trimmed = frame.data.trim();
+          if (!trimmed) return;
+          let parsed: Record<string, unknown>;
+          try {
+            parsed = JSON.parse(trimmed) as Record<string, unknown>;
+          } catch {
+            return;
+          }
+          if (parsed.error) {
+            throw new ProviderHttpError({
+              status: 502,
+              bodyText: JSON.stringify(parsed.error),
+              endpoint,
+              usedApiKey: apiKey,
+            });
+          }
+          const choices = parsed.choices;
+          if (!Array.isArray(choices) || choices.length === 0) return;
+          const firstChoice = choices[0] as Record<string, unknown> | undefined;
+          const deltaObj = firstChoice?.delta as
+            | Record<string, unknown>
+            | undefined;
+          const deltaText = extractOpenAiContentString(
+            deltaObj?.content ?? firstChoice?.text,
+          );
+          if (deltaText) {
+            fullContent += deltaText;
+            onDelta?.(deltaText);
+          }
+        },
+        scope.signal,
+        streamIdleTimeoutMs,
+      );
+
+      return { content: fullContent, httpStatus: response.status };
+    }
+
+    const rawText = new TextDecoder('utf-8').decode(
+      await scope.race(response.arrayBuffer()),
+    );
+    let json: Record<string, unknown>;
+    try {
+      json = JSON.parse(rawText) as Record<string, unknown>;
+    } catch {
+      throw new Error(`Invalid JSON from OpenAI-compatible endpoint: ${rawText.slice(0, 200)}`);
+    }
+
+    if (json.error && !Array.isArray(json.choices)) {
+      throw new ProviderHttpError({
+        status: 502,
+        bodyText: JSON.stringify(json.error),
+        endpoint,
+        usedApiKey: apiKey,
+      });
+    }
+
+    const choices = json.choices;
+    const firstChoice = Array.isArray(choices)
+      ? (choices[0] as Record<string, unknown> | undefined)
+      : undefined;
+    const message = firstChoice?.message as Record<string, unknown> | undefined;
+    const content = extractOpenAiContentString(
+      message?.content ?? firstChoice?.text ?? '',
+    );
+
+    return {
+      content,
+      httpStatus: response.status,
+    };
+  } finally {
+    scope.cleanup();
   }
-
-  if (json.error && !Array.isArray(json.choices)) {
-    throw new ProviderHttpError({
-      status: 502,
-      bodyText: JSON.stringify(json.error),
-      endpoint,
-      usedApiKey: apiKey,
-    });
-  }
-
-  const choices = json.choices;
-  const firstChoice = Array.isArray(choices)
-    ? (choices[0] as Record<string, unknown> | undefined)
-    : undefined;
-  const message = firstChoice?.message as Record<string, unknown> | undefined;
-  const content = extractOpenAiContentString(
-    message?.content ?? firstChoice?.text ?? '',
-  );
-
-  return {
-    content,
-    httpStatus: response.status,
-  };
 }

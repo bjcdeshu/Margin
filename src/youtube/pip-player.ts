@@ -6,10 +6,12 @@ import {
   cleanPipCueText,
   computePipDimensions,
   normalizeActiveCueState,
+  normalizeSubtitleStylePreset,
   PIP_BUTTON_ID,
   PIP_CLEAR_DELAY_MS,
   PIP_NOTICE_DURATION_MS,
   PIP_NOTICE_HOST_ID,
+  resolveEffectiveTranslationScale,
   resolveRenderedCueLines,
 } from './shared';
 
@@ -193,6 +195,9 @@ export class YoutubePipPlayer {
     const normalized = normalizeActiveCueState({
       mode: this.cueState.mode,
       fontSizePercent: this.cueState.fontSizePercent,
+      sourceScalePercent: this.cueState.sourceScalePercent,
+      translationScalePercent: this.cueState.translationScalePercent,
+      stylePreset: this.cueState.stylePreset,
       position: this.cueState.position,
       ...input,
     });
@@ -210,6 +215,9 @@ export class YoutubePipPlayer {
     // Always apply non-text style/position changes immediately even while debouncing text clear
     const styleChanged =
       normalized.fontSizePercent !== this.cueState.fontSizePercent ||
+      normalized.sourceScalePercent !== this.cueState.sourceScalePercent ||
+      normalized.translationScalePercent !== this.cueState.translationScalePercent ||
+      normalized.stylePreset !== this.cueState.stylePreset ||
       normalized.position !== this.cueState.position ||
       normalized.mode !== this.cueState.mode;
 
@@ -218,6 +226,9 @@ export class YoutubePipPlayer {
         ...this.cueState,
         mode: normalized.mode,
         fontSizePercent: normalized.fontSizePercent,
+        sourceScalePercent: normalized.sourceScalePercent,
+        translationScalePercent: normalized.translationScalePercent,
+        stylePreset: normalized.stylePreset,
         position: normalized.position,
       };
       this.renderPipSubtitles();
@@ -237,6 +248,9 @@ export class YoutubePipPlayer {
         this.cueState = normalizeActiveCueState({
           mode: this.cueState.mode,
           fontSizePercent: this.cueState.fontSizePercent,
+          sourceScalePercent: this.cueState.sourceScalePercent,
+          translationScalePercent: this.cueState.translationScalePercent,
+          stylePreset: this.cueState.stylePreset,
           position: this.cueState.position,
         });
         this.renderPipSubtitles();
@@ -245,13 +259,27 @@ export class YoutubePipPlayer {
   }
 
   public updateSettings(
-    settings: Pick<SubtitleSettings, 'displayMode' | 'fontSizePercent' | 'position'>,
+    settings: Pick<SubtitleSettings, 'displayMode' | 'fontSizePercent' | 'position'> &
+      Partial<
+        Pick<
+          SubtitleSettings,
+          'sourceScalePercent' | 'translationScalePercent' | 'stylePreset'
+        >
+      >,
   ): void {
     if (this.destroyed) return;
+    const transScale = resolveEffectiveTranslationScale(settings);
     this.cueState = normalizeActiveCueState({
       ...this.cueState,
       mode: settings.displayMode,
-      fontSizePercent: settings.fontSizePercent,
+      fontSizePercent: settings.fontSizePercent ?? transScale,
+      sourceScalePercent:
+        settings.sourceScalePercent ?? this.cueState.sourceScalePercent ?? 100,
+      translationScalePercent: transScale,
+      stylePreset:
+        settings.stylePreset !== undefined
+          ? normalizeSubtitleStylePreset(settings.stylePreset)
+          : (this.cueState.stylePreset ?? 'youtube-native'),
       position: settings.position,
     });
     this.renderPipSubtitles();
@@ -262,6 +290,9 @@ export class YoutubePipPlayer {
     this.cueState = normalizeActiveCueState({
       mode: this.cueState.mode,
       fontSizePercent: this.cueState.fontSizePercent,
+      sourceScalePercent: this.cueState.sourceScalePercent,
+      translationScalePercent: this.cueState.translationScalePercent,
+      stylePreset: this.cueState.stylePreset,
       position: this.cueState.position,
     });
     this.renderPipSubtitles();
@@ -463,11 +494,17 @@ export class YoutubePipPlayer {
     originalEl.id = 'margin-pip-original';
     originalEl.className = 'margin-pip-line margin-pip-original';
     originalEl.hidden = true;
+    const origSeg = doc.createElement('span');
+    origSeg.className = 'margin-sub-seg';
+    originalEl.appendChild(origSeg);
 
     const translatedEl = doc.createElement('div');
     translatedEl.id = 'margin-pip-translated';
     translatedEl.className = 'margin-pip-line margin-pip-translated';
     translatedEl.hidden = true;
+    const transSeg = doc.createElement('span');
+    transSeg.className = 'margin-sub-seg';
+    translatedEl.appendChild(transSeg);
 
     subtitleContainer.append(originalEl, translatedEl);
     root.appendChild(subtitleContainer);
@@ -728,8 +765,15 @@ export class YoutubePipPlayer {
     const translatedEl = doc.getElementById('margin-pip-translated');
     if (!container || !originalEl || !translatedEl) return;
 
-    const scale = (this.cueState.fontSizePercent / 70).toFixed(3);
-    container.style.setProperty('--margin-cue-scale', scale);
+    const origPct = clampFontSizePercent(this.cueState.sourceScalePercent, 100);
+    const transPct = clampFontSizePercent(
+      this.cueState.translationScalePercent ?? this.cueState.fontSizePercent,
+      70,
+    );
+    const preset = normalizeSubtitleStylePreset(this.cueState.stylePreset);
+    container.style.setProperty('--margin-orig-scale', (origPct / 100).toFixed(3));
+    container.style.setProperty('--margin-trans-scale', (transPct / 100).toFixed(3));
+    container.dataset.stylePreset = preset;
     container.dataset.position = this.cueState.position;
     if (root) {
       root.dataset.position = this.cueState.position;
@@ -737,10 +781,22 @@ export class YoutubePipPlayer {
 
     const { originalLine, translatedLine } = resolveRenderedCueLines(this.cueState);
 
-    originalEl.textContent = originalLine;
+    let origSeg = originalEl.querySelector<HTMLElement>('.margin-sub-seg');
+    if (!origSeg) {
+      origSeg = doc.createElement('span');
+      origSeg.className = 'margin-sub-seg';
+      originalEl.replaceChildren(origSeg);
+    }
+    origSeg.textContent = originalLine;
     originalEl.hidden = !originalLine;
 
-    translatedEl.textContent = translatedLine;
+    let transSeg = translatedEl.querySelector<HTMLElement>('.margin-sub-seg');
+    if (!transSeg) {
+      transSeg = doc.createElement('span');
+      transSeg.className = 'margin-sub-seg';
+      translatedEl.replaceChildren(transSeg);
+    }
+    transSeg.textContent = translatedLine;
     translatedEl.hidden = !translatedLine;
 
     container.hidden = !originalLine && !translatedLine;
@@ -882,7 +938,8 @@ function buildPipWindowStyles(): string {
       background: #000;
     }
     #margin-pip-subtitles {
-      --margin-cue-scale: 1;
+      --margin-orig-scale: 1;
+      --margin-trans-scale: 0.7;
       position: absolute;
       left: 4%;
       right: 4%;
@@ -891,9 +948,10 @@ function buildPipWindowStyles(): string {
       display: flex;
       flex-direction: column;
       align-items: center;
-      gap: 4px;
+      gap: 2px;
       pointer-events: none;
       text-align: center;
+      font-family: "YouTube Noto", Roboto, Arial, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Noto Sans SC", sans-serif;
     }
     #margin-pip-subtitles[data-position="top"] {
       bottom: auto;
@@ -904,26 +962,76 @@ function buildPipWindowStyles(): string {
       display: none !important;
     }
     .margin-pip-line {
-      max-width: 100%;
-      padding: 4px 10px 5px;
-      border-radius: 5px;
-      background: rgba(21, 20, 17, 0.82);
-      border: 1px solid rgba(201, 148, 85, 0.18);
+      width: fit-content;
+      max-width: 96%;
+      padding: 0;
+      margin: 0;
+      background: transparent;
+      border: none;
       white-space: pre-wrap;
       overflow-wrap: anywhere;
-      text-shadow: 0 1px 2px rgba(0, 0, 0, 0.88);
+      text-shadow: none;
+      line-height: 1.48;
+    }
+    .margin-sub-seg {
+      display: inline;
+      background: rgba(8, 8, 8, 0.75);
+      color: #ffffff;
+      padding: 2px 7px;
+      border-radius: 2px;
+      border: none;
+      box-decoration-break: clone;
+      -webkit-box-decoration-break: clone;
     }
     .margin-pip-original {
-      color: rgba(236, 228, 210, 0.88);
-      font-size: calc(clamp(12px, 2.5vw, 22px) * var(--margin-cue-scale, 1));
+      color: #ffffff;
+      font-size: calc(clamp(14px, 3.2vw, 24px) * var(--margin-orig-scale, 1));
       font-weight: 500;
-      line-height: 1.38;
     }
     .margin-pip-translated {
+      color: rgba(255, 255, 255, 0.96);
+      font-size: calc(clamp(14px, 3.2vw, 24px) * var(--margin-trans-scale, 0.7));
+      font-weight: 500;
+    }
+    .margin-pip-translated .margin-sub-seg {
+      color: rgba(255, 255, 255, 0.96);
+    }
+    #margin-pip-subtitles[data-style-preset="cinema-outline"] {
+      gap: 3px;
+    }
+    #margin-pip-subtitles[data-style-preset="cinema-outline"] .margin-sub-seg {
+      background: transparent;
+      border: none;
+      padding: 1px 6px;
+      text-shadow:
+        0 1px 3px rgba(0, 0, 0, 0.95),
+        0 0 6px rgba(0, 0, 0, 0.9),
+        -1px -1px 0 rgba(0, 0, 0, 0.85),
+        1px -1px 0 rgba(0, 0, 0, 0.85),
+        -1px 1px 0 rgba(0, 0, 0, 0.85),
+        1px 1px 0 rgba(0, 0, 0, 0.85);
+    }
+    #margin-pip-subtitles[data-style-preset="warm-paper"] {
+      gap: 4px;
+    }
+    #margin-pip-subtitles[data-style-preset="warm-paper"] .margin-pip-line {
+      padding: 3px 10px 4px;
+      border-radius: 5px;
+      background: rgba(21, 20, 17, 0.82);
+      border: 1px solid rgba(201, 148, 85, 0.24);
+      text-shadow: 0 1px 2px rgba(0, 0, 0, 0.88);
+      line-height: 1.36;
+    }
+    #margin-pip-subtitles[data-style-preset="warm-paper"] .margin-sub-seg {
+      background: transparent;
+      padding: 0;
+      color: inherit;
+    }
+    #margin-pip-subtitles[data-style-preset="warm-paper"] .margin-pip-original {
+      color: rgba(236, 228, 210, 0.90);
+    }
+    #margin-pip-subtitles[data-style-preset="warm-paper"] .margin-pip-translated {
       color: #fbfaf6;
-      font-size: calc(clamp(14px, 2.9vw, 26px) * var(--margin-cue-scale, 1));
-      font-weight: 600;
-      line-height: 1.42;
     }
     #margin-pip-controls {
       position: absolute;

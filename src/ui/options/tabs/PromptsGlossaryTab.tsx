@@ -1,4 +1,4 @@
-import { useState } from 'preact/hooks';
+import { useEffect, useRef, useState } from 'preact/hooks';
 import { BUILTIN_ASSISTANTS } from '@shared/constants';
 import type {
   AssistantConfig,
@@ -16,9 +16,14 @@ import {
 export interface PromptsGlossaryTabProps {
   draft: MarginConfig;
   onMutate: (mutator: (next: MarginConfig) => void) => void;
+  registerPendingFlush?: (fn: (() => void) | null) => void;
 }
 
-type PromptSlot = 'systemPrompt' | 'prompt' | 'subtitlePrompt';
+type PromptSlot =
+  | 'systemPrompt'
+  | 'prompt'
+  | 'multiplePrompt'
+  | 'subtitlePrompt';
 
 const TEMPLATE_VARIABLES = [
   '{{to}}',
@@ -29,7 +34,11 @@ const TEMPLATE_VARIABLES = [
   '{{terms_prompt}}',
 ] as const;
 
-export function PromptsGlossaryTab({ draft, onMutate }: PromptsGlossaryTabProps) {
+export function PromptsGlossaryTab({
+  draft,
+  onMutate,
+  registerPendingFlush,
+}: PromptsGlossaryTabProps) {
   const lang = draft.interfaceLang;
   const assistantIds = Object.keys(draft.assistants);
 
@@ -53,6 +62,34 @@ export function PromptsGlossaryTab({ draft, onMutate }: PromptsGlossaryTabProps)
       if (target) mutator(target);
     });
   };
+
+  const envInputsRef = useRef({ key: newEnvKey, val: newEnvVal, astId: currentAstId });
+  envInputsRef.current = { key: newEnvKey, val: newEnvVal, astId: currentAstId };
+
+  const commitPendingEnvEntry = () => {
+    const k = envInputsRef.current.key.trim();
+    const v = envInputsRef.current.val;
+    const targetAstId = envInputsRef.current.astId;
+    if (!k || !targetAstId) return;
+    onMutate((d) => {
+      const target = d.assistants[targetAstId];
+      if (target) {
+        target.env[k] = v;
+      }
+    });
+    envInputsRef.current.key = '';
+    envInputsRef.current.val = '';
+    setNewEnvKey('');
+    setNewEnvVal('');
+  };
+
+  useEffect(() => {
+    if (!registerPendingFlush) return;
+    registerPendingFlush(() => {
+      commitPendingEnvEntry();
+    });
+    return () => registerPendingFlush(null);
+  }, [registerPendingFlush]);
 
   const handleAddAssistant = () => {
     const base = structuredClone(BUILTIN_ASSISTANTS['builtin-yaml']);
@@ -83,7 +120,8 @@ export function PromptsGlossaryTab({ draft, onMutate }: PromptsGlossaryTabProps)
 
   /**
    * Loads built-in Aloxaf "泛用翻译大师" (<yaml>) or "通用翻译" (%%) into the draft
-   * WITHOUT auto-saving until the user confirms via Save!
+   * WITHOUT auto-saving until the user confirms via Save, and explicitly clears any
+   * stale imported `multiplePrompt` / `multipleSystemPrompt` overrides!
    */
   const handleStageBuiltinReset = (presetKey: 'builtin-yaml' | 'builtin-delimiter') => {
     if (!assistant) return;
@@ -103,6 +141,16 @@ export function PromptsGlossaryTab({ draft, onMutate }: PromptsGlossaryTabProps)
       ast.systemPrompt = template.systemPrompt;
       ast.prompt = template.prompt;
       ast.subtitlePrompt = template.subtitlePrompt;
+      if (template.multiplePrompt) {
+        ast.multiplePrompt = template.multiplePrompt;
+      } else {
+        delete ast.multiplePrompt;
+      }
+      if (template.multipleSystemPrompt) {
+        ast.multipleSystemPrompt = template.multipleSystemPrompt;
+      } else {
+        delete ast.multipleSystemPrompt;
+      }
       ast.env = structuredClone(template.env);
     });
 
@@ -117,18 +165,12 @@ export function PromptsGlossaryTab({ draft, onMutate }: PromptsGlossaryTabProps)
     if (!assistant) return;
     updateAssistant((ast) => {
       const prev = ast[activePromptSlot] ?? '';
-      ast[activePromptSlot] = prev ? `${prev}${token}` : token;
+      const next = prev ? `${prev}${token}` : token;
+      if (activePromptSlot === 'prompt' && ast.multiplePrompt === prev && prev !== '') {
+        ast.multiplePrompt = next;
+      }
+      ast[activePromptSlot] = next;
     });
-  };
-
-  const handleAddEnvEntry = () => {
-    const k = newEnvKey.trim();
-    if (!k || !assistant) return;
-    updateAssistant((ast) => {
-      ast.env[k] = newEnvVal;
-    });
-    setNewEnvKey('');
-    setNewEnvVal('');
   };
 
   const codecOptions: Array<{ value: PromptCodecId; label: string }> = [
@@ -170,6 +212,7 @@ export function PromptsGlossaryTab({ draft, onMutate }: PromptsGlossaryTabProps)
                 class="mp-roster-tab"
                 aria-selected={id === currentAstId ? 'true' : 'false'}
                 onClick={() => {
+                  commitPendingEnvEntry();
                   setSelectedAstId(id);
                   setStagedPresetNotice(null);
                 }}
@@ -390,14 +433,18 @@ export function PromptsGlossaryTab({ draft, onMutate }: PromptsGlossaryTabProps)
               </div>
             </FieldRow>
 
-            {/* Segmented Prompt Editor (System / User / Subtitle) */}
+            {/* Segmented Prompt Editor (System / User / Multi-Batch / Subtitle) */}
             <FieldRow
               stacked
               label={lang === 'en' ? 'Prompt Templates' : '提示词模板编辑器'}
               hint={
-                lang === 'en'
-                  ? 'Inserting variables modifies the draft only and does not auto-submit.'
-                  : '切换三个模板分段编辑；点击下方变量芯片可快捷插入，不会自动提交保存。'
+                activePromptSlot === 'multiplePrompt'
+                  ? lang === 'en'
+                    ? 'Optional multi-paragraph override; leave blank to automatically reuse prompt.'
+                    : '多段并发覆盖模板；留空则多段落批次自动复用主 prompt 模板。'
+                  : lang === 'en'
+                    ? 'Inserting variables modifies the draft only and does not auto-submit.'
+                    : '切换模板槽位编辑；点击下方变量芯片可快捷插入，不会自动提交保存。'
               }
             >
               <div style={{ width: '100%', display: 'flex', flexDirection: 'column', gap: '8px' }}>
@@ -407,6 +454,7 @@ export function PromptsGlossaryTab({ draft, onMutate }: PromptsGlossaryTabProps)
                     options={[
                       { value: 'systemPrompt', label: 'systemPrompt' },
                       { value: 'prompt', label: 'prompt' },
+                      { value: 'multiplePrompt', label: 'multiplePrompt' },
                       { value: 'subtitlePrompt', label: 'subtitlePrompt' },
                     ]}
                     value={activePromptSlot}
@@ -429,12 +477,31 @@ export function PromptsGlossaryTab({ draft, onMutate }: PromptsGlossaryTabProps)
 
                 <textarea
                   class="mp-textarea mp-textarea--mono"
+                  data-testid="assistant-prompt-textarea"
                   style={{ minHeight: '132px' }}
+                  placeholder={
+                    activePromptSlot === 'multiplePrompt'
+                      ? lang === 'en'
+                        ? '(Empty — inherits prompt automatically)'
+                        : '（留空默认复用 prompt 模板）'
+                      : undefined
+                  }
                   value={assistant[activePromptSlot] ?? ''}
                   onInput={(e) => {
                     const val = (e.currentTarget as HTMLTextAreaElement).value;
                     updateAssistant((ast) => {
-                      ast[activePromptSlot] = val;
+                      if (
+                        activePromptSlot === 'prompt' &&
+                        ast.multiplePrompt !== undefined &&
+                        ast.multiplePrompt === ast.prompt
+                      ) {
+                        ast.multiplePrompt = val;
+                      }
+                      if (activePromptSlot === 'multiplePrompt' && !val.trim()) {
+                        delete ast.multiplePrompt;
+                      } else {
+                        ast[activePromptSlot] = val;
+                      }
                     });
                   }}
                 />
@@ -509,8 +576,18 @@ export function PromptsGlossaryTab({ draft, onMutate }: PromptsGlossaryTabProps)
                     placeholder="Template value..."
                     value={newEnvVal}
                     onInput={(e) => setNewEnvVal((e.currentTarget as HTMLInputElement).value)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') {
+                        e.preventDefault();
+                        commitPendingEnvEntry();
+                      }
+                    }}
                   />
-                  <button type="button" class="mp-btn mp-btn--sm" onClick={handleAddEnvEntry}>
+                  <button
+                    type="button"
+                    class="mp-btn mp-btn--sm"
+                    onClick={() => commitPendingEnvEntry()}
+                  >
                     + {lang === 'en' ? 'Add env' : '添加变量'}
                   </button>
                 </div>

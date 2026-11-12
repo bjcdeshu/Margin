@@ -17,11 +17,24 @@ import type {
 } from '@shared/types';
 import { FieldRow, StatusPill } from '../../components';
 
+export interface StagedMigrationState {
+  rawImportText: string;
+  importError: string | null;
+  importPreview: LegacyImportResult | null;
+  importApplied: boolean;
+}
+
 export interface MigrationDiagnosticsTabProps {
   draft: MarginConfig;
   capabilityCache: ModelCapabilityMap;
   onRefreshCapabilityCache: (next: ModelCapabilityMap) => void;
   onApplyImportedConfig: (importedConfig: MarginConfig) => Promise<void>;
+  stagedImport?: StagedMigrationState;
+  onStagedImportChange?: (
+    updater:
+      | StagedMigrationState
+      | ((prev: StagedMigrationState) => StagedMigrationState),
+  ) => void;
 }
 
 async function copyTextSafe(text: string): Promise<boolean> {
@@ -52,14 +65,23 @@ export function MigrationDiagnosticsTab({
   capabilityCache,
   onRefreshCapabilityCache,
   onApplyImportedConfig,
+  stagedImport,
+  onStagedImportChange,
 }: MigrationDiagnosticsTabProps) {
   const lang = draft.interfaceLang;
 
-  // Legacy Importer state
-  const [rawImportText, setRawImportText] = useState('');
-  const [importError, setImportError] = useState<string | null>(null);
-  const [importPreview, setImportPreview] = useState<LegacyImportResult | null>(null);
-  const [importApplied, setImportApplied] = useState(false);
+  // Fallback local state when rendered standalone without lifted state
+  const [localStaged, setLocalStaged] = useState<StagedMigrationState>({
+    rawImportText: '',
+    importError: null,
+    importPreview: null,
+    importApplied: false,
+  });
+
+  const currentStaged = stagedImport ?? localStaged;
+  const updateStaged = onStagedImportChange ?? setLocalStaged;
+  const { rawImportText, importError, importPreview, importApplied } =
+    currentStaged;
 
   // Exporter state
   const [includeSecrets, setIncludeSecrets] = useState(false);
@@ -81,22 +103,35 @@ export function MigrationDiagnosticsTab({
   }, []);
 
   const parseImportInput = (jsonText: string) => {
-    setImportError(null);
-    setImportApplied(false);
     const trimmed = jsonText.trim();
     if (!trimmed) {
-      setImportPreview(null);
-      setImportError(
-        lang === 'en' ? 'Please paste or choose a JSON configuration file.' : '请先粘贴或选择配置文件 JSON。',
-      );
+      updateStaged((prev) => ({
+        ...prev,
+        rawImportText: jsonText,
+        importApplied: false,
+        importPreview: null,
+        importError:
+          lang === 'en'
+            ? 'Please paste or choose a JSON configuration file.'
+            : '请先粘贴或选择配置文件 JSON。',
+      }));
       return;
     }
     try {
       const result = importLegacyConfig(trimmed, draft);
-      setImportPreview(result);
+      updateStaged({
+        rawImportText: jsonText,
+        importError: null,
+        importPreview: result,
+        importApplied: false,
+      });
     } catch (err) {
-      setImportPreview(null);
-      setImportError(err instanceof Error ? err.message : String(err));
+      updateStaged({
+        rawImportText: jsonText,
+        importError: err instanceof Error ? err.message : String(err),
+        importPreview: null,
+        importApplied: false,
+      });
     }
   };
 
@@ -105,7 +140,6 @@ export function MigrationDiagnosticsTab({
     const reader = new FileReader();
     reader.onload = () => {
       const content = String(reader.result ?? '');
-      setRawImportText(content);
       parseImportInput(content);
     };
     reader.readAsText(file);
@@ -114,7 +148,10 @@ export function MigrationDiagnosticsTab({
   const handleConfirmApplyImport = async () => {
     if (!importPreview) return;
     await onApplyImportedConfig(importPreview.config);
-    setImportApplied(true);
+    updateStaged((prev) => ({
+      ...prev,
+      importApplied: true,
+    }));
   };
 
   const handleGenerateExport = async (downloadFile: boolean) => {
@@ -195,8 +232,8 @@ export function MigrationDiagnosticsTab({
     }
     setDiagNotice(
       lang === 'en'
-        ? 'Cleared background translation cache'
-        : '已清空后台译文缓存',
+        ? 'Cleared background & page translation cache'
+        : '已清空后台与页面译文缓存',
     );
   };
 
@@ -221,58 +258,17 @@ export function MigrationDiagnosticsTab({
             <h2 class="mp-section-title">
               {lang === 'en'
                 ? '1-Click Legacy JSON Importer'
-                : '一键导入旧版配置 (Immersive / myAItranslate v1 JSON)'}
+                : '一键导入配置 (Immersive / myAItranslate / Margin JSON)'}
             </h2>
             <p class="mp-section-desc">
               {lang === 'en'
-                ? 'Imports channels, custom <yaml>/%% assistants, glossary, and inherit routing while repairing "temperatre" typos and dropping float-ball clutter.'
-                : '自动迁移翻译渠道、Aloxaf <yaml>/%% 助手、术语库与 inherit 场景联动，自动修复 "temperatre" 拼写并剔除悬浮球冗余项。'}
+                ? 'Imports channels, custom <yaml>/%% assistants, glossary, and inherit routing while repairing "temperatre" typos.'
+                : '自动迁移翻译渠道、Aloxaf <yaml>/%% 助手、术语库与场景联动，修复 "temperatre" 拼写并剔除悬浮球冗余项。'}
             </p>
           </div>
         </div>
 
-        <FieldRow
-          stacked
-          label={lang === 'en' ? 'Choose JSON File or Paste Below' : '选择 JSON 配置文件或直接粘贴'}
-        >
-          <div style={{ width: '100%', display: 'flex', flexDirection: 'column', gap: '8px' }}>
-            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '8px', flexWrap: 'wrap' }}>
-              <input
-                type="file"
-                accept=".json,application/json"
-                aria-label={lang === 'en' ? 'Import Legacy JSON File' : '选择旧版 JSON 配置文件'}
-                onChange={(e) => {
-                  const file = (e.currentTarget as HTMLInputElement).files?.[0];
-                  handleFileUpload(file);
-                }}
-              />
-              <button
-                type="button"
-                class="mp-btn mp-btn--solid"
-                data-testid="parse-legacy-json-btn"
-                onClick={() => parseImportInput(rawImportText)}
-              >
-                {lang === 'en' ? 'Preview Import & Audit' : '解析并预览迁移报告'}
-              </button>
-            </div>
-
-            <textarea
-              class="mp-textarea mp-textarea--mono"
-              data-testid="legacy-json-textarea"
-              placeholder='{"translationServices": ..., "customAiAssistants": ...}'
-              value={rawImportText}
-              onInput={(e) => setRawImportText((e.currentTarget as HTMLTextAreaElement).value)}
-            />
-          </div>
-        </FieldRow>
-
-        {importError ? (
-          <div class="mp-editorial-note" style={{ borderLeftColor: 'var(--danger-ink)' }}>
-            <StatusPill tone="danger">{lang === 'en' ? 'Parse Error' : '解析错误'}</StatusPill>{' '}
-            {importError}
-          </div>
-        ) : null}
-
+        {/* Immediate Top Summary + Apply CTA (Zero scrolling required after file upload/parse!) */}
         {importPreview ? (
           <div
             class="mp-editorial-note"
@@ -282,18 +278,33 @@ export function MigrationDiagnosticsTab({
               flexDirection: 'column',
               gap: '10px',
               padding: '14px 16px',
+              marginBottom: '12px',
+              borderLeftColor: importApplied ? 'var(--ok-ink)' : 'var(--action-solid)',
             }}
           >
-            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: '8px' }}>
-              <strong style={{ fontSize: '13.5px', color: 'var(--ink)' }}>
-                {importApplied
-                  ? lang === 'en'
-                    ? 'Import Audit Summary (Applied)'
-                    : '配置迁移审计摘要（已正式应用）'
-                  : lang === 'en'
-                    ? 'Import Audit Summary (Ready to Apply)'
-                    : '配置迁移审计摘要（待确认应用）'}
-              </strong>
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: '10px' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+                <strong style={{ fontSize: '13.5px', color: 'var(--ink)' }}>
+                  {importApplied
+                    ? lang === 'en'
+                      ? 'Import Audit Summary (Applied)'
+                      : '配置迁移审计摘要（已正式应用）'
+                    : lang === 'en'
+                      ? 'Import Audit Summary (Pending Apply)'
+                      : '配置迁移审计摘要（待确认应用）'}
+                </strong>
+                {!importApplied ? (
+                  <StatusPill tone="accent" dataTestId="import-pending-warning">
+                    {lang === 'en'
+                      ? 'Not yet active — click Apply Now'
+                      : '尚未写入生效 · 请点击右侧「立即应用导入配置」'}
+                  </StatusPill>
+                ) : (
+                  <StatusPill tone="ok">
+                    {lang === 'en' ? 'Active in Browser' : '已写入浏览器生效'}
+                  </StatusPill>
+                )}
+              </div>
 
               <button
                 type="button"
@@ -306,8 +317,8 @@ export function MigrationDiagnosticsTab({
                     ? 'Re-apply Imported Config'
                     : '已应用（点击可重新写入）'
                   : lang === 'en'
-                    ? 'Apply Imported Config'
-                    : '确认应用导入配置'}
+                    ? 'Apply Imported Config Now'
+                    : '立即应用导入配置'}
               </button>
             </div>
 
@@ -355,29 +366,84 @@ export function MigrationDiagnosticsTab({
               ) : null}
             </div>
 
-            {/* Audit Log Entries */}
+            {/* Collapsible Detailed Audit Log Entries so CTA stays concise */}
             {importPreview.audit.length > 0 ? (
-              <div style={{ display: 'flex', flexDirection: 'column', gap: '4px', paddingTop: '4px', borderTop: '1px solid var(--rule-soft)' }}>
-                {importPreview.audit.map((item, idx) => (
-                  <div key={idx} style={{ display: 'flex', alignItems: 'baseline', gap: '8px', fontSize: '12px' }}>
-                    <StatusPill
-                      tone={
-                        item.level === 'warning'
-                          ? 'danger'
-                          : item.level === 'normalized'
-                            ? 'ok'
-                            : 'mono'
-                      }
-                    >
-                      {item.level}
-                    </StatusPill>
-                    <span>{item.message}</span>
-                  </div>
-                ))}
-              </div>
+              <details>
+                <summary class="mp-muted" style={{ cursor: 'pointer', fontSize: '12px' }}>
+                  {lang === 'en'
+                    ? `View detailed audit entries (${importPreview.audit.length})`
+                    : `展开查看详细迁移审计明细 (${importPreview.audit.length} 条)`}
+                </summary>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '4px', paddingTop: '8px', marginTop: '6px', borderTop: '1px solid var(--rule-soft)' }}>
+                  {importPreview.audit.map((item, idx) => (
+                    <div key={idx} style={{ display: 'flex', alignItems: 'baseline', gap: '8px', fontSize: '12px' }}>
+                      <StatusPill
+                        tone={
+                          item.level === 'warning'
+                            ? 'danger'
+                            : item.level === 'normalized'
+                              ? 'ok'
+                              : 'mono'
+                        }
+                      >
+                        {item.level}
+                      </StatusPill>
+                      <span>{item.message}</span>
+                    </div>
+                  ))}
+                </div>
+              </details>
             ) : null}
           </div>
         ) : null}
+
+        {importError ? (
+          <div class="mp-editorial-note" style={{ borderLeftColor: 'var(--danger-ink)' }}>
+            <StatusPill tone="danger">{lang === 'en' ? 'Parse Error' : '解析错误'}</StatusPill>{' '}
+            {importError}
+          </div>
+        ) : null}
+
+        <FieldRow
+          stacked
+          label={lang === 'en' ? 'Choose JSON File or Paste Below' : '选择 JSON 配置文件或直接粘贴'}
+        >
+          <div style={{ width: '100%', display: 'flex', flexDirection: 'column', gap: '8px' }}>
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '8px', flexWrap: 'wrap' }}>
+              <input
+                type="file"
+                accept=".json,application/json"
+                aria-label={lang === 'en' ? 'Import Legacy JSON File' : '选择旧版 JSON 配置文件'}
+                onChange={(e) => {
+                  const file = (e.currentTarget as HTMLInputElement).files?.[0];
+                  handleFileUpload(file);
+                }}
+              />
+              <button
+                type="button"
+                class="mp-btn mp-btn--solid"
+                data-testid="parse-legacy-json-btn"
+                onClick={() => parseImportInput(rawImportText)}
+              >
+                {lang === 'en' ? 'Preview Import & Audit' : '解析并预览迁移报告'}
+              </button>
+            </div>
+
+            <textarea
+              class="mp-textarea mp-textarea--mono"
+              data-testid="legacy-json-textarea"
+              placeholder='{"translationServices": ..., "customAiAssistants": ...}'
+              value={rawImportText}
+              onInput={(e) => {
+                const text = (e.currentTarget as HTMLTextAreaElement).value;
+                updateStaged((prev) => ({
+                  ...prev,
+                  rawImportText: text,
+                }));
+              }}
+            />
+          </div>
+        </FieldRow>
       </section>
 
       {/* Section 2: Export Configuration */}

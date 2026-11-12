@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'preact/hooks';
+import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import { PROVIDER_PRESETS } from '@shared/constants';
 import { requestProviderTest } from '@shared/messaging';
 import { getCapabilityCache } from '@shared/storage';
@@ -33,6 +33,7 @@ export interface ProvidersTabProps {
   onMutate: (mutator: (next: MarginConfig) => void) => void;
   /** Ensures unsaved provider edits are persisted before background test runs. */
   onEnsureSavedBeforeTest: () => Promise<void>;
+  registerPendingFlush?: (fn: (() => void) | null) => void;
 }
 
 const PRESET_LIST: readonly ProviderPreset[] = [
@@ -44,6 +45,48 @@ const PRESET_LIST: readonly ProviderPreset[] = [
   'google-free',
   'custom',
 ];
+
+const DEFAULT_ENDPOINT_BY_PROTOCOL: Readonly<Record<WireProtocol, string>> = {
+  'openai-chat': PROVIDER_PRESETS.openai.defaultEndpoint,
+  'anthropic-messages': PROVIDER_PRESETS.anthropic.defaultEndpoint,
+  deeplx: PROVIDER_PRESETS.deeplx.defaultEndpoint,
+  'google-web': PROVIDER_PRESETS['google-free'].defaultEndpoint,
+};
+
+const KNOWN_BUILTIN_ENDPOINTS = new Set<string>(
+  Object.values(PROVIDER_PRESETS)
+    .map((m) => m.defaultEndpoint)
+    .filter(Boolean),
+);
+
+function adaptBaseUrlForProtocolSwitch(
+  currentUrl: string,
+  nextProto: WireProtocol,
+): string {
+  const trimmed = currentUrl.trim();
+  if (!trimmed || KNOWN_BUILTIN_ENDPOINTS.has(trimmed)) {
+    return DEFAULT_ENDPOINT_BY_PROTOCOL[nextProto];
+  }
+
+  // Strip another protocol's default path suffix on custom gateway origins
+  const stripped = trimmed.replace(
+    /(?:\/v1\/chat\/completions|\/api\/paas\/v4\/chat\/completions|\/v1\/messages|\/translate_a\/single|\/translate)\/?$/i,
+    '',
+  );
+  if (stripped !== trimmed && stripped) {
+    if (nextProto === 'openai-chat') return `${stripped}/v1/chat/completions`;
+    if (nextProto === 'anthropic-messages') return `${stripped}/v1/messages`;
+    if (nextProto === 'deeplx') return `${stripped}/translate`;
+  }
+  return currentUrl;
+}
+
+function parseSplitList(raw: string): string[] {
+  return raw
+    .split(/[\n,]+/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
 
 function createProviderFromPreset(preset: ProviderPreset): ProviderConfig {
   const meta = PROVIDER_PRESETS[preset];
@@ -76,6 +119,7 @@ export function ProvidersTab({
   onRefreshCapabilityCache,
   onMutate,
   onEnsureSavedBeforeTest,
+  registerPendingFlush,
 }: ProvidersTabProps) {
   const lang = draft.interfaceLang;
 
@@ -102,6 +146,80 @@ export function ProvidersTab({
   const activeId =
     selectedId && draft.providers[selectedId] ? selectedId : defaultProviderId;
   const provider = activeId ? draft.providers[activeId] : undefined;
+
+  // Raw string buffers so typing commas, spaces, or Enter newlines never strips characters mid-edit
+  const [rawApiKeysText, setRawApiKeysText] = useState(() =>
+    (provider?.apiKeys ?? []).join('\n'),
+  );
+  const [rawEndpointsText, setRawEndpointsText] = useState(() =>
+    (provider?.endpoints ?? (provider ? [provider.baseUrl] : [])).join('\n'),
+  );
+
+  const prevActiveIdRef = useRef(activeId);
+  useEffect(() => {
+    if (!provider) return;
+    const switchedChannel = prevActiveIdRef.current !== activeId;
+    prevActiveIdRef.current = activeId;
+
+    if (switchedChannel) {
+      setRawApiKeysText(
+        revealKeys ? provider.apiKeys.join('\n') : provider.apiKeys.join(', '),
+      );
+      setRawEndpointsText((provider.endpoints ?? [provider.baseUrl]).join('\n'));
+      setCustomModelInput('');
+      return;
+    }
+
+    if (parseSplitList(rawApiKeysText).join('\n') !== provider.apiKeys.join('\n')) {
+      setRawApiKeysText(
+        revealKeys ? provider.apiKeys.join('\n') : provider.apiKeys.join(', '),
+      );
+    }
+    const targetEndpoints = provider.endpoints ?? [provider.baseUrl];
+    if (
+      parseSplitList(rawEndpointsText).join('\n') !==
+      targetEndpoints.filter(Boolean).join('\n')
+    ) {
+      setRawEndpointsText(targetEndpoints.join('\n'));
+    }
+  }, [activeId, provider?.apiKeys, provider?.endpoints, provider?.baseUrl, revealKeys]);
+
+  const updateProvider = (mutator: (p: ProviderConfig) => void) => {
+    if (!activeId) return;
+    onMutate((d) => {
+      const target = d.providers[activeId];
+      if (target) mutator(target);
+    });
+  };
+
+  const customModelInputRef = useRef(customModelInput);
+  customModelInputRef.current = customModelInput;
+  const activeIdRef = useRef(activeId);
+  activeIdRef.current = activeId;
+
+  const commitCustomModelInput = () => {
+    const trimmed = customModelInputRef.current.trim();
+    const targetId = activeIdRef.current;
+    if (!trimmed || !targetId) return;
+    onMutate((d) => {
+      const p = d.providers[targetId];
+      if (!p) return;
+      if (!p.models.includes(trimmed)) {
+        p.models = [...p.models, trimmed];
+      }
+      p.model = trimmed;
+    });
+    customModelInputRef.current = '';
+    setCustomModelInput('');
+  };
+
+  useEffect(() => {
+    if (!registerPendingFlush) return;
+    registerPendingFlush(() => {
+      commitCustomModelInput();
+    });
+    return () => registerPendingFlush(null);
+  }, [registerPendingFlush]);
 
   const endpointPreview = useMemo(() => {
     if (!provider) return null;
@@ -133,14 +251,6 @@ export function ProvidersTab({
     capabilityCache,
   ]);
 
-  const updateProvider = (mutator: (p: ProviderConfig) => void) => {
-    if (!activeId) return;
-    onMutate((d) => {
-      const target = d.providers[activeId];
-      if (target) mutator(target);
-    });
-  };
-
   const handleAddProvider = () => {
     const created = createProviderFromPreset(newPreset);
     onMutate((d) => {
@@ -166,7 +276,8 @@ export function ProvidersTab({
   const handleDeleteProvider = (id: string) => {
     if (orderedIds.length <= 1) return;
     const remaining = orderedIds.filter((item) => item !== id);
-    const fallbackId = remaining[0];
+    const fallbackId =
+      remaining.find((rid) => draft.providers[rid]?.enabled) ?? remaining[0];
     onMutate((d) => {
       delete d.providers[id];
       d.providerOrder = remaining;
@@ -182,20 +293,9 @@ export function ProvidersTab({
     setSelectedId(fallbackId);
   };
 
-  const handleAddCustomModel = () => {
-    const trimmed = customModelInput.trim();
-    if (!trimmed || !provider) return;
-    updateProvider((p) => {
-      if (!p.models.includes(trimmed)) {
-        p.models = [...p.models, trimmed];
-      }
-      p.model = trimmed;
-    });
-    setCustomModelInput('');
-  };
-
   const handleTestConnection = async () => {
     if (!provider) return;
+    commitCustomModelInput();
     const targetId = provider.id;
     setTestingId(targetId);
     try {
@@ -238,6 +338,38 @@ export function ProvidersTab({
   const isAiProtocol =
     provider?.protocol === 'openai-chat' || provider?.protocol === 'anthropic-messages';
 
+  const advancedSummaryLabel = useMemo(() => {
+    if (!provider) return '';
+    if (!isAiProtocol) {
+      return `${provider.rateLimitRps} RPS · ${lang === 'en' ? 'Concurrency' : '并发'} ${provider.maxConcurrency}`;
+    }
+    const tempLabel =
+      provider.temperaturePolicy.mode === 'omit'
+        ? lang === 'en'
+          ? 'Omit Temp'
+          : 'Omit温度'
+        : `Temp ${provider.temperaturePolicy.value}`;
+    const thinkLabel =
+      provider.thinkingPolicy.mode === 'provider-default'
+        ? lang === 'en'
+          ? 'Default Thinking'
+          : '默认思考'
+        : provider.thinkingPolicy.mode === 'disabled'
+          ? lang === 'en'
+            ? 'No Thinking'
+            : '关闭思考'
+          : lang === 'en'
+            ? 'Thinking On'
+            : '开启思考';
+    const streamLabel =
+      provider.stream === 'off'
+        ? 'SSE Off'
+        : lang === 'en'
+          ? `SSE ${provider.stream}`
+          : `SSE ${provider.stream === 'on' ? '强制' : '自动'}`;
+    return `${tempLabel} · ${thinkLabel} · ${streamLabel} · ${lang === 'en' ? 'Concurrency' : '并发'} ${provider.maxConcurrency}`;
+  }, [provider, isAiProtocol, lang]);
+
   return (
     <div>
       {/* Provider Roster Bar + Add Preset */}
@@ -249,12 +381,12 @@ export function ProvidersTab({
             </h2>
             <p class="mp-section-desc">
               {lang === 'en'
-                ? 'Protocol-first channel configuration with automatic endpoint completion, multi-key rotation, and 4-defense temperature protection.'
-                : '协议解耦渠道管理，内置端点路径智能补全、多密钥自动轮询与四重温度参数防呆保护。'}
+                ? 'Configure endpoints, multi-key rotation pools, and active models with 1-click connection verification.'
+                : '配置服务地址、多密钥轮询池与主力模型，支持一键测试连通性；低频并发与采样参数已收纳于下方折叠区。'}
             </p>
           </div>
 
-          <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '6px', flexShrink: 0 }}>
             <select
               class="mp-select"
               aria-label={lang === 'en' ? 'New Provider Preset' : '新增渠道预设'}
@@ -286,13 +418,16 @@ export function ProvidersTab({
                 class="mp-roster-tab"
                 aria-selected={selected ? 'true' : 'false'}
                 onClick={() => {
+                  commitCustomModelInput();
                   setSelectedId(id);
                   setRevealKeys(false);
                 }}
               >
                 <span>{p.name}</span>
                 <span class="mp-mono mp-muted">{p.model}</span>
-                {draft.routing.webpage === id ? (
+                {!p.enabled ? (
+                  <StatusPill tone="danger">{lang === 'en' ? 'Off' : '已停用'}</StatusPill>
+                ) : draft.routing.webpage === id ? (
                   <StatusPill tone="accent">{lang === 'en' ? 'Primary' : '主服务'}</StatusPill>
                 ) : null}
               </button>
@@ -302,7 +437,7 @@ export function ProvidersTab({
 
         {provider ? (
           <div>
-            {/* Toolbar for active provider: reorder, test connection, delete */}
+            {/* Toolbar for active provider: reorder, make primary, test connection, delete */}
             <div
               style={{
                 display: 'flex',
@@ -317,13 +452,26 @@ export function ProvidersTab({
               <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
                 <StatusPill tone="mono">{provider.id}</StatusPill>
                 <StatusPill tone="neutral">{labelForPreset(provider.preset, lang)}</StatusPill>
+                {draft.routing.webpage !== provider.id && provider.enabled ? (
+                  <button
+                    type="button"
+                    class="mp-btn mp-btn--sm"
+                    onClick={() =>
+                      onMutate((d) => {
+                        d.routing.webpage = provider.id;
+                      })
+                    }
+                  >
+                    {lang === 'en' ? 'Set as Primary Webpage Channel' : '设为网页主服务'}
+                  </button>
+                ) : null}
                 <button
                   type="button"
                   class="mp-btn mp-btn--sm"
                   disabled={orderedIds.indexOf(provider.id) <= 0}
                   onClick={() => handleMoveProvider(provider.id, -1)}
                 >
-                  ↑ {lang === 'en' ? 'Move Up' : '上移'}
+                  ↑ {lang === 'en' ? 'Up' : '上移'}
                 </button>
                 <button
                   type="button"
@@ -331,7 +479,7 @@ export function ProvidersTab({
                   disabled={orderedIds.indexOf(provider.id) >= orderedIds.length - 1}
                   onClick={() => handleMoveProvider(provider.id, 1)}
                 >
-                  ↓ {lang === 'en' ? 'Move Down' : '下移'}
+                  ↓ {lang === 'en' ? 'Down' : '下移'}
                 </button>
               </div>
 
@@ -401,7 +549,7 @@ export function ProvidersTab({
               </div>
             ) : null}
 
-            {/* Basic Channel Identity */}
+            {/* Primary Connection Settings */}
             <FieldRow label={lang === 'en' ? 'Channel Name' : '渠道显示名称'}>
               <input
                 type="text"
@@ -439,11 +587,16 @@ export function ProvidersTab({
             >
               <select
                 class="mp-select"
+                aria-label={lang === 'en' ? 'Wire Protocol' : '通信协议'}
                 value={provider.protocol}
                 onChange={(e) => {
                   const nextProto = (e.currentTarget as HTMLSelectElement).value as WireProtocol;
                   updateProvider((p) => {
+                    p.baseUrl = adaptBaseUrlForProtocolSwitch(p.baseUrl, nextProto);
                     p.protocol = nextProto;
+                    if (nextProto === 'deeplx' || nextProto === 'google-web') {
+                      p.stream = 'off';
+                    }
                   });
                 }}
               >
@@ -500,13 +653,12 @@ export function ProvidersTab({
               >
                 <textarea
                   class="mp-textarea mp-textarea--mono"
-                  value={(provider.endpoints ?? [provider.baseUrl]).join('\n')}
+                  data-testid="deeplx-endpoints-textarea"
+                  value={rawEndpointsText}
                   onInput={(e) => {
                     const raw = (e.currentTarget as HTMLTextAreaElement).value;
-                    const list = raw
-                      .split(/[\n,]+/)
-                      .map((s) => s.trim())
-                      .filter(Boolean);
+                    setRawEndpointsText(raw);
+                    const list = parseSplitList(raw);
                     updateProvider((p) => {
                       p.endpoints = list;
                       if (list[0]) p.baseUrl = list[0];
@@ -516,7 +668,7 @@ export function ProvidersTab({
               </FieldRow>
             ) : null}
 
-            {/* Multi-Key API Key Pool (Masked by default) */}
+            {/* Multi-Key API Key Pool (Masked by default, raw string buffer preserves typing) */}
             {PROVIDER_PRESETS[provider.preset]?.requiresApiKey || provider.apiKeys.length > 0 || provider.protocol !== 'google-web' ? (
               <FieldRow
                 stacked
@@ -531,7 +683,7 @@ export function ProvidersTab({
                 hint={
                   lang === 'en'
                     ? 'One key per line or comma-separated. Keys are masked by default and rotated automatically on HTTP 429.'
-                    : '支持换行或逗号分隔填写多把 Key，遇到 429 限流自动冷却切换；默认遮罩脱敏保护。'
+                    : '支持换行或逗号分隔多把 Key，遇到 429 限流自动轮换冷却；默认遮罩显示。'
                 }
               >
                 <div style={{ width: '100%', display: 'flex', flexDirection: 'column', gap: '6px' }}>
@@ -539,7 +691,18 @@ export function ProvidersTab({
                     <button
                       type="button"
                       class="mp-btn mp-btn--ghost mp-btn--sm"
-                      onClick={() => setRevealKeys((v) => !v)}
+                      data-testid="toggle-reveal-keys-btn"
+                      onClick={() => {
+                        setRevealKeys((prev) => {
+                          const next = !prev;
+                          setRawApiKeysText(
+                            next
+                              ? provider.apiKeys.join('\n')
+                              : provider.apiKeys.join(', '),
+                          );
+                          return next;
+                        });
+                      }}
                     >
                       {revealKeys
                         ? lang === 'en'
@@ -547,21 +710,20 @@ export function ProvidersTab({
                           : '隐藏明文密钥'
                         : lang === 'en'
                           ? 'Reveal Keys to Edit'
-                          : '显示/编辑密钥'}
+                          : '显示/多行编辑密钥'}
                     </button>
                   </div>
 
                   {revealKeys ? (
                     <textarea
                       class="mp-textarea mp-textarea--mono"
+                      data-testid="api-keys-textarea"
                       placeholder="sk-..."
-                      value={provider.apiKeys.join('\n')}
+                      value={rawApiKeysText}
                       onInput={(e) => {
                         const raw = (e.currentTarget as HTMLTextAreaElement).value;
-                        const keys = raw
-                          .split(/[\n,]+/)
-                          .map((s) => s.trim())
-                          .filter(Boolean);
+                        setRawApiKeysText(raw);
+                        const keys = parseSplitList(raw);
                         updateProvider((p) => {
                           p.apiKeys = keys;
                         });
@@ -571,6 +733,7 @@ export function ProvidersTab({
                     <input
                       type="password"
                       class="mp-input mp-input--mono"
+                      data-testid="api-keys-masked-input"
                       style={{ width: '100%' }}
                       aria-label={lang === 'en' ? 'Masked API Key Input' : 'API 密钥输入 (遮罩模式)'}
                       placeholder={
@@ -578,13 +741,11 @@ export function ProvidersTab({
                           ? 'Paste API key(s) (comma-separated, masked)...'
                           : '粘贴 API Key（支持逗号分隔多把密钥，默认遮罩显示）...'
                       }
-                      value={provider.apiKeys.join(',')}
+                      value={rawApiKeysText}
                       onInput={(e) => {
                         const raw = (e.currentTarget as HTMLInputElement).value;
-                        const keys = raw
-                          .split(/[\n,]+/)
-                          .map((s) => s.trim())
-                          .filter(Boolean);
+                        setRawApiKeysText(raw);
+                        const keys = parseSplitList(raw);
                         updateProvider((p) => {
                           p.apiKeys = keys;
                         });
@@ -598,7 +759,7 @@ export function ProvidersTab({
             {/* Model Selector + Custom Model Tags */}
             <FieldRow
               stacked
-              label={lang === 'en' ? 'Active Model & Custom Model Tags' : '当前模型与自定义模型标签'}
+              label={lang === 'en' ? 'Active Model & Custom Model Tags' : '当前模型与常用模型标签'}
               badge={
                 isStrictTemperatureModel(provider.model) ? (
                   <StatusPill tone="accent">
@@ -626,18 +787,24 @@ export function ProvidersTab({
                     <input
                       type="text"
                       class="mp-input mp-input--mono"
-                      style={{ minWidth: '240px' }}
-                      placeholder={lang === 'en' ? 'Add model tag (e.g. gpt-6-luna)' : '添加常用模型标签 (如 gpt-6-luna)'}
+                      data-testid="custom-model-tag-input"
+                      style={{ minWidth: '230px' }}
+                      placeholder={lang === 'en' ? 'Add model tag (e.g. gpt-6-luna)' : '输入新模型后回车或直接保存'}
                       value={customModelInput}
                       onInput={(e) => setCustomModelInput((e.currentTarget as HTMLInputElement).value)}
+                      onBlur={() => commitCustomModelInput()}
                       onKeyDown={(e) => {
                         if (e.key === 'Enter') {
                           e.preventDefault();
-                          handleAddCustomModel();
+                          commitCustomModelInput();
                         }
                       }}
                     />
-                    <button type="button" class="mp-btn mp-btn--sm" onClick={handleAddCustomModel}>
+                    <button
+                      type="button"
+                      class="mp-btn mp-btn--sm"
+                      onClick={() => commitCustomModelInput()}
+                    >
                       + {lang === 'en' ? 'Pin Tag' : '加入标签'}
                     </button>
                   </div>
@@ -701,281 +868,299 @@ export function ProvidersTab({
               </div>
             </FieldRow>
 
-            {/* Assistant Binding + Explicit 2-Mode Temperature Control + Live Preview */}
             {isAiProtocol ? (
-              <>
-                <FieldRow
-                  label={lang === 'en' ? 'Bound Prompt Assistant' : '绑定提示词助手 (assistantId)'}
-                  hint={
-                    lang === 'en'
-                      ? 'Choose Aloxaf <yaml>, %% streaming delimiter, or leave default id-locked JSON batch'
-                      : '可绑定「泛用翻译大师 (<yaml>)」、「通用翻译 (%%)」或使用内置默认 JSON 批处理'
-                  }
-                >
-                  <select
-                    class="mp-select"
-                    aria-label={lang === 'en' ? 'Bound Prompt Assistant' : '绑定提示词助手'}
-                    value={provider.assistantId ?? ''}
-                    onChange={(e) => {
-                      const val = (e.currentTarget as HTMLSelectElement).value;
-                      updateProvider((p) => {
-                        if (val) {
-                          p.assistantId = val;
-                        } else {
-                          delete p.assistantId;
-                        }
-                      });
-                    }}
-                  >
-                    <option value="">
-                      {lang === 'en'
-                        ? 'Built-in Default (id-locked JSON Batch)'
-                        : '内置默认 (JSON 严格 ID 批处理)'}
-                    </option>
-                    {Object.values(draft.assistants).map((ast) => (
-                      <option key={ast.id} value={ast.id}>
-                        {ast.name} [{ast.codec}]
-                      </option>
-                    ))}
-                  </select>
-                </FieldRow>
-
-                <FieldRow
-                  stacked
-                  label={lang === 'en' ? 'Temperature Policy (2-Mode)' : '采样温度策略 (Temperature 双模式)'}
-                  badge={
-                    effectiveTemp ? (
-                      <StatusPill
-                        tone={effectiveTemp.value === undefined ? 'accent' : 'ok'}
-                        dataTestId="live-temperature-preview"
-                      >
-                        {describeTemperatureResolution({
-                          trace: effectiveTemp.trace,
-                          value: effectiveTemp.value,
-                          model: provider.model,
-                          assistantName: boundAssistant?.name,
-                          lang,
-                        })}
-                      </StatusPill>
-                    ) : null
-                  }
-                  hint={
-                    lang === 'en'
-                      ? 'Omit never sends temperature:0, eliminating reasoning-model HTTP 400 errors.'
-                      : '「不发送 Omit」彻底消除旧版默认发送 temperature:0 引发的推理模型 400 报错。'
-                  }
-                >
-                  <div style={{ display: 'flex', alignItems: 'center', gap: '10px', flexWrap: 'wrap', width: '100%' }}>
-                    <SegmentedControl
-                      ariaLabel={lang === 'en' ? 'Temperature Mode' : '温度模式'}
-                      options={[
-                        {
-                          value: 'omit',
-                          label:
-                            lang === 'en'
-                              ? 'Omit (Recommended for Reasoning)'
-                              : '不发送 Omit (推荐推理模型)',
-                        },
-                        {
-                          value: 'custom',
-                          label: lang === 'en' ? 'Custom (0.0–2.0)' : '自定义数值 0.0–2.0',
-                        },
-                      ]}
-                      value={provider.temperaturePolicy.mode}
-                      onChange={(mode) =>
-                        updateProvider((p) => {
-                          if (mode === 'omit') {
-                            p.temperaturePolicy = { mode: 'omit' };
-                          } else {
-                            p.temperaturePolicy = { mode: 'custom', value: 0.3 };
-                          }
-                        })
+              <FieldRow
+                label={lang === 'en' ? 'Bound Prompt Assistant' : '绑定提示词助手 (assistantId)'}
+                hint={
+                  lang === 'en'
+                    ? 'Choose Aloxaf <yaml>, %% streaming delimiter, or built-in JSON batch'
+                    : '可绑定「泛用翻译大师 (<yaml>)」、「通用翻译 (%%)」或使用内置 JSON 批处理'
+                }
+              >
+                <select
+                  class="mp-select"
+                  aria-label={lang === 'en' ? 'Bound Prompt Assistant' : '绑定提示词助手'}
+                  value={provider.assistantId ?? ''}
+                  onChange={(e) => {
+                    const val = (e.currentTarget as HTMLSelectElement).value;
+                    updateProvider((p) => {
+                      if (val) {
+                        p.assistantId = val;
+                      } else {
+                        delete p.assistantId;
                       }
-                    />
+                    });
+                  }}
+                >
+                  <option value="">
+                    {lang === 'en'
+                      ? 'Built-in Default (id-locked JSON Batch)'
+                      : '内置默认 (JSON 严格 ID 批处理)'}
+                  </option>
+                  {Object.values(draft.assistants).map((ast) => (
+                    <option key={ast.id} value={ast.id}>
+                      {ast.name} [{ast.codec}]
+                    </option>
+                  ))}
+                </select>
+              </FieldRow>
+            ) : null}
 
-                    {provider.temperaturePolicy.mode === 'custom' ? (
-                      <>
-                        <input
-                          type="number"
-                          class="mp-input mp-input--mono"
-                          aria-label={lang === 'en' ? 'Custom Temperature Value' : '自定义温度数值'}
-                          style={{ width: '92px' }}
-                          min={0}
-                          max={2}
-                          step={0.1}
-                          value={provider.temperaturePolicy.value}
-                          onInput={(e) => {
-                            const raw = Number.parseFloat((e.currentTarget as HTMLInputElement).value);
-                            const clamped = Number.isFinite(raw)
-                              ? Math.max(0, Math.min(2, Math.round(raw * 1000) / 1000))
-                              : 0.3;
+            {/* Secondary Disclosure: Advanced Request & Concurrency Parameters */}
+            <details class="mp-advanced-details">
+              <summary class="mp-advanced-summary">
+                <span>
+                  {lang === 'en'
+                    ? 'Advanced Request & Concurrency Tuning'
+                    : '高级请求、温度与并发参数'}
+                </span>
+                <span style={{ display: 'inline-flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+                  <StatusPill tone="mono">{advancedSummaryLabel}</StatusPill>
+                  <span class="mp-advanced-chevron">▸</span>
+                </span>
+              </summary>
+
+              <div class="mp-advanced-body">
+                {isAiProtocol ? (
+                  <>
+                    <FieldRow
+                      stacked
+                      label={lang === 'en' ? 'Temperature Policy (2-Mode)' : '采样温度策略 (Temperature 双模式)'}
+                      badge={
+                        effectiveTemp ? (
+                          <StatusPill
+                            tone={effectiveTemp.value === undefined ? 'accent' : 'ok'}
+                            dataTestId="live-temperature-preview"
+                          >
+                            {describeTemperatureResolution({
+                              trace: effectiveTemp.trace,
+                              value: effectiveTemp.value,
+                              model: provider.model,
+                              assistantName: boundAssistant?.name,
+                              lang,
+                            })}
+                          </StatusPill>
+                        ) : null
+                      }
+                      hint={
+                        lang === 'en'
+                          ? 'Omit never sends temperature:0, eliminating reasoning-model HTTP 400 errors.'
+                          : '「不发送 Omit」彻底消除旧版默认发送 temperature:0 引发的推理模型 400 报错。'
+                      }
+                    >
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '10px', flexWrap: 'wrap', width: '100%' }}>
+                        <SegmentedControl
+                          ariaLabel={lang === 'en' ? 'Temperature Mode' : '温度模式'}
+                          options={[
+                            {
+                              value: 'omit',
+                              label:
+                                lang === 'en'
+                                  ? 'Omit (Recommended for Reasoning)'
+                                  : '不发送 Omit (推荐推理模型)',
+                            },
+                            {
+                              value: 'custom',
+                              label: lang === 'en' ? 'Custom (0.0–2.0)' : '自定义数值 0.0–2.0',
+                            },
+                          ]}
+                          value={provider.temperaturePolicy.mode}
+                          onChange={(mode) =>
                             updateProvider((p) => {
-                              const prevForce =
-                                p.temperaturePolicy.mode === 'custom'
-                                  ? p.temperaturePolicy.forceOnReasoning
-                                  : undefined;
-                              p.temperaturePolicy = {
-                                mode: 'custom',
-                                value: clamped,
-                                ...(prevForce ? { forceOnReasoning: true } : {}),
-                              };
-                            });
-                          }}
+                              if (mode === 'omit') {
+                                p.temperaturePolicy = { mode: 'omit' };
+                              } else {
+                                p.temperaturePolicy = { mode: 'custom', value: 0.3 };
+                              }
+                            })
+                          }
                         />
 
-                        {isStrictTemperatureModel(provider.model) ? (
-                          <label style={{ display: 'inline-flex', alignItems: 'center', gap: '6px', fontSize: '12px' }}>
+                        {provider.temperaturePolicy.mode === 'custom' ? (
+                          <>
                             <input
-                              type="checkbox"
-                              checked={Boolean(provider.temperaturePolicy.forceOnReasoning)}
-                              onChange={(e) => {
-                                const checked = (e.currentTarget as HTMLInputElement).checked;
+                              type="number"
+                              class="mp-input mp-input--mono"
+                              aria-label={lang === 'en' ? 'Custom Temperature Value' : '自定义温度数值'}
+                              style={{ width: '92px' }}
+                              min={0}
+                              max={2}
+                              step={0.1}
+                              value={provider.temperaturePolicy.value}
+                              onInput={(e) => {
+                                const raw = Number.parseFloat((e.currentTarget as HTMLInputElement).value);
+                                const clamped = Number.isFinite(raw)
+                                  ? Math.max(0, Math.min(2, Math.round(raw * 1000) / 1000))
+                                  : 0.3;
                                 updateProvider((p) => {
-                                  if (p.temperaturePolicy.mode === 'custom') {
-                                    p.temperaturePolicy = {
-                                      mode: 'custom',
-                                      value: p.temperaturePolicy.value,
-                                      ...(checked ? { forceOnReasoning: true } : {}),
-                                    };
-                                  }
+                                  const prevForce =
+                                    p.temperaturePolicy.mode === 'custom'
+                                      ? p.temperaturePolicy.forceOnReasoning
+                                      : undefined;
+                                  p.temperaturePolicy = {
+                                    mode: 'custom',
+                                    value: clamped,
+                                    ...(prevForce ? { forceOnReasoning: true } : {}),
+                                  };
                                 });
                               }}
                             />
-                            <span class="mp-muted">
-                              {lang === 'en' ? 'Force send on reasoning model' : '强制向推理模型发送'}
-                            </span>
-                          </label>
-                        ) : null}
-                      </>
-                    ) : null}
-                  </div>
-                </FieldRow>
 
-                <FieldRow
-                  label={lang === 'en' ? 'Thinking / Reasoning Policy' : '深度思考策略 (ThinkingPolicy)'}
-                  hint={
-                    lang === 'en'
-                      ? 'Controls thinking budget or disables reasoning when fast low-latency translation is preferred'
-                      : '控制推理预算或关闭思考链以降低翻译首字延迟'
-                  }
-                >
-                  <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
-                    <SegmentedControl
-                      ariaLabel={lang === 'en' ? 'Thinking Policy' : '深度思考策略'}
-                      options={[
-                        { value: 'provider-default', label: lang === 'en' ? 'Default' : '默认' },
-                        { value: 'disabled', label: lang === 'en' ? 'Disabled' : '关闭' },
-                        { value: 'enabled', label: lang === 'en' ? 'Enabled' : '开启' },
-                      ]}
-                      value={provider.thinkingPolicy.mode}
-                      onChange={(mode: ThinkingPolicy['mode']) =>
-                        updateProvider((p) => {
-                          if (mode === 'enabled') {
-                            p.thinkingPolicy = { mode: 'enabled', budgetTokens: 2048 };
-                          } else {
-                            p.thinkingPolicy = { mode };
-                          }
-                        })
+                            {isStrictTemperatureModel(provider.model) ? (
+                              <label style={{ display: 'inline-flex', alignItems: 'center', gap: '6px', fontSize: '12px' }}>
+                                <input
+                                  type="checkbox"
+                                  checked={Boolean(provider.temperaturePolicy.forceOnReasoning)}
+                                  onChange={(e) => {
+                                    const checked = (e.currentTarget as HTMLInputElement).checked;
+                                    updateProvider((p) => {
+                                      if (p.temperaturePolicy.mode === 'custom') {
+                                        p.temperaturePolicy = {
+                                          mode: 'custom',
+                                          value: p.temperaturePolicy.value,
+                                          ...(checked ? { forceOnReasoning: true } : {}),
+                                        };
+                                      }
+                                    });
+                                  }}
+                                />
+                                <span class="mp-muted">
+                                  {lang === 'en' ? 'Force send on reasoning model' : '强制向推理模型发送'}
+                                </span>
+                              </label>
+                            ) : null}
+                          </>
+                        ) : null}
+                      </div>
+                    </FieldRow>
+
+                    <FieldRow
+                      label={lang === 'en' ? 'Thinking / Reasoning Policy' : '深度思考策略 (ThinkingPolicy)'}
+                      hint={
+                        lang === 'en'
+                          ? 'Controls thinking budget or disables reasoning when fast low-latency translation is preferred'
+                          : '控制推理预算或关闭思考链以降低首屏译文延迟'
                       }
-                    />
-                    {provider.thinkingPolicy.mode === 'enabled' ? (
+                    >
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+                        <SegmentedControl
+                          ariaLabel={lang === 'en' ? 'Thinking Policy' : '深度思考策略'}
+                          options={[
+                            { value: 'provider-default', label: lang === 'en' ? 'Default' : '默认' },
+                            { value: 'disabled', label: lang === 'en' ? 'Disabled' : '关闭' },
+                            { value: 'enabled', label: lang === 'en' ? 'Enabled' : '开启' },
+                          ]}
+                          value={provider.thinkingPolicy.mode}
+                          onChange={(mode: ThinkingPolicy['mode']) =>
+                            updateProvider((p) => {
+                              if (mode === 'enabled') {
+                                p.thinkingPolicy = { mode: 'enabled', budgetTokens: 2048 };
+                              } else {
+                                p.thinkingPolicy = { mode };
+                              }
+                            })
+                          }
+                        />
+                        {provider.thinkingPolicy.mode === 'enabled' ? (
+                          <input
+                            type="number"
+                            class="mp-input mp-input--mono"
+                            style={{ width: '104px' }}
+                            min={256}
+                            max={32768}
+                            step={256}
+                            value={provider.thinkingPolicy.budgetTokens ?? 2048}
+                            onInput={(e) => {
+                              const budget = Number.parseInt((e.currentTarget as HTMLInputElement).value, 10);
+                              updateProvider((p) => {
+                                p.thinkingPolicy = {
+                                  mode: 'enabled',
+                                  budgetTokens: Number.isFinite(budget) ? Math.max(256, budget) : 2048,
+                                };
+                              });
+                            }}
+                          />
+                        ) : null}
+                      </div>
+                    </FieldRow>
+
+                    <FieldRow label={lang === 'en' ? 'SSE Streaming' : '流式响应传输 (SSE Stream)'}>
+                      <SegmentedControl
+                        ariaLabel={lang === 'en' ? 'Stream Policy' : '流式响应传输'}
+                        options={[
+                          { value: 'auto', label: lang === 'en' ? 'Auto' : '自动' },
+                          { value: 'on', label: lang === 'en' ? 'On' : '开启' },
+                          { value: 'off', label: lang === 'en' ? 'Off' : '关闭' },
+                        ]}
+                        value={provider.stream}
+                        onChange={(next) =>
+                          updateProvider((p) => {
+                            p.stream = next;
+                          })
+                        }
+                      />
+                    </FieldRow>
+
+                    <FieldRow
+                      label={lang === 'en' ? 'Inject Document Context' : '注入页面标题与摘要上下文'}
+                    >
+                      <ToggleSwitch
+                        ariaLabel={lang === 'en' ? 'Inject Document Context' : '注入页面标题与摘要上下文'}
+                        checked={provider.enableContext}
+                        onChange={(next) =>
+                          updateProvider((p) => {
+                            p.enableContext = next;
+                          })
+                        }
+                      />
+                    </FieldRow>
+                  </>
+                ) : null}
+
+                {/* Rate Limit & Concurrency */}
+                <FieldRow
+                  label={lang === 'en' ? 'Rate Limit (RPS) & Max Concurrency' : '请求速率上限 (RPS) 与并发度'}
+                >
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                    <label class="mp-muted" style={{ fontSize: '12px' }}>
+                      RPS
                       <input
                         type="number"
                         class="mp-input mp-input--mono"
-                        style={{ width: '104px' }}
-                        min={256}
-                        max={32768}
-                        step={256}
-                        value={provider.thinkingPolicy.budgetTokens ?? 2048}
+                        style={{ width: '76px', marginLeft: '6px' }}
+                        min={1}
+                        max={200}
+                        value={provider.rateLimitRps}
                         onInput={(e) => {
-                          const budget = Number.parseInt((e.currentTarget as HTMLInputElement).value, 10);
+                          const val = Number.parseInt((e.currentTarget as HTMLInputElement).value, 10);
                           updateProvider((p) => {
-                            p.thinkingPolicy = {
-                              mode: 'enabled',
-                              budgetTokens: Number.isFinite(budget) ? Math.max(256, budget) : 2048,
-                            };
+                            p.rateLimitRps = Number.isFinite(val) ? Math.max(1, val) : 20;
                           });
                         }}
                       />
-                    ) : null}
+                    </label>
+
+                    <label class="mp-muted" style={{ fontSize: '12px' }}>
+                      {lang === 'en' ? 'Concurrency' : '并发'}
+                      <input
+                        type="number"
+                        class="mp-input mp-input--mono"
+                        style={{ width: '72px', marginLeft: '6px' }}
+                        min={1}
+                        max={32}
+                        value={provider.maxConcurrency}
+                        onInput={(e) => {
+                          const val = Number.parseInt((e.currentTarget as HTMLInputElement).value, 10);
+                          updateProvider((p) => {
+                            p.maxConcurrency = Number.isFinite(val) ? Math.max(1, val) : 4;
+                          });
+                        }}
+                      />
+                    </label>
                   </div>
                 </FieldRow>
-
-                <FieldRow label={lang === 'en' ? 'SSE Streaming' : '流式响应传输 (SSE Stream)'}>
-                  <SegmentedControl
-                    ariaLabel={lang === 'en' ? 'Stream Policy' : '流式响应传输'}
-                    options={[
-                      { value: 'auto', label: lang === 'en' ? 'Auto' : '自动' },
-                      { value: 'on', label: lang === 'en' ? 'On' : '开启' },
-                      { value: 'off', label: lang === 'en' ? 'Off' : '关闭' },
-                    ]}
-                    value={provider.stream}
-                    onChange={(next) =>
-                      updateProvider((p) => {
-                        p.stream = next;
-                      })
-                    }
-                  />
-                </FieldRow>
-
-                <FieldRow
-                  label={lang === 'en' ? 'Inject Document Context' : '注入页面标题与摘要上下文'}
-                >
-                  <ToggleSwitch
-                    ariaLabel={lang === 'en' ? 'Inject Document Context' : '注入页面标题与摘要上下文'}
-                    checked={provider.enableContext}
-                    onChange={(next) =>
-                      updateProvider((p) => {
-                        p.enableContext = next;
-                      })
-                    }
-                  />
-                </FieldRow>
-              </>
-            ) : null}
-
-            {/* Rate Limit & Concurrency */}
-            <FieldRow
-              label={lang === 'en' ? 'Rate Limit (RPS) & Max Concurrency' : '请求速率上限 (RPS) 与并发度'}
-            >
-              <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-                <label class="mp-muted" style={{ fontSize: '12px' }}>
-                  RPS
-                  <input
-                    type="number"
-                    class="mp-input mp-input--mono"
-                    style={{ width: '76px', marginLeft: '6px' }}
-                    min={1}
-                    max={200}
-                    value={provider.rateLimitRps}
-                    onInput={(e) => {
-                      const val = Number.parseInt((e.currentTarget as HTMLInputElement).value, 10);
-                      updateProvider((p) => {
-                        p.rateLimitRps = Number.isFinite(val) ? Math.max(1, val) : 20;
-                      });
-                    }}
-                  />
-                </label>
-
-                <label class="mp-muted" style={{ fontSize: '12px' }}>
-                  {lang === 'en' ? 'Concurrency' : '并发'}
-                  <input
-                    type="number"
-                    class="mp-input mp-input--mono"
-                    style={{ width: '72px', marginLeft: '6px' }}
-                    min={1}
-                    max={32}
-                    value={provider.maxConcurrency}
-                    onInput={(e) => {
-                      const val = Number.parseInt((e.currentTarget as HTMLInputElement).value, 10);
-                      updateProvider((p) => {
-                        p.maxConcurrency = Number.isFinite(val) ? Math.max(1, val) : 4;
-                      });
-                    }}
-                  />
-                </label>
               </div>
-            </FieldRow>
+            </details>
           </div>
         ) : null}
       </section>

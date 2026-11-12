@@ -2,6 +2,7 @@ import { BRAND } from '@shared/brand';
 import type {
   MarginActiveCueState,
   SubtitleCue,
+  SubtitleStylePreset,
   YoutubeMainBridgeMessage,
 } from '@shared/types';
 
@@ -86,6 +87,33 @@ export function clampFontSizePercent(value: unknown, fallback = 70): number {
   return Math.min(160, Math.max(40, Math.round(num)));
 }
 
+export function normalizeSubtitleStylePreset(
+  value: unknown,
+): SubtitleStylePreset {
+  if (value === 'cinema-outline' || value === 'warm-paper') {
+    return value;
+  }
+  return 'youtube-native';
+}
+
+export function resolveEffectiveTranslationScale(settings: {
+  translationScalePercent?: number;
+  fontSizePercent?: number;
+}): number {
+  if (
+    typeof settings.translationScalePercent === 'number' &&
+    typeof settings.fontSizePercent === 'number' &&
+    settings.translationScalePercent === 70 &&
+    settings.fontSizePercent !== 70
+  ) {
+    return clampFontSizePercent(settings.fontSizePercent, 70);
+  }
+  return clampFontSizePercent(
+    settings.translationScalePercent ?? settings.fontSizePercent,
+    70,
+  );
+}
+
 /**
  * Normalizes `MarginActiveCueState` and suppresses duplicate `translated === original`.
  */
@@ -112,7 +140,19 @@ export function normalizeActiveCueState(
   const position: MarginActiveCueState['position'] =
     input?.position === 'top' ? 'top' : 'bottom';
 
-  const fontSizePercent = clampFontSizePercent(input?.fontSizePercent, 70);
+  const sourceScalePercent = clampFontSizePercent(
+    input?.sourceScalePercent,
+    100,
+  );
+  const translationScalePercent =
+    input?.translationScalePercent !== undefined
+      ? clampFontSizePercent(input.translationScalePercent, 70)
+      : clampFontSizePercent(input?.fontSizePercent, 70);
+  const fontSizePercent =
+    input?.fontSizePercent !== undefined
+      ? clampFontSizePercent(input.fontSizePercent, translationScalePercent)
+      : translationScalePercent;
+  const stylePreset = normalizeSubtitleStylePreset(input?.stylePreset);
 
   return {
     original,
@@ -121,6 +161,9 @@ export function normalizeActiveCueState(
     endMs,
     mode,
     fontSizePercent,
+    sourceScalePercent,
+    translationScalePercent,
+    stylePreset,
     position,
   };
 }

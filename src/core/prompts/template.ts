@@ -21,10 +21,47 @@ const DEFAULT_OPTIONAL_PROMPT_VARS: Readonly<Record<string, string>> = {
   extra_prompt: '',
 };
 
+const BUILTIN_CONDITIONAL_ENV_DEFAULTS: Readonly<Record<string, string>> = {
+  title_prompt: 'Document Title: {{imt_title}}\n',
+  summary_prompt: 'Context Summary: {{imt_summary}}\n',
+  terms_prompt: 'Required Glossary: {{imt_terms}}\n',
+  sub_summary_prompt: 'Video Context: {{imt_summary}}\n',
+  sub_terms_prompt: 'Required Glossary: {{imt_terms}}\n',
+};
+
+const RICH_TAG_MARKER_RE = /<\/?m(?:\d+|N)\b/i;
+
+const DEFAULT_RICH_TAG_INSTRUCTION =
+  'HTML Tag Rule: When the source contains inline <m0>...</m0>, <m1>...</m1> tags, preserve every <mN>...</mN> tag pair and its exact numeric index around the corresponding translated phrase without adding, dropping, or renaming tags.';
+
 export function hasRichMarkupInItems(items: readonly BatchItemInput[]): boolean {
   return items.some(
     (item) => item.hasRichTags === true || /<\/?m\d+\b/i.test(item.text),
   );
+}
+
+/**
+ * Ensures custom imported prompts that omitted `{{html_only}}` still instruct
+ * the model to preserve `<m0>...</m0>` inline markup placeholders whenever the
+ * encoded batch actually contains rich inline tags.
+ */
+export function ensureRichTagInstruction(
+  systemPrompt: string,
+  userPrompt: string,
+  items: readonly BatchItemInput[],
+): string {
+  if (!hasRichMarkupInItems(items)) {
+    return systemPrompt;
+  }
+  if (
+    RICH_TAG_MARKER_RE.test(systemPrompt) ||
+    RICH_TAG_MARKER_RE.test(userPrompt)
+  ) {
+    return systemPrompt;
+  }
+  return systemPrompt
+    ? `${systemPrompt}\n\n${DEFAULT_RICH_TAG_INSTRUCTION}`
+    : DEFAULT_RICH_TAG_INSTRUCTION;
 }
 
 export function stripThinkingBlocks(raw: string): string {
@@ -149,9 +186,13 @@ export function buildExpandedPromptVariables(
     ...extraVars,
   };
 
-  // Evaluate `assistant.env` entries (excluding item row templates expanded per-item)
+  // Evaluate `assistant.env` entries (with built-in conditional header fallbacks when omitted)
   const ITEM_TEMPLATE_KEYS = new Set(['imt_yaml_item', 'imt_subtitle_yaml_item']);
-  const envEntries = Object.entries(rawEnv).filter(
+  const effectiveEnv: Record<string, string> = {
+    ...BUILTIN_CONDITIONAL_ENV_DEFAULTS,
+    ...rawEnv,
+  };
+  const envEntries = Object.entries(effectiveEnv).filter(
     ([k]) => !ITEM_TEMPLATE_KEYS.has(k),
   );
 

@@ -19,6 +19,7 @@ import type {
   ProviderConfig,
   ProviderPreset,
   SelectionTriggerMode,
+  SubtitleStylePreset,
   TemperaturePolicy,
   ThemePatternRule,
   ThinkingPolicy,
@@ -1400,10 +1401,32 @@ function importNativeMarginV2(
     ) {
       config.subtitles.displayMode = sub.displayMode;
     }
-    config.subtitles.fontSizePercent = toPositiveInt(
-      sub.fontSizePercent,
-      config.subtitles.fontSizePercent,
+    const legacyTransScale = Math.max(
+      50,
+      Math.min(160, toPositiveInt(sub.fontSizePercent, config.subtitles.fontSizePercent)),
     );
+    config.subtitles.sourceScalePercent = Math.max(
+      50,
+      Math.min(
+        160,
+        toPositiveInt(sub.sourceScalePercent, config.subtitles.sourceScalePercent ?? 100),
+      ),
+    );
+    config.subtitles.translationScalePercent = Math.max(
+      50,
+      Math.min(
+        160,
+        toPositiveInt(sub.translationScalePercent, legacyTransScale),
+      ),
+    );
+    config.subtitles.fontSizePercent = config.subtitles.translationScalePercent;
+    if (
+      sub.stylePreset === 'youtube-native' ||
+      sub.stylePreset === 'cinema-outline' ||
+      sub.stylePreset === 'warm-paper'
+    ) {
+      config.subtitles.stylePreset = sub.stylePreset as SubtitleStylePreset;
+    }
     if (sub.position === 'bottom' || sub.position === 'top') {
       config.subtitles.position = sub.position;
     }
@@ -1765,8 +1788,8 @@ export function importLegacyConfig(
   if (subtitleRule.translationFontSize !== undefined) {
     const rawFs = subtitleRule.translationFontSize;
     const coercedFs = Math.max(
-      30,
-      Math.min(200, toPositiveInt(rawFs, config.subtitles.fontSizePercent)),
+      50,
+      Math.min(160, toPositiveInt(rawFs, config.subtitles.fontSizePercent)),
     );
     if (typeof rawFs === 'string' && rawFs.trim() !== '') {
       ctx.onNormalized();
@@ -1777,6 +1800,23 @@ export function importLegacyConfig(
       });
     }
     config.subtitles.fontSizePercent = coercedFs;
+    config.subtitles.translationScalePercent = coercedFs;
+  }
+  if (subtitleRule.originalFontSize !== undefined || subtitleRule.sourceScalePercent !== undefined) {
+    const rawOrig = subtitleRule.sourceScalePercent ?? subtitleRule.originalFontSize;
+    config.subtitles.sourceScalePercent = Math.max(
+      50,
+      Math.min(160, toPositiveInt(rawOrig, config.subtitles.sourceScalePercent ?? 100)),
+    );
+  }
+  if (!config.subtitles.sourceScalePercent) {
+    config.subtitles.sourceScalePercent = 100;
+  }
+  if (!config.subtitles.translationScalePercent) {
+    config.subtitles.translationScalePercent = config.subtitles.fontSizePercent || 70;
+  }
+  if (!config.subtitles.stylePreset) {
+    config.subtitles.stylePreset = 'youtube-native';
   }
   const rawSubPos = nonEmptyString(subtitleRule.translationPosition)?.toLowerCase();
   if (rawSubPos === 'bottom' || rawSubPos === 'top') {

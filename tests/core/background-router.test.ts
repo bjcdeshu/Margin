@@ -606,4 +606,87 @@ describe('MV3 Background Router, Vision BBox Parser, DNR Anti-403, Stream Port &
       },
     ]);
   });
+
+  it('fails fast on request & SSE idle timeouts without 3x retry hangs, guards disabled providers, and broadcasts cache clear to open tabs', async () => {
+    const config = createDefaultMarginConfig();
+    config.providers['disabled-ai'] = {
+      ...config.providers['google-free'],
+      id: 'disabled-ai',
+      name: 'Disabled Channel',
+      preset: 'openai',
+      protocol: 'openai-chat',
+      enabled: false,
+      baseUrl: 'https://gateway.example.com/v1',
+      apiKeys: ['sk-TEST_FAKE'],
+      model: 'gpt-4o-mini',
+    };
+    await saveMarginConfig(config);
+
+    // 1. Disabled explicit provider is rejected cleanly for normal translation scenes
+    const disabledResp = (await handleRuntimeRpcRequest({
+      type: 'margin:translate-batch',
+      payload: {
+        requestId: 'req-disabled-1',
+        scene: 'webpage',
+        providerId: 'disabled-ai',
+        fromLang: 'en',
+        toLang: 'zh-CN',
+        items: [{ id: 1, text: 'Hello' }],
+      },
+    })) as TranslateBatchResponse;
+    expect(disabledResp.ok).toBe(false);
+    expect(disabledResp.error?.code).toBe('PROVIDER_DISABLED');
+
+    // 2. Hung Google Translate endpoint fails fast (`attempts: 1`, no 3x retry multiplication)
+    let googleAttempts = 0;
+    const hungFetch = vi.fn(() => {
+      googleAttempts++;
+      return new Promise<Response>(() => {
+        // Never resolves — simulates blocked translate.googleapis.com
+      });
+    });
+
+    const timeoutResp = (await handleRuntimeRpcRequest(
+      {
+        type: 'margin:translate-batch',
+        payload: {
+          requestId: 'req-timeout-1',
+          scene: 'webpage',
+          providerId: 'google-free',
+          fromLang: 'en',
+          toLang: 'zh-CN',
+          items: [{ id: 1, text: 'Blocked endpoint test' }],
+        },
+      },
+      {
+        fetchImpl: hungFetch as unknown as typeof fetch,
+        pool: new ProviderExecutionPool(),
+        requestTimeoutMs: 25,
+        retryBaseDelayMs: 0,
+      },
+    )) as TranslateBatchResponse;
+
+    expect(timeoutResp.ok).toBe(false);
+    expect(timeoutResp.error?.code).toBe('NETWORK_ERROR');
+    expect(timeoutResp.error?.message).toMatch(/timed out/i);
+    expect(googleAttempts).toBe(1);
+
+    // 3. `margin:clear-translation-cache` broadcasts `margin:cmd:clear-page-cache` to open tabs
+    const broadcasted: Array<{ tabId: number; msg: unknown }> = [];
+    globalThis.chrome = {
+      tabs: {
+        query: vi.fn(async () => [{ id: 11 }, { id: 22 }] as chrome.tabs.Tab[]),
+        sendMessage: vi.fn(async (tabId: number, msg: unknown) => {
+          broadcasted.push({ tabId, msg });
+          return { ok: true };
+        }),
+      },
+    } as unknown as typeof chrome;
+
+    await handleRuntimeRpcRequest({ type: 'margin:clear-translation-cache' });
+    expect(broadcasted).toEqual([
+      { tabId: 11, msg: { type: 'margin:cmd:clear-page-cache' } },
+      { tabId: 22, msg: { type: 'margin:cmd:clear-page-cache' } },
+    ]);
+  });
 });

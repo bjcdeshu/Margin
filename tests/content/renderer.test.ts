@@ -16,6 +16,7 @@ import {
   WEBPAGE_INJECTED_CSS,
   WebpageRenderer,
   packIntoBatches,
+  packIntoProgressiveBatches,
 } from '../../src/content/renderer';
 
 function makeMockDiagnostic(): DiagnosticSnapshot {
@@ -128,7 +129,7 @@ describe('renderer & content orchestrator: themes, reversible target-only, retry
     expect(p.querySelector('[data-margin-orig-wrap="true"]')).toBeNull();
     expect(p.querySelector('a')).toBe(originalLinkInstance);
     expect(transSpan.getAttribute('data-margin-theme')).toBe('opacity');
-    expect(transSpan.getAttribute('data-margin-layout')).toBe('inline');
+    expect(transSpan.getAttribute('data-margin-layout')).toBe('block');
 
     // Restore page completely: exact original DOM node reference remains intact
     renderer.restorePage();
@@ -140,17 +141,19 @@ describe('renderer & content orchestrator: themes, reversible target-only, retry
     renderer.destroy();
   });
 
-  it('applies lineBreakMaxTextCount (<= 280 inline vs > 280 block) and URL themePatterns', async () => {
+  it('uses separated block layout for prose/tweets, inline layout only for short compact table/term cells, and URL themePatterns', async () => {
     const config = createDefaultMarginConfig();
     config.webpage.theme = 'mask';
     config.webpage.themePatterns = [{ pattern: 'https://arxiv.org/*', theme: 'weakening' }];
-    config.webpage.lineBreakMaxTextCount = 280;
 
     const shortP = document.createElement('p');
     shortP.textContent = 'Short concise sentence.';
     const longP = document.createElement('p');
-    longP.textContent = 'Long analytical paragraph. '.repeat(14); // > 280 chars
-    document.body.append(shortP, longP);
+    longP.textContent = 'Long analytical paragraph. '.repeat(14);
+    const table = document.createElement('table');
+    table.innerHTML = '<tr><th id="th-short">Latency</th></tr>';
+    document.body.append(shortP, longP, table);
+    const shortTh = document.getElementById('th-short')!;
 
     const renderer = new WebpageRenderer({
       config,
@@ -169,10 +172,13 @@ describe('renderer & content orchestrator: themes, reversible target-only, retry
 
     const shortSpan = shortP.querySelector('.margin-trans-root')!;
     const longSpan = longP.querySelector('.margin-trans-root')!;
+    const thSpan = shortTh.querySelector('.margin-trans-root')!;
 
     expect(shortSpan.getAttribute('data-margin-theme')).toBe('weakening');
-    expect(shortSpan.getAttribute('data-margin-layout')).toBe('inline');
+    expect(shortSpan.getAttribute('data-margin-layout')).toBe('block');
     expect(longSpan.getAttribute('data-margin-layout')).toBe('block');
+    expect(thSpan.getAttribute('data-margin-layout')).toBe('inline');
+    expect(WEBPAGE_INJECTED_CSS).toContain('white-space: pre-line;');
 
     renderer.destroy();
   });
@@ -481,6 +487,126 @@ describe('renderer & content orchestrator: themes, reversible target-only, retry
       await controller.handleCommand({ type: 'margin:cmd:toggle-page' }),
     ).toBe(false);
     expect(p1.querySelector('.margin-trans-root')).toBeNull();
+
+    controller.destroy();
+  });
+
+  it('packs progressive micro-batches ([3, 5, 10]), shows per-block loading spinner & status pill, overwrites partial stream items on final decode, re-translates on targetLang change, and deduplicates 280ms cold-SW Alt+A', async () => {
+    // 1. Progressive micro-batching check
+    const items = Array.from({ length: 20 }, (_, i) => ({
+      id: i + 1,
+      charCount: 80,
+    }));
+    const progressive = packIntoProgressiveBatches(items, 10, 3200);
+    expect(progressive.map((b) => b.length)).toEqual([3, 5, 10, 2]);
+
+    // 2. Loading spinner + fuller final overwrite + toggle ON->OFF->ON + live targetLang switch
+    const config = createDefaultMarginConfig();
+    config.providers['google-free'].stream = 'on';
+
+    const p = document.createElement('p');
+    p.textContent = 'Multi-paragraph announcement.\n\nSecond paragraph details.';
+    document.body.appendChild(p);
+
+    let releaseBatch!: () => void;
+    let barrier = new Promise<void>((r) => {
+      releaseBatch = r;
+    });
+    const seenRequests: TranslateBatchRequest[] = [];
+
+    let fakeNow = 5000;
+    const controller = new MarginContentController({
+      config,
+      now: () => fakeNow,
+      getUrl: () => 'https://x.com/ubuntu/status/999',
+      transport: async (req, callbacks) => {
+        seenRequests.push(req);
+        if (req.toLang === 'ja') {
+          return {
+            ok: true,
+            requestId: req.requestId,
+            providerId: 'google-free',
+            model: 'gtx',
+            items: req.items.map((it) => ({ id: it.id, trans: '日本語の翻訳結果' })),
+            diagnostic: makeMockDiagnostic(),
+          };
+        }
+        callbacks.onItemReady?.({ id: 1, trans: '第一段局部流式译文' });
+        await barrier;
+        return {
+          ok: true,
+          requestId: req.requestId,
+          providerId: 'google-free',
+          model: 'gtx',
+          items: [
+            { id: 1, trans: '第一段局部流式译文\n\n第二段完整收敛译文' },
+          ],
+          diagnostic: makeMockDiagnostic(),
+        };
+      },
+    });
+    controller.mount();
+
+    // Key trigger at t=5000ms, followed by cold-SW Chrome command at t=5280ms (+280ms <= 1200ms) -> MUST NOT undo!
+    const firstTogglePromise = controller.handleCommand(
+      { type: 'margin:cmd:toggle-page' },
+      'key',
+    );
+    expect(await firstTogglePromise).toBe(true);
+    expect(controller.renderer.isActive).toBe(true);
+
+    fakeNow += 280;
+    expect(
+      await controller.handleCommand({ type: 'margin:cmd:toggle-page' }, 'cmd'),
+    ).toBe(false);
+    expect(controller.renderer.isActive).toBe(true);
+
+    // Immediate first-viewport queueing starts translating without waiting for IntersectionObserver!
+    await vi.waitFor(() => {
+      expect(p.querySelector('.margin-trans-root')?.textContent).toBe(
+        '第一段局部流式译文',
+      );
+    });
+    expect(seenRequests[0]?.context?.domain).toBe('x.com');
+
+    // Final batch response has fuller multi-paragraph translation -> overwrites partial stream text!
+    releaseBatch();
+    await vi.waitFor(() => {
+      expect(p.querySelector('.margin-trans-root')?.textContent).toBe(
+        '第一段局部流式译文\n\n第二段完整收敛译文',
+      );
+    });
+
+    // Toggle OFF -> ON re-translates cleanly (observedBlocks reset on restorePage)
+    fakeNow += 2000;
+    await controller.handleCommand({ type: 'margin:cmd:toggle-page' }, 'cmd');
+    expect(controller.renderer.isActive).toBe(false);
+    expect(p.querySelector('.margin-trans-root')).toBeNull();
+
+    barrier = Promise.resolve();
+    await controller.handleCommand({ type: 'margin:cmd:toggle-page' }, 'cmd');
+    await vi.waitFor(() => {
+      expect(p.querySelector('.margin-trans-root')?.textContent).toContain(
+        '第二段完整收敛译文',
+      );
+    });
+
+    // Live targetLang change ('zh-CN' -> 'ja') automatically re-translates active page!
+    const jaCfg = structuredClone(config);
+    jaCfg.targetLang = 'ja';
+    await saveMarginConfig(jaCfg);
+    await vi.waitFor(() => {
+      expect(p.querySelector('.margin-trans-root')?.textContent).toBe(
+        '日本語の翻訳結果',
+      );
+    });
+
+    // Adding domain to excludeMatches immediately restores active page!
+    const excludedCfg = structuredClone(jaCfg);
+    excludedCfg.urlRules.excludeMatches = ['https://x.com/*'];
+    await saveMarginConfig(excludedCfg);
+    expect(controller.renderer.isActive).toBe(false);
+    expect(p.querySelector('.margin-trans-root')).toBeNull();
 
     controller.destroy();
   });

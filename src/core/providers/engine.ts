@@ -31,6 +31,7 @@ import {
 import { executeGoogleWebCall } from './google-web';
 import { executeOpenAiChatCall } from './openai-chat';
 import { abortableSleep, defaultProviderPool } from './pool';
+import { ProviderTimeoutError } from './timeout';
 import {
   type ExecuteBatchOptions,
   type ExecuteBatchResult,
@@ -119,6 +120,8 @@ async function runSelfHealingAiCompletion(
     fetchImpl = globalThis.fetch.bind(globalThis),
     pool = defaultProviderPool,
     retryBaseDelayMs = 600,
+    requestTimeoutMs,
+    streamIdleTimeoutMs,
     signal,
   } = input;
 
@@ -182,6 +185,8 @@ async function runSelfHealingAiCompletion(
             stream,
             onDelta: wrappedOnDelta,
             fetchImpl,
+            requestTimeoutMs,
+            streamIdleTimeoutMs,
             signal,
           });
         }
@@ -196,6 +201,8 @@ async function runSelfHealingAiCompletion(
           stream,
           onDelta: wrappedOnDelta,
           fetchImpl,
+          requestTimeoutMs,
+          streamIdleTimeoutMs,
           signal,
         });
       });
@@ -278,8 +285,10 @@ async function runSelfHealingAiCompletion(
         };
       }
 
-      // Network / fetch reset error (no HTTP status received): retry up to 2 times if no stream deltas emitted
+      // Request / SSE idle timeout fails fast without multiplying wait time by 3x
+      const isTimeout = err instanceof ProviderTimeoutError;
       if (
+        !isTimeout &&
         transientRetriesUsed < MAX_TRANSIENT_RETRIES &&
         deltasEmittedThisAttempt === 0
       ) {
@@ -327,6 +336,8 @@ export async function executeBatchWithProvider(
     fetchImpl = globalThis.fetch.bind(globalThis),
     pool = defaultProviderPool,
     retryBaseDelayMs = 600,
+    requestTimeoutMs,
+    streamIdleTimeoutMs,
     signal,
   } = options;
 
@@ -412,6 +423,7 @@ export async function executeBatchWithProvider(
               fromLang,
               toLang,
               fetchImpl,
+              requestTimeoutMs,
               signal,
             });
           }
@@ -422,6 +434,7 @@ export async function executeBatchWithProvider(
             fromLang,
             toLang,
             fetchImpl,
+            requestTimeoutMs,
             signal,
             maxCharsPerChunk: provider.maxCharsPerBatch,
           });
@@ -547,7 +560,14 @@ export async function executeBatchWithProvider(
           pool.markEndpointUnhealthy(provider.id, currentEndpoint);
         }
 
-        if (transientRetriesUsed < MAX_TRANSIENT_RETRIES) {
+        const isTimeout = err instanceof ProviderTimeoutError;
+        const maxNetworkRetries = isTimeout
+          ? provider.protocol === 'deeplx' && deeplxEndpoints.length > 1
+            ? 1
+            : 0
+          : MAX_TRANSIENT_RETRIES;
+
+        if (transientRetriesUsed < maxNetworkRetries) {
           transientRetriesUsed++;
           await abortableSleep(
             computeBackoffDelayMs(transientRetriesUsed, retryBaseDelayMs),
@@ -672,6 +692,8 @@ export async function executeBatchWithProvider(
     fetchImpl,
     pool,
     retryBaseDelayMs,
+    requestTimeoutMs,
+    streamIdleTimeoutMs,
     signal,
   });
 
@@ -835,6 +857,8 @@ export async function executeVisionWithProvider(
     fetchImpl = globalThis.fetch.bind(globalThis),
     pool = defaultProviderPool,
     retryBaseDelayMs = 600,
+    requestTimeoutMs,
+    streamIdleTimeoutMs,
     signal,
   } = options;
 
@@ -896,6 +920,8 @@ export async function executeVisionWithProvider(
     fetchImpl,
     pool,
     retryBaseDelayMs,
+    requestTimeoutMs,
+    streamIdleTimeoutMs,
     signal,
   });
 

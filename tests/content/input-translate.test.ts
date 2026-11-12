@@ -283,4 +283,53 @@ describe('input-translate: Triple-Space, Alt+I, CJK direction, ShadowRoot, Escap
 
     translator.destroy();
   });
+
+  it('preserves multi-line [contenteditable] line breaks across translation & undo, and hides Shadow pill host via [hidden] on settle', async () => {
+    const config = createDefaultMarginConfig();
+    const sentTexts: string[] = [];
+
+    const translator = new InputQuickTranslator({
+      config,
+      transport: async (req) => {
+        sentTexts.push(req.items[0]?.text ?? '');
+        return {
+          ok: true,
+          requestId: req.requestId,
+          providerId: 'google-free',
+          model: 'gtx',
+          items: [{ id: 1, trans: 'First paragraph\nSecond paragraph' }],
+          diagnostic: mockDiag(),
+        };
+      },
+    });
+    translator.mount();
+
+    const editor = document.createElement('div');
+    editor.setAttribute('contenteditable', 'true');
+    editor.innerHTML = '<div>第一段草稿</div><div>第二段草稿</div>';
+    document.body.appendChild(editor);
+    editor.focus();
+
+    expect(await translator.translateTarget(editor)).toBe(true);
+    expect(sentTexts).toEqual(['第一段草稿\n第二段草稿']);
+    expect(editor.querySelectorAll('br').length).toBeGreaterThanOrEqual(1);
+
+    const pillHost = document.querySelector(
+      '[data-margin-host="input-pill"]',
+    ) as HTMLElement | null;
+    expect(pillHost?.hidden).toBe(true);
+
+    // Ctrl+Z restores multi-line original text cleanly
+    editor.dispatchEvent(
+      new KeyboardEvent('keydown', {
+        key: 'z',
+        ctrlKey: true,
+        bubbles: true,
+        cancelable: true,
+      }),
+    );
+    expect(editor.querySelectorAll('br').length).toBeGreaterThanOrEqual(1);
+
+    translator.destroy();
+  });
 });

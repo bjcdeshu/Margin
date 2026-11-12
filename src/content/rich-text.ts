@@ -1,4 +1,5 @@
 import {
+  BLOCK_BOUNDARY_TAGS,
   getBlockSourceContainer,
   isAtomicInlineElement,
   isExcludedElement,
@@ -311,6 +312,27 @@ export function stripResidualMarkers(text: string): string {
   return unescapeLiteralMarkerInRawText(withoutTags).replace(/ {2,}/g, ' ').trim();
 }
 
+function blockPreservesNewlines(blockEl: HTMLElement): boolean {
+  const inlineWs = blockEl.style?.whiteSpace?.trim().toLowerCase() ?? '';
+  if (inlineWs.startsWith('pre')) {
+    return true;
+  }
+  if (blockEl.isConnected) {
+    const view = blockEl.ownerDocument?.defaultView;
+    if (view && typeof view.getComputedStyle === 'function') {
+      try {
+        const computedWs = view.getComputedStyle(blockEl).whiteSpace?.trim().toLowerCase() ?? '';
+        if (computedWs.startsWith('pre')) {
+          return true;
+        }
+      } catch {
+        // Ignore computed-style errors on detached documents
+      }
+    }
+  }
+  return false;
+}
+
 /**
  * Tokenizes an HTML paragraph block into `<mN>` rich markers + plain text metadata.
  */
@@ -320,11 +342,13 @@ export function tokenizeParagraph(
 ): TokenizedParagraph {
   const enableRichHtml = options.enableRichHtml ?? true;
   const sourceContainer = getBlockSourceContainer(blockEl);
+  const preserveNewlines = blockPreservesNewlines(blockEl);
   const tokens = new Map<number, RichTokenDescriptor>();
   let plainChars = '';
   let nextId = 0;
 
   if (!enableRichHtml) {
+    const brSentinel = '\uE000';
     const collectPlain = (node: Node): void => {
       if (node.nodeType === Node.TEXT_NODE) {
         plainChars += node.nodeValue ?? '';
@@ -332,15 +356,17 @@ export function tokenizeParagraph(
       }
       if (node.nodeType !== Node.ELEMENT_NODE) return;
       const el = node as Element;
+      const upperTag = el.tagName.toUpperCase();
       if (
         el.hasAttribute('data-margin-injected') ||
         el.hasAttribute('data-margin-host') ||
-        isExcludedElement(el)
+        BLOCK_BOUNDARY_TAGS.has(upperTag) ||
+        isExcludedElement(el, { insideParagraph: true })
       ) {
         return;
       }
-      if (el.tagName.toUpperCase() === 'BR') {
-        plainChars += '\n';
+      if (upperTag === 'BR') {
+        plainChars += brSentinel;
         return;
       }
       for (let i = 0; i < el.childNodes.length; i++) {
@@ -351,7 +377,15 @@ export function tokenizeParagraph(
     for (let i = 0; i < sourceContainer.childNodes.length; i++) {
       collectPlain(sourceContainer.childNodes[i]);
     }
-    const normalized = plainChars.replace(/[ \t\f\v]+/g, ' ').trim();
+    const normalized = (
+      preserveNewlines
+        ? plainChars.replace(/\r\n?/g, '\n').replace(/[ \t\f\v]+/g, ' ')
+        : plainChars.replace(/\s+/g, ' ')
+    )
+      .split(brSentinel)
+      .map((part) => part.replace(/^[ \t]+|[ \t]+$/g, ''))
+      .join('\n')
+      .trim();
     return {
       text: normalized,
       hasRichTags: false,
@@ -389,11 +423,15 @@ export function tokenizeParagraph(
         continue;
       }
 
-      if (isExcludedElement(el)) {
+      const upperTag = el.tagName.toUpperCase();
+      if (BLOCK_BOUNDARY_TAGS.has(upperTag)) {
         continue;
       }
 
-      const upperTag = el.tagName.toUpperCase();
+      if (isExcludedElement(el, { insideParagraph: true })) {
+        continue;
+      }
+
       if (INLINE_FORMATTING_TAGS.has(upperTag)) {
         const reservedId = nextId++;
         const inner = serializeNodes(el.childNodes);
@@ -417,9 +455,10 @@ export function tokenizeParagraph(
     return out;
   };
 
-  const serialized = serializeNodes(sourceContainer.childNodes)
-    .replace(/[ \t\f\v]+/g, ' ')
-    .trim();
+  const rawSerialized = serializeNodes(sourceContainer.childNodes);
+  const serialized = preserveNewlines
+    ? rawSerialized.replace(/\r\n?/g, '\n').replace(/[ \t\f\v]+/g, ' ').trim()
+    : rawSerialized.replace(/\s+/g, ' ').trim();
   const normalizedPlain = plainChars.replace(/\s+/g, ' ').trim();
 
   return {

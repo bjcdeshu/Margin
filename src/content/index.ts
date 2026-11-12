@@ -1,9 +1,15 @@
 import { BRAND } from '@shared/brand';
 import { getMarginConfig, onMarginConfigChanged } from '@shared/storage';
-import type { MarginConfig, TabCommandMessage } from '@shared/types';
+import type {
+  AnyTabMessage,
+  MarginConfig,
+  TabCommandMessage,
+  TabPageState,
+} from '@shared/types';
 import {
   isUnsupportedBrowserUrl,
   isUrlExcluded,
+  matchesAnyUrlGlob,
   shouldAutoTranslateUrl,
 } from '@shared/url-match';
 import { HoverTranslator } from './hover-translate';
@@ -81,12 +87,14 @@ export class MarginContentController {
       doc: this.doc,
       now: this.now,
       transport: options.transport,
+      isUrlExcluded: () => this.isExplicitlyDomainExcluded(),
     });
 
     this.hoverTranslator = new HoverTranslator({
       config: this.config,
       renderer: this.renderer,
       doc: this.doc,
+      isUrlExcluded: () => this.isExplicitlyDomainExcluded(),
     });
 
     this.selectionPopover = new SelectionPopover({
@@ -94,11 +102,24 @@ export class MarginContentController {
       doc: this.doc,
       now: this.now,
       transport: options.transport,
+      isUrlExcluded: () => this.isExplicitlyDomainExcluded(),
     });
+  }
+
+  isExplicitlyDomainExcluded(): boolean {
+    return matchesAnyUrlGlob(this.getUrl(), this.config.urlRules.excludeMatches);
   }
 
   isCurrentUrlExcluded(): boolean {
     return isUrlExcluded(this.getUrl(), this.config.urlRules);
+  }
+
+  getPageState(): TabPageState {
+    return this.renderer.getPageState();
+  }
+
+  clearPageCache(): void {
+    this.renderer.clearCache();
   }
 
   shouldAutoTranslateCurrentUrl(): boolean {
@@ -142,7 +163,16 @@ export class MarginContentController {
         sendResponse: (response?: unknown) => void,
       ): boolean | undefined => {
         if (!message || typeof message !== 'object') return undefined;
-        const cmd = message as Partial<TabCommandMessage>;
+        const cmd = message as Partial<AnyTabMessage>;
+        if (cmd.type === 'margin:cmd:get-page-state') {
+          sendResponse(this.renderer.getPageState());
+          return false;
+        }
+        if (cmd.type === 'margin:cmd:clear-page-cache') {
+          this.renderer.clearCache();
+          sendResponse({ ok: true });
+          return false;
+        }
         if (
           cmd.type === 'margin:cmd:toggle-page' ||
           cmd.type === 'margin:cmd:translate-whole-page' ||
@@ -153,7 +183,11 @@ export class MarginContentController {
             { type: cmd.type } as TabCommandMessage,
             'cmd',
           ).then((res) => {
-            sendResponse({ ok: true, result: res });
+            sendResponse({
+              ok: true,
+              result: res,
+              state: this.renderer.getPageState(),
+            });
           });
           return true;
         }
@@ -233,6 +267,16 @@ export class MarginContentController {
 
     if (!this.mounted) return;
 
+    if (this.isExplicitlyDomainExcluded()) {
+      this.selectionPopover.close();
+      this.inputTranslator.cancelInFlight();
+      if (this.renderer.isActive) {
+        this.manuallyEnabled = false;
+        this.renderer.restorePage();
+      }
+      return;
+    }
+
     if (
       !this.manuallyEnabled &&
       this.renderer.isActive &&
@@ -251,18 +295,25 @@ export class MarginContentController {
     const currentNow = this.now();
     const prev = this.lastTriggerRecord.get(type);
     this.lastTriggerRecord.set(type, { source, at: currentNow });
-    if (prev && prev.source !== source && currentNow - prev.at <= 250) {
+    if (prev && prev.source !== source && currentNow - prev.at <= 1200) {
       return true;
     }
     return false;
   }
 
   async handleCommand(
-    command: TabCommandMessage,
+    command: AnyTabMessage,
     source: 'cmd' | 'key' = 'cmd',
   ): Promise<boolean> {
     if (command.type === 'margin:cmd:translate-context-image') {
       return false;
+    }
+    if (command.type === 'margin:cmd:get-page-state') {
+      return this.renderer.isActive;
+    }
+    if (command.type === 'margin:cmd:clear-page-cache') {
+      this.renderer.clearCache();
+      return true;
     }
 
     if (this.isDuplicateCrossSourceTrigger(command.type, source)) {

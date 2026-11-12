@@ -147,6 +147,89 @@ Item 2 was empty or skipped; item 1 and item 3 have colons and quotes!
       { id: 2, trans: '世' },
     ]);
   });
+
+  it('expands built-in conditional macros when omitted from env, injects <mN> tag rules, and recovers multi-line & inner-quoted scalars', () => {
+    // Replicates imported user assistant where `env` omitted title_prompt/summary_prompt/terms_prompt & html_only
+    const importedStyleAst: AssistantConfig = {
+      ...structuredClone(BUILTIN_ASSISTANTS['builtin-yaml']),
+      id: 'imported-custom',
+      systemPrompt: 'Translate into {{to}} inside <yaml>...</yaml>.',
+      prompt: '{{title_prompt}}{{summary_prompt}}{{terms_prompt}}<yaml>\n{{yaml}}\n</yaml>',
+      env: {
+        imt_yaml_item: '- id: {{id}}\n  src: |-\n    {{text}}',
+        imt_source_field: 'src',
+        imt_trans_field: 'trans',
+      },
+    };
+
+    const richEncoded = yamlPromptCodec.encode({
+      scene: 'webpage',
+      fromLang: 'en',
+      toLang: 'zh-CN',
+      items: [{ id: 1, text: 'Click <m0>here</m0> to read about LLMs.', hasRichTags: true }],
+      assistant: importedStyleAst,
+      context: {
+        url: 'https://example.com/guide',
+        domain: 'example.com',
+        title: 'Agentic Architecture',
+        summary: 'Practical guide',
+      },
+      glossary: [{ k: 'LLMs', v: '' }],
+    });
+
+    expect(richEncoded.userPrompt).toContain('Document Title: Agentic Architecture');
+    expect(richEncoded.userPrompt).toContain('Context Summary: Practical guide');
+    expect(richEncoded.userPrompt).toContain("Required Glossary: 'LLMs': 'LLMs'");
+    expect(richEncoded.systemPrompt).toContain('<m0>');
+
+    // Plain-text batch with no context/glossary prunes all optional macros and omits <m0> rule
+    const plainEncoded = yamlPromptCodec.encode({
+      scene: 'webpage',
+      fromLang: 'en',
+      toLang: 'zh-CN',
+      items: [{ id: 1, text: 'Simple plain text.' }],
+      assistant: importedStyleAst,
+    });
+    expect(plainEncoded.userPrompt).toBe(
+      '<yaml>\n- id: 1\n  src: |-\n    Simple plain text.\n</yaml>',
+    );
+    expect(plainEncoded.systemPrompt).not.toContain('<m0>');
+
+    // Multi-line unindented trans + outer quotes wrapping unescaped inner quotes + prose-wrapped ```yaml fence
+    const trickyOutput = `Here is the YAML translation you requested:
+\`\`\`yaml
+- id: 1
+  trans: 第一行译文
+第二行未缩进续行: 依然完整保留
+- id: 2
+  trans: "点击 <m0>这里</m0> 阅读 "第 2 部分: 架构""
+\`\`\`
+Hope this helps!`;
+
+    const decoded = yamlPromptCodec.decode(
+      trickyOutput,
+      [
+        { id: 10, text: 'Line 1\nLine 2' },
+        { id: 20, text: 'Click <m0>here</m0> to read "Part 2: Architecture"', hasRichTags: true },
+      ],
+      { scene: 'webpage', assistant: importedStyleAst },
+    );
+
+    expect(decoded).toEqual([
+      { id: 10, trans: '第一行译文\n第二行未缩进续行: 依然完整保留' },
+      { id: 20, trans: '点击 <m0>这里</m0> 阅读 "第 2 部分: 架构"' },
+    ]);
+
+    // Streaming guard: pre-<yaml> reasoning prose with `- id: 1` must NEVER poison emitted items
+    const streamItems = [{ id: 1, text: 'Hello' }];
+    const sp = yamlPromptCodec.createStreamParser(streamItems, {
+      scene: 'webpage',
+      assistant: importedStyleAst,
+    });
+    expect(sp.push('Let me plan:\n- id: 1\n  trans: WRONG_DRAFT\n- id: 2\n  trans: X\n')).toEqual([]);
+    const readyAfterYaml = sp.push('<yaml>\n- id: 1\n  trans: 正确译文\n</yaml>');
+    expect(readyAfterYaml).toEqual([{ id: 1, trans: '正确译文' }]);
+  });
 });
 
 describe('DelimiterPromptCodec ("通用翻译" %% streaming & mismatch recovery)', () => {

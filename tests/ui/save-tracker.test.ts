@@ -51,17 +51,21 @@ describe('Snapshot-Verified Save State (save-tracker)', () => {
     expect(tracker.getState().status).toBe('saving');
     expect(tracker.isSaving()).toBe(true);
 
-    // Concurrent second save while in-flight is rejected
-    expect(tracker.beginUserSave(edited)).toBeNull();
+    // Rapid consecutive second save coalesces & supersedes pendingSnapshot instead of dropping!
+    const editedV2 = structuredClone(edited);
+    editedV2.targetLang = 'ja';
+    const payloadV2 = tracker.beginUserSave(editedV2);
+    expect(payloadV2.targetLang).toBe('ja');
+    expect(tracker.getState().status).toBe('saving');
 
-    // Unrelated stale GET / mismatched background readback must NOT confirm early or unlock saving
-    const stale = createDefaultMarginConfig();
-    expect(tracker.observePersisted(stale)).toBe(false);
+    // Earlier Save #1 readback arrives stale -> must NOT confirm 'saved' early!
+    const staleSave1 = normalizeConfigForSave(edited);
+    expect(tracker.observePersisted(staleSave1)).toBe(false);
     expect(tracker.getState().status).toBe('saving');
     expect(tracker.isSaving()).toBe(true);
 
-    // Persisted snapshot with normalized URL rules arrives and matches!
-    const persisted = normalizeConfigForSave(edited);
+    // Persisted snapshot matching latest Save #2 arrives and confirms 'saved'!
+    const persisted = normalizeConfigForSave(editedV2);
     expect(persisted.urlRules.excludeMatches).toEqual([
       'https://linux.do/*',
       'https://example.org/*',

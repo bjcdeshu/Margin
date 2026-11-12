@@ -8,6 +8,7 @@ import type {
 import { parse as parseYaml } from 'yaml';
 import {
   buildExpandedPromptVariables,
+  ensureRichTagInstruction,
   extractStreamableVisibleText,
   interpolateTemplate,
   selectPromptsForBatch,
@@ -74,34 +75,58 @@ export function formatYamlItemRow(
 export function extractCleanYamlPayload(
   rawText: string,
   allowUnclosedTag = false,
+  expectYamlTag = false,
 ): string {
   const stripped = stripThinkingBlocks(rawText);
   if (!stripped) return '';
 
-  // Prefer explicit `<yaml>...</yaml>` wrapper when present
+  // 1. Prefer explicit `<yaml>...</yaml>` wrapper when present
   const closedMatches = Array.from(
     stripped.matchAll(/<yaml\b[^>]*>([\s\S]*?)<\/yaml>/gi),
   );
-  let body =
+  let body: string | null =
     closedMatches.length > 0
       ? closedMatches[closedMatches.length - 1][1]
-      : stripped;
+      : null;
 
-  if (closedMatches.length === 0 && allowUnclosedTag) {
-    const unclosed = /<yaml\b[^>]*>([\s\S]*)$/i.exec(stripped);
-    if (unclosed) {
-      body = unclosed[1];
-    }
-  } else if (closedMatches.length === 0) {
+  if (body === null) {
     const unclosed = /<yaml\b[^>]*>([\s\S]*)$/i.exec(stripped);
     if (unclosed) {
       body = unclosed[1];
     }
   }
 
+  // 2. If no `<yaml>` tag is present, check for ```yaml ... ``` or ``` ... ``` fences (even when surrounded by prose)
+  if (body === null) {
+    const closedFence =
+      /```(?:yaml|yml)?[ \t]*\r?\n([\s\S]*?)\r?\n[ \t]*```/i.exec(stripped);
+    if (closedFence) {
+      return closedFence[1].trim();
+    }
+    if (allowUnclosedTag) {
+      const unclosedFence = /```(?:yaml|yml)?[ \t]*\r?\n([\s\S]*)$/i.exec(
+        stripped,
+      );
+      if (unclosedFence) {
+        return unclosedFence[1].trim();
+      }
+      // During streaming, if the prompt explicitly expects `<yaml>`, wait until `<yaml>` or ```yaml opens
+      // so pre-tag reasoning prose never leaks into emittedIds!
+      if (expectYamlTag) {
+        return '';
+      }
+    }
+    body = stripped;
+  }
+
   body = body.trim();
 
-  // Strip surrounding ```yaml ... ``` or ``` ... ``` markdown code fences
+  // Strip surrounding ```yaml ... ``` or ``` ... ``` markdown code fences inside `<yaml>`
+  const innerClosedFence =
+    /```(?:yaml|yml)?[ \t]*\r?\n([\s\S]*?)\r?\n[ \t]*```/i.exec(body);
+  if (innerClosedFence) {
+    return innerClosedFence[1].trim();
+  }
   const fenced = /^```(?:yaml|yml)?[ \t]*\r?\n([\s\S]*?)(?:\r?\n```[ \t]*)?$/i.exec(
     body,
   );
@@ -127,24 +152,86 @@ function unquoteScalarIfWrapped(raw: string): string {
         return parsed;
       }
     } catch {
-      // Unescaped inner double-quotes (e.g. `"Hello" world: "ok"`) — keep verbatim!
-      return trimmed;
+      const inner = trimmed.slice(1, -1);
+      // Keep verbatim ONLY when the line starts and ends with two distinct quoted phrases
+      // (e.g. `"Hello" world: "ok"`), while unwrapping outer-wrapped scalars that contain
+      // unescaped inner quotes (e.g. `"点击 <m0>这里</m0> 阅读 "第 2 部分""` or `"He said "hi" now"`).
+      const looksLikeSeparateQuotedPhrases =
+        /^[^"]+"(?:[\s,:;.!?)}\]]|$)/.test(inner) &&
+        /(?:^|[\s,:;([{\-])"[^"]+$/.test(inner) &&
+        (inner.match(/"/g)?.length ?? 0) % 2 === 0;
+      if (looksLikeSeparateQuotedPhrases) {
+        return trimmed;
+      }
+      return inner.replace(/\\"/g, '"').replace(/\\\\/g, '\\');
     }
   }
   if (trimmed.length >= 2 && trimmed.startsWith("'") && trimmed.endsWith("'")) {
     const inner = trimmed.slice(1, -1);
-    // Only unwrap if there are no unescaped single quotes inside
     if (!/(?<!')'(?!')/.test(inner)) {
       return inner.replace(/''/g, "'");
     }
+    const looksLikeSeparateSingleQuotedPhrases =
+      /^[^']+'(?:[\s,:;.!?)}\]]|$)/.test(inner) &&
+      /(?:^|[\s,:;([{\-])'[^']+$/.test(inner) &&
+      (inner.match(/'/g)?.length ?? 0) % 2 === 0;
+    if (looksLikeSeparateSingleQuotedPhrases) {
+      return trimmed;
+    }
+    return inner.replace(/''/g, "'");
   }
   return trimmed;
 }
 
+function isYamlScalarBoundaryLine(
+  line: string,
+  itemIndent: number,
+  propIndent: number,
+  knownSchemaKeys: ReadonlySet<string>,
+): boolean {
+  const trimmed = line.trim();
+  if (!trimmed) return false;
+  if (
+    trimmed === '---' ||
+    trimmed === '...' ||
+    trimmed.startsWith('```') ||
+    /^<\/yaml\b/i.test(trimmed)
+  ) {
+    return true;
+  }
+
+  const bareDashMatch = /^([ \t]*)-\s*$/.exec(line);
+  if (bareDashMatch && bareDashMatch[1].length <= propIndent) {
+    return true;
+  }
+
+  const listMatch = /^([ \t]*)-\s+([A-Za-z_][A-Za-z0-9_-]*)\s*:/.exec(line);
+  if (
+    listMatch &&
+    listMatch[1].length <= propIndent &&
+    knownSchemaKeys.has(listMatch[2])
+  ) {
+    return true;
+  }
+
+  const propMatch = /^([ \t]*)([A-Za-z_][A-Za-z0-9_-]*)\s*:/.exec(line);
+  if (propMatch && knownSchemaKeys.has(propMatch[2])) {
+    const indentLen = propMatch[1].length;
+    if (
+      (indentLen > itemIndent && indentLen <= propIndent + 2) ||
+      (itemIndent === 0 && indentLen === 0)
+    ) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
 /**
  * Tolerant line-by-line `- id:` state-machine parser for `<yaml>` responses.
- * Recovers cleanly when LLMs emit unescaped colons (`:` / `：`) or unescaped
- * quotes (`"` / `'`) inside `thinking` or `trans` flow scalars.
+ * Recovers cleanly when LLMs emit unescaped colons (`:` / `：`), unescaped
+ * quotes (`"` / `'`), or unindented multi-line breaks inside `thinking` or `trans`.
  */
 export function parseYamlItemsStateMachine(
   yamlText: string,
@@ -196,7 +283,14 @@ export function parseYamlItemsStateMachine(
         propIndent,
       };
       rawRecords.push(record);
-      const consumed = readFieldValue(lines, i, propIndent, rest);
+      const consumed = readFieldValue(
+        lines,
+        i,
+        itemIndent,
+        propIndent,
+        rest,
+        knownSchemaKeys,
+      );
       record.fields[key] = consumed.value;
       i = consumed.nextIndex;
       continue;
@@ -230,7 +324,14 @@ export function parseYamlItemsStateMachine(
           indentLen <= currentRecord.propIndent + 2
         ) {
           currentRecord.propIndent = indentLen;
-          const consumed = readFieldValue(lines, i, indentLen, rest);
+          const consumed = readFieldValue(
+            lines,
+            i,
+            currentRecord.itemIndent,
+            indentLen,
+            rest,
+            knownSchemaKeys,
+          );
           currentRecord.fields[key] = consumed.value;
           i = consumed.nextIndex;
           continue;
@@ -274,8 +375,10 @@ export function parseYamlItemsStateMachine(
 function readFieldValue(
   lines: readonly string[],
   startLineIndex: number,
+  itemIndent: number,
   propIndent: number,
   restAfterColon: string,
+  knownSchemaKeys: ReadonlySet<string>,
 ): { value: string; nextIndex: number } {
   const trimmedRest = restAfterColon.trim();
 
@@ -331,50 +434,62 @@ function readFieldValue(
     return { value: joined, nextIndex: idx };
   }
 
-  // Flow / inline scalar (with optional indented continuation lines)
-  const continuation: string[] = [];
-  if (trimmedRest !== '') {
-    continuation.push(trimmedRest);
-  }
+  // Flow / inline scalar (preserving both deeper-indented folded lines AND unindented multi-line LLM outputs)
+  let acc = trimmedRest;
+  let pendingBlankLine = false;
 
   let idx = startLineIndex + 1;
   while (idx < lines.length) {
     const nextLine = lines[idx];
     const nextTrimmed = nextLine.trim();
+
     if (nextTrimmed === '') {
-      // Peek ahead: only continue if a deeper-indented non-empty line follows before next key/item
       let peek = idx + 1;
       while (peek < lines.length && lines[peek].trim() === '') {
         peek++;
       }
-      if (peek < lines.length) {
-        const peekIndent = /^([ \t]*)/.exec(lines[peek])?.[1].length ?? 0;
-        if (peekIndent > propIndent && !/^[ \t]*-\s+/.test(lines[peek])) {
-          continuation.push('');
-          idx++;
-          continue;
-        }
+      if (
+        peek < lines.length &&
+        !isYamlScalarBoundaryLine(
+          lines[peek],
+          itemIndent,
+          propIndent,
+          knownSchemaKeys,
+        )
+      ) {
+        pendingBlankLine = true;
+        idx++;
+        continue;
       }
       break;
     }
 
-    const leading = /^([ \t]*)/.exec(nextLine)?.[1].length ?? 0;
-    if (leading <= propIndent || /^[ \t]*-\s+/.test(nextLine)) {
+    if (
+      isYamlScalarBoundaryLine(nextLine, itemIndent, propIndent, knownSchemaKeys)
+    ) {
       break;
     }
-    continuation.push(nextTrimmed);
+
+    const leading = /^([ \t]*)/.exec(nextLine)?.[1].length ?? 0;
+    if (acc === '') {
+      acc = nextTrimmed;
+    } else if (pendingBlankLine) {
+      acc += `\n\n${nextTrimmed}`;
+    } else if (leading <= propIndent) {
+      // LLM emitted an unindented or property-level line break inside a scalar: preserve `\n`!
+      acc += `\n${nextTrimmed}`;
+    } else {
+      acc += ` ${nextTrimmed}`;
+    }
+    pendingBlankLine = false;
     idx++;
   }
 
-  if (continuation.length === 0) {
+  if (acc === '') {
     return { value: '', nextIndex: idx };
   }
-  if (continuation.length === 1) {
-    return { value: unquoteScalarIfWrapped(continuation[0]), nextIndex: idx };
-  }
 
-  const combined = continuation.join(' ').replace(/  +/g, ' ').trim();
-  return { value: unquoteScalarIfWrapped(combined), nextIndex: idx };
+  return { value: unquoteScalarIfWrapped(acc), nextIndex: idx };
 }
 
 function tryPrimaryYamlLibraryParse(
@@ -383,7 +498,7 @@ function tryPrimaryYamlLibraryParse(
 ): RawParsedYamlItem[] | null {
   try {
     const doc: unknown = parseYaml(yamlText, {
-      strict: false,
+      strict: true,
       uniqueKeys: false,
     });
     if (!Array.isArray(doc)) return null;
@@ -559,9 +674,21 @@ export class YamlPromptCodec implements PromptCodec {
       input.items.length,
     );
 
+    const rawSystemPrompt = interpolateTemplate(systemTemplate, fullVars).trim();
+    const userPrompt = interpolateTemplate(userTemplate, fullVars).trim();
+    const userTemplateInstructionsOnly = interpolateTemplate(userTemplate, {
+      ...baseVars,
+      yaml: '',
+      text: '',
+    }).trim();
+
     return {
-      systemPrompt: interpolateTemplate(systemTemplate, fullVars).trim(),
-      userPrompt: interpolateTemplate(userTemplate, fullVars).trim(),
+      systemPrompt: ensureRichTagInstruction(
+        rawSystemPrompt,
+        userTemplateInstructionsOnly,
+        input.items,
+      ),
+      userPrompt,
     };
   }
 
@@ -573,7 +700,7 @@ export class YamlPromptCodec implements PromptCodec {
       assistant?: AssistantConfig;
     },
   ): BatchItemOutput[] {
-    const yamlBody = extractCleanYamlPayload(rawOutput, false);
+    const yamlBody = extractCleanYamlPayload(rawOutput, false, false);
     const parsed = parseRawYamlBatch(yamlBody, options?.scene, options?.assistant);
     return alignParsedItemsStrictlyById(parsed, items);
   }
@@ -586,7 +713,14 @@ export class YamlPromptCodec implements PromptCodec {
     },
   ): CodecStreamParser {
     let buffer = '';
-    const emittedIds = new Set<number>();
+    const emittedTransById = new Map<number, string>();
+    const activeAssistant =
+      options?.assistant ?? BUILTIN_ASSISTANTS['builtin-yaml'];
+    const expectYamlTag =
+      /<yaml\b/i.test(activeAssistant.prompt ?? '') ||
+      /<yaml\b/i.test(activeAssistant.multiplePrompt ?? '') ||
+      /<yaml\b/i.test(activeAssistant.subtitlePrompt ?? '') ||
+      /<yaml\b/i.test(activeAssistant.systemPrompt ?? '');
 
     return {
       push: (delta: string): BatchItemOutput[] => {
@@ -595,7 +729,7 @@ export class YamlPromptCodec implements PromptCodec {
         if (!visible) return [];
 
         const yamlClosed = /<\/yaml>/i.test(visible);
-        const yamlBody = extractCleanYamlPayload(visible, true);
+        const yamlBody = extractCleanYamlPayload(visible, true, expectYamlTag);
         if (!yamlBody) return [];
 
         const { transFields, sourceFields } = resolveTransFieldCandidates(
@@ -620,8 +754,11 @@ export class YamlPromptCodec implements PromptCodec {
         );
         const newlyReady: BatchItemOutput[] = [];
         for (const out of aligned) {
-          if (!emittedIds.has(out.id) && out.trans.trim() !== '') {
-            emittedIds.add(out.id);
+          if (
+            out.trans.trim() !== '' &&
+            emittedTransById.get(out.id) !== out.trans
+          ) {
+            emittedTransById.set(out.id, out.trans);
             newlyReady.push(out);
           }
         }
@@ -630,9 +767,11 @@ export class YamlPromptCodec implements PromptCodec {
 
       finish: () => {
         const allItems = this.decode(buffer, items, options);
-        const newlyReady = allItems.filter((item) => !emittedIds.has(item.id));
+        const newlyReady = allItems.filter(
+          (item) => emittedTransById.get(item.id) !== item.trans,
+        );
         for (const item of newlyReady) {
-          emittedIds.add(item.id);
+          emittedTransById.set(item.id, item.trans);
         }
         return { allItems, newlyReady };
       },

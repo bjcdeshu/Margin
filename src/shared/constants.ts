@@ -174,21 +174,28 @@ export function resolveProviderIdForScene(
   explicitProviderId?: string,
 ): string {
   if (explicitProviderId && providers[explicitProviderId]) {
-    return explicitProviderId;
+    if (scene === 'service-test' || providers[explicitProviderId].enabled) {
+      return explicitProviderId;
+    }
   }
+  const firstEnabled = Object.values(providers).find((p) => p.enabled);
+  const fallbackId =
+    firstEnabled?.id ??
+    (providers['google-free'] ? 'google-free' : (Object.keys(providers)[0] ?? 'google-free'));
+
   if (scene === 'service-test') {
-    return providers[routing.webpage] ? routing.webpage : 'google-free';
+    const webProv = providers[routing.webpage];
+    return webProv && webProv.enabled ? routing.webpage : fallbackId;
   }
   const configured = routing[scene];
   const targetId = !configured || configured === 'inherit' ? routing.webpage : configured;
-  if (providers[targetId]) {
+  if (providers[targetId]?.enabled) {
     return targetId;
   }
-  if (providers[routing.webpage]) {
+  if (providers[routing.webpage]?.enabled) {
     return routing.webpage;
   }
-  const firstEnabled = Object.values(providers).find((p) => p.enabled);
-  return firstEnabled?.id ?? 'google-free';
+  return fallbackId;
 }
 
 export function createDefaultMarginConfig(): MarginConfig {
@@ -256,11 +263,11 @@ export function createDefaultMarginConfig(): MarginConfig {
       fallbackTargetLang: 'zh-CN',
     },
     selection: {
-      enabled: false,
+      enabled: true,
       triggerMode: 'icon',
     },
     hover: {
-      enabled: false,
+      enabled: true,
       modifierKey: 'ctrl',
       delayMs: 180,
     },
@@ -270,6 +277,9 @@ export function createDefaultMarginConfig(): MarginConfig {
       preTranslate: true,
       displayMode: 'bilingual',
       fontSizePercent: 70,
+      sourceScalePercent: 100,
+      translationScalePercent: 70,
+      stylePreset: 'youtube-native',
       position: 'bottom',
     },
     urlRules: {

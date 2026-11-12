@@ -1,5 +1,10 @@
 import type { ProviderConfig } from '@shared/types';
 import { readSseStream } from './sse';
+import {
+  DEFAULT_AI_CONNECT_TIMEOUT_MS,
+  DEFAULT_SSE_IDLE_TIMEOUT_MS,
+  createLinkedTimeoutScope,
+} from './timeout';
 import { type AiCompletionRequestParams, ProviderHttpError } from './types';
 
 export const ANTHROPIC_API_VERSION = '2023-06-01';
@@ -113,6 +118,8 @@ export async function executeAnthropicMessagesCall(
     stream,
     onDelta,
     fetchImpl,
+    requestTimeoutMs = DEFAULT_AI_CONNECT_TIMEOUT_MS,
+    streamIdleTimeoutMs = DEFAULT_SSE_IDLE_TIMEOUT_MS,
     signal,
   } = params;
 
@@ -133,100 +140,111 @@ export async function executeAnthropicMessagesCall(
     stream,
   });
 
-  const response = await fetchImpl(endpoint, {
-    method: 'POST',
-    headers,
-    body: JSON.stringify(body),
-    signal,
-  });
-
-  if (!response.ok) {
-    const errorText = new TextDecoder('utf-8').decode(
-      await response.arrayBuffer(),
-    );
-    throw new ProviderHttpError({
-      status: response.status,
-      bodyText: errorText,
-      endpoint,
-      usedApiKey: apiKey,
-    });
-  }
-
-  if (stream) {
-    let fullContent = '';
-    await readSseStream(
-      response,
-      (frame) => {
-        if (frame.event === 'message_stop') {
-          return 'stop';
-        }
-        const trimmed = frame.data.trim();
-        if (!trimmed) return;
-
-        let parsed: Record<string, unknown>;
-        try {
-          parsed = JSON.parse(trimmed) as Record<string, unknown>;
-        } catch {
-          return;
-        }
-
-        const eventType = String(parsed.type ?? frame.event ?? '');
-        if (eventType === 'error') {
-          throw new ProviderHttpError({
-            status: 502,
-            bodyText: JSON.stringify(parsed.error ?? parsed),
-            endpoint,
-            usedApiKey: apiKey,
-          });
-        }
-        if (eventType === 'message_stop') {
-          return 'stop';
-        }
-        if (eventType === 'content_block_delta') {
-          const delta = parsed.delta as Record<string, unknown> | undefined;
-          if (delta?.type === 'text_delta' && typeof delta.text === 'string') {
-            fullContent += delta.text;
-            onDelta?.(delta.text);
-          }
-        }
-        return undefined;
-      },
-      signal,
-    );
-
-    return { content: fullContent, httpStatus: response.status };
-  }
-
-  const rawText = new TextDecoder('utf-8').decode(await response.arrayBuffer());
-  let json: Record<string, unknown>;
+  const scope = createLinkedTimeoutScope(requestTimeoutMs, signal, 'connect');
   try {
-    json = JSON.parse(rawText) as Record<string, unknown>;
-  } catch {
-    throw new Error(`Invalid JSON from Anthropic endpoint: ${rawText.slice(0, 200)}`);
-  }
+    const response = await scope.race(
+      fetchImpl(endpoint, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(body),
+        signal: scope.signal,
+      }),
+    );
 
-  if (json.type === 'error' || json.error) {
-    throw new ProviderHttpError({
-      status: 502,
-      bodyText: JSON.stringify(json.error ?? json),
-      endpoint,
-      usedApiKey: apiKey,
-    });
-  }
+    if (!response.ok) {
+      const errorText = new TextDecoder('utf-8').decode(
+        await scope.race(response.arrayBuffer()),
+      );
+      throw new ProviderHttpError({
+        status: response.status,
+        bodyText: errorText,
+        endpoint,
+        usedApiKey: apiKey,
+      });
+    }
 
-  const contentBlocks = Array.isArray(json.content) ? json.content : [];
-  const textParts: string[] = [];
-  for (const block of contentBlocks) {
-    if (block && typeof block === 'object') {
-      const rec = block as Record<string, unknown>;
-      if (rec.type === 'text' && typeof rec.text === 'string') {
-        textParts.push(rec.text);
+    if (stream) {
+      scope.clearTimer();
+      let fullContent = '';
+      await readSseStream(
+        response,
+        (frame) => {
+          if (frame.event === 'message_stop') {
+            return 'stop';
+          }
+          const trimmed = frame.data.trim();
+          if (!trimmed) return;
+
+          let parsed: Record<string, unknown>;
+          try {
+            parsed = JSON.parse(trimmed) as Record<string, unknown>;
+          } catch {
+            return;
+          }
+
+          const eventType = String(parsed.type ?? frame.event ?? '');
+          if (eventType === 'error') {
+            throw new ProviderHttpError({
+              status: 502,
+              bodyText: JSON.stringify(parsed.error ?? parsed),
+              endpoint,
+              usedApiKey: apiKey,
+            });
+          }
+          if (eventType === 'message_stop') {
+            return 'stop';
+          }
+          if (eventType === 'content_block_delta') {
+            const delta = parsed.delta as Record<string, unknown> | undefined;
+            if (delta?.type === 'text_delta' && typeof delta.text === 'string') {
+              fullContent += delta.text;
+              onDelta?.(delta.text);
+            }
+          }
+          return undefined;
+        },
+        scope.signal,
+        streamIdleTimeoutMs,
+      );
+
+      return { content: fullContent, httpStatus: response.status };
+    }
+
+    const rawText = new TextDecoder('utf-8').decode(
+      await scope.race(response.arrayBuffer()),
+    );
+    let json: Record<string, unknown>;
+    try {
+      json = JSON.parse(rawText) as Record<string, unknown>;
+    } catch {
+      throw new Error(`Invalid JSON from Anthropic endpoint: ${rawText.slice(0, 200)}`);
+    }
+
+    if (json.type === 'error' || json.error) {
+      throw new ProviderHttpError({
+        status: 502,
+        bodyText: JSON.stringify(json.error ?? json),
+        endpoint,
+        usedApiKey: apiKey,
+      });
+    }
+
+    const contentBlocks = Array.isArray(json.content) ? json.content : [];
+    const textParts: string[] = [];
+    for (const block of contentBlocks) {
+      if (block && typeof block === 'object') {
+        const rec = block as Record<string, unknown>;
+        if (rec.type === 'text' && typeof rec.text === 'string') {
+          textParts.push(rec.text);
+        }
       }
     }
-  }
 
-  return {
-    content: textParts.join(''),
-    httpStatus: response.status,
-  };
+    return {
+      content: textParts.join(''),
+      httpStatus: response.status,
+    };
+  } finally {
+    scope.cleanup();
+  }
 }

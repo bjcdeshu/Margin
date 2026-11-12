@@ -94,4 +94,9 @@ export const SHADOW_HOST_RESET_CSS = /* css */ `
 *, *::before, *::after {
   box-sizing: border-box;
 }
+
+:host([hidden]),
+:host([data-margin-fullscreen-hidden="true"]) {
+  display: none !important;
+}
 `;

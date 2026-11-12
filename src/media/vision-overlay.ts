@@ -212,6 +212,24 @@ export async function captureImageDataUrl(params: {
 }
 
 const OVERLAY_SCOPED_CSS = /* css */ `
+:host {
+  position: absolute !important;
+  display: block !important;
+  top: var(--margin-overlay-top, 0px) !important;
+  left: var(--margin-overlay-left, 0px) !important;
+  width: var(--margin-overlay-w, 0px) !important;
+  height: var(--margin-overlay-h, 0px) !important;
+  pointer-events: none !important;
+  z-index: 2147483640 !important;
+  margin: 0 !important;
+  padding: 0 !important;
+  border: 0 !important;
+}
+
+:host([hidden]) {
+  display: none !important;
+}
+
 .mv-root {
   position: relative;
   width: 100%;
@@ -468,10 +486,19 @@ export function mountVisionImageOverlay(
     const width = rect.width || targetImg.width || targetImg.naturalWidth || 320;
     const height = rect.height || targetImg.height || targetImg.naturalHeight || 240;
 
-    host.style.top = `${Math.round(rect.top + (win.scrollY || 0))}px`;
-    host.style.left = `${Math.round(rect.left + (win.scrollX || 0))}px`;
-    host.style.width = `${Math.round(width)}px`;
-    host.style.height = `${Math.round(height)}px`;
+    const topPx = `${Math.round(rect.top + (win.scrollY || 0))}px`;
+    const leftPx = `${Math.round(rect.left + (win.scrollX || 0))}px`;
+    const widthPx = `${Math.round(width)}px`;
+    const heightPx = `${Math.round(height)}px`;
+
+    host.style.setProperty('--margin-overlay-top', topPx);
+    host.style.setProperty('--margin-overlay-left', leftPx);
+    host.style.setProperty('--margin-overlay-w', widthPx);
+    host.style.setProperty('--margin-overlay-h', heightPx);
+    host.style.setProperty('top', topPx, 'important');
+    host.style.setProperty('left', leftPx, 'important');
+    host.style.setProperty('width', widthPx, 'important');
+    host.style.setProperty('height', heightPx, 'important');
 
     for (const item of regionNodes) {
       const px = scaleVisionBoxToPixels(item.region.box, width, height);

@@ -154,12 +154,17 @@ export interface HoverSettings {
   delayMs: number;
 }
 
+export type SubtitleStylePreset = 'youtube-native' | 'cinema-outline' | 'warm-paper';
+
 export interface SubtitleSettings {
   autoEnable: boolean;
   youtubeAutoEnable: boolean;
   preTranslate: boolean;
   displayMode: 'bilingual' | 'target-only' | 'source-only';
   fontSizePercent: number;
+  sourceScalePercent: number;
+  translationScalePercent: number;
+  stylePreset: SubtitleStylePreset;
   position: 'bottom' | 'top';
 }
 
@@ -353,6 +358,9 @@ export interface MarginActiveCueState {
   endMs: number | null;
   mode: 'bilingual' | 'target-only' | 'source-only';
   fontSizePercent: number;
+  sourceScalePercent?: number;
+  translationScalePercent?: number;
+  stylePreset?: SubtitleStylePreset;
   position: 'bottom' | 'top';
 }
 
@@ -424,3 +432,25 @@ export type TabCommandMessage =
   | { type: 'margin:cmd:toggle-mask' }
   | { type: 'margin:cmd:translate-input' }
   | { type: 'margin:cmd:translate-context-image'; srcUrl: string };
+
+export type TabControlMessage =
+  | { type: 'margin:cmd:get-page-state' }
+  | { type: 'margin:cmd:clear-page-cache' };
+
+export type AnyTabMessage = TabCommandMessage | TabControlMessage;
+
+export interface TabPageState {
+  active: boolean;
+  inFlightBlocks: number;
+  translatedBlocks: number;
+  maskRevealed: boolean;
+  lastError?: string;
+}
+
+export interface TabCommandDispatchResult {
+  ok: boolean;
+  result?: unknown;
+  autoInjected?: boolean;
+  unsupportedPage?: boolean;
+  error?: string;
+}
