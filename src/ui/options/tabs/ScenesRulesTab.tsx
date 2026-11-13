@@ -4,6 +4,7 @@ import type {
   MarginConfig,
   SelectionTriggerMode,
   SubtitleStylePreset,
+  SubtitleTranslationTint,
 } from '@shared/types';
 import {
   FieldRow,
@@ -39,6 +40,27 @@ export function ScenesRulesTab({ draft, onMutate }: ScenesRulesTabProps) {
     draft.subtitles.translationScalePercent ?? draft.subtitles.fontSizePercent ?? 70;
   const stylePreset: SubtitleStylePreset =
     draft.subtitles.stylePreset ?? 'youtube-native';
+  const bgOpacityOverride =
+    typeof draft.subtitles.bgOpacityPercent === 'number'
+      ? Math.max(0, Math.min(100, Math.round(draft.subtitles.bgOpacityPercent)))
+      : null;
+  const translationTint: SubtitleTranslationTint =
+    draft.subtitles.translationTint ?? 'follow';
+
+  const previewBgAlpha = (bgOpacityOverride ?? 75) / 100;
+  const previewBgCss = `rgba(8, 8, 8, ${previewBgAlpha})`;
+  const previewShadowCss =
+    previewBgAlpha < 0.12
+      ? '0 1px 3px rgba(0, 0, 0, 0.9), 0 0 5px rgba(0, 0, 0, 0.78)'
+      : 'none';
+  const previewTransFgCss =
+    translationTint === 'warm-ivory'
+      ? 'rgba(247, 239, 222, 0.96)'
+      : translationTint === 'amber'
+        ? 'rgba(255, 217, 125, 0.98)'
+        : translationTint === 'cyan'
+          ? 'rgba(158, 236, 255, 0.96)'
+          : 'rgba(255, 255, 255, 0.95)';
 
   const previewSourcePx = Math.round(17 * (sourceScale / 100) * 10) / 10;
   const previewTransPx = Math.round(17 * (transScale / 100) * 10) / 10;
@@ -73,8 +95,8 @@ export function ScenesRulesTab({ draft, onMutate }: ScenesRulesTabProps) {
             </h2>
             <p class="mp-section-desc">
               {en
-                ? 'Native YouTube per-line caption strips with independent original (100%) and translation (70%) typography.'
-                : '复刻 YouTube 原生逐行黑底字幕视觉，支持原文（默认 100%）与译文（默认 70%）独立字号比例实时预览。'}
+                ? 'Hybrid YouTube caption engine: syncs native player color/opacity/edge options live while keeping independent 100% / 70% bilingual typography and PiP.'
+                : '融合 YouTube 原生字幕设置（自动联动播放器 ⚙ 字幕选项的颜色、背景透明度与描边），兼顾原文 100% / 译文 70% 独立字号、防遮挡抬升与双语画中画。'}
             </p>
           </div>
         </div>
@@ -96,6 +118,13 @@ export function ScenesRulesTab({ draft, onMutate }: ScenesRulesTabProps) {
               class="mp-subtitle-preview-stack"
               data-preset={stylePreset}
               data-testid="subtitle-preview-stack"
+              style={
+                {
+                  '--mp-preview-bg': previewBgCss,
+                  '--mp-preview-shadow': previewShadowCss,
+                  '--mp-preview-trans-fg': previewTransFgCss,
+                } as Record<string, string>
+              }
             >
               {draft.subtitles.displayMode !== 'target-only' ? (
                 <div
@@ -138,8 +167,8 @@ export function ScenesRulesTab({ draft, onMutate }: ScenesRulesTabProps) {
             label={en ? 'Caption Style Preset' : '字幕背景样式预设'}
             hint={
               en
-                ? 'YouTube Native uses clean per-line 75% black strips with zero outer box border'
-                : 'YouTube 原生黑底采用逐行紧贴 75% 半透明黑条，无外框包裹感'
+                ? 'YouTube Native syncs live with YouTube ⚙ -> Subtitles -> Options (font color, opacity, edge & font)'
+                : 'YouTube 原生融合会实时读取播放器「⚙ -> 字幕 -> 选项」中的字色、背景透明度、描边与字体'
             }
           >
             <SegmentedControl
@@ -147,7 +176,7 @@ export function ScenesRulesTab({ draft, onMutate }: ScenesRulesTabProps) {
               options={[
                 {
                   value: 'youtube-native',
-                  label: en ? 'YouTube Native' : 'YouTube 原生黑底 (推荐)',
+                  label: en ? 'YouTube Hybrid' : 'YouTube 原生融合 (推荐)',
                 },
                 {
                   value: 'cinema-outline',
@@ -166,6 +195,75 @@ export function ScenesRulesTab({ draft, onMutate }: ScenesRulesTabProps) {
               }
             />
           </FieldRow>
+
+          {stylePreset === 'youtube-native' ? (
+            <>
+              <FieldRow
+                label={en ? 'Background Strip Opacity' : '黑底条不透明度'}
+                badge={
+                  <StatusPill tone="mono">
+                    {bgOpacityOverride === null
+                      ? en
+                        ? 'Native'
+                        : '跟随原生'
+                      : `${bgOpacityOverride}%`}
+                  </StatusPill>
+                }
+                hint={
+                  en
+                    ? 'Follow Native inherits YouTube player caption background opacity (default 75%), or lock a custom opacity'
+                    : '默认跟随 YouTube 播放器原生设置（75%），也可在此固定为半透或全透明'
+                }
+              >
+                <SegmentedControl
+                  ariaLabel={en ? 'Background Strip Opacity' : '黑底条不透明度'}
+                  options={[
+                    { value: 'native', label: en ? 'Follow Native' : '跟随原生' },
+                    { value: '75', label: '75%' },
+                    { value: '50', label: '50%' },
+                    { value: '25', label: '25%' },
+                    { value: '0', label: en ? '0% Clear' : '0% 透明' },
+                  ]}
+                  value={
+                    bgOpacityOverride === null
+                      ? 'native'
+                      : String(bgOpacityOverride)
+                  }
+                  onChange={(rawVal: string) =>
+                    onMutate((d) => {
+                      d.subtitles.bgOpacityPercent =
+                        rawVal === 'native' ? null : Number.parseInt(rawVal, 10);
+                    })
+                  }
+                />
+              </FieldRow>
+
+              <FieldRow
+                label={en ? 'Translation Line Tint' : '译文色彩区分'}
+                hint={
+                  en
+                    ? 'Keep original and translated lines unified, or tint the secondary line for instant visual separation'
+                    : '默认跟随原生字色，也可为下方译文设置柔和暖白或浅琥珀色以便一眼区分双语'
+                }
+              >
+                <SegmentedControl
+                  ariaLabel={en ? 'Translation Line Tint' : '译文色彩区分'}
+                  options={[
+                    { value: 'follow', label: en ? 'Follow Native' : '跟随原文' },
+                    { value: 'warm-ivory', label: en ? 'Warm Ivory' : '柔和暖白' },
+                    { value: 'amber', label: en ? 'Soft Amber' : '浅琥珀金' },
+                    { value: 'cyan', label: en ? 'Clear Cyan' : '清透青' },
+                  ]}
+                  value={translationTint}
+                  onChange={(tint: SubtitleTranslationTint) =>
+                    onMutate((d) => {
+                      d.subtitles.translationTint = tint;
+                    })
+                  }
+                />
+              </FieldRow>
+            </>
+          ) : null}
 
           <FieldRow
             label={en ? 'Original Caption Scale' : '原文字幕字号比例'}

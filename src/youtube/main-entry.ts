@@ -2,14 +2,19 @@ import { BRAND } from '@shared/brand';
 import type {
   SubtitleSettings,
   YoutubeMainBridgeMessage,
+  YoutubeNativeCaptionTheme,
   YoutubeRawJson3Event,
 } from '@shared/types';
 import { YoutubePipPlayer, type PipCapableVideoElement } from './pip-player';
 import {
+  areYoutubeNativeThemesEqual,
   extractYoutubeVideoId,
   isTimedTextUrl,
   PIP_BUTTON_ID,
+  readLocalYoutubeCaptionTheme,
   SUBTITLE_TOGGLE_BUTTON_ID,
+  YOUTUBE_CAPTION_STORAGE_KEY,
+  YOUTUBE_CONTROLS_STYLE_ID,
   type YoutubeExtendedBridgeMessage,
 } from './shared';
 import { parseYoutubeTimedTextPayload } from './timeline';
@@ -18,6 +23,7 @@ export {
   extractYoutubeVideoId,
   isTimedTextUrl,
   SUBTITLE_TOGGLE_BUTTON_ID,
+  YOUTUBE_CONTROLS_STYLE_ID,
   type YoutubeExtendedBridgeMessage,
 };
 
@@ -72,6 +78,8 @@ export function createYoutubeMainController(
   let boundVideo: HTMLVideoElement | null = null;
   let detachVideoListeners: (() => void) | null = null;
   let playerObserver: MutationObserver | null = null;
+  let lastBroadcastedTheme: YoutubeNativeCaptionTheme | null = null;
+  let pendingThemeTimer: ReturnType<typeof setTimeout> | null = null;
 
   const pipPlayer = new YoutubePipPlayer({
     hostWindow: win,
@@ -332,88 +340,176 @@ export function createYoutubeMainController(
     emitPlayheadTick(candidate);
   }
 
-  function createPipButtonIcon(active: boolean): SVGSVGElement {
+  function createActiveUnderlineBar(): SVGRectElement {
     const ns = 'http://www.w3.org/2000/svg';
-    const stroke = active ? '#c99455' : '#ffffff';
-    const svg = doc.createElementNS(ns, 'svg');
-    svg.setAttribute('viewBox', '0 0 36 36');
-    svg.setAttribute('width', '100%');
-    svg.setAttribute('height', '100%');
+    const bar = doc.createElementNS(ns, 'rect');
+    bar.setAttribute('data-margin-active-bar', 'true');
+    bar.setAttribute('x', '5');
+    bar.setAttribute('y', '24.2');
+    bar.setAttribute('width', '18');
+    bar.setAttribute('height', '2.6');
+    bar.setAttribute('rx', '1.3');
+    bar.setAttribute('fill', '#ff0033');
+    return bar;
+  }
+
+  function applyNativeIconSvgSizing(svg: SVGSVGElement): void {
+    svg.setAttribute('viewBox', '0 0 28 28');
+    svg.setAttribute('width', '28');
+    svg.setAttribute('height', '28');
     svg.setAttribute('aria-hidden', 'true');
     Object.assign(svg.style, {
-      width: '22px',
-      height: '22px',
+      width: '28px',
+      height: '28px',
+      minWidth: '28px',
+      minHeight: '28px',
+      padding: '0px',
+      margin: '0px',
       display: 'block',
+      overflow: 'visible',
       pointerEvents: 'none',
     });
+  }
+
+  function createPipButtonIcon(active: boolean): SVGSVGElement {
+    const ns = 'http://www.w3.org/2000/svg';
+    const svg = doc.createElementNS(ns, 'svg');
+    applyNativeIconSvgSizing(svg);
 
     const frame = doc.createElementNS(ns, 'rect');
-    frame.setAttribute('x', '5');
-    frame.setAttribute('y', '8');
-    frame.setAttribute('width', '26');
-    frame.setAttribute('height', '20');
-    frame.setAttribute('rx', '2.5');
+    frame.setAttribute('x', '3.5');
+    frame.setAttribute('y', '5.5');
+    frame.setAttribute('width', '21');
+    frame.setAttribute('height', '16');
+    frame.setAttribute('rx', '2.4');
     frame.setAttribute('fill', 'none');
-    frame.setAttribute('stroke', stroke);
+    frame.setAttribute('stroke', '#ffffff');
     frame.setAttribute('stroke-width', '2');
 
     const inset = doc.createElementNS(ns, 'rect');
-    inset.setAttribute('x', '18.5');
-    inset.setAttribute('y', '17.5');
-    inset.setAttribute('width', '10');
-    inset.setAttribute('height', '7.5');
-    inset.setAttribute('rx', '1.4');
-    inset.setAttribute('fill', stroke);
+    inset.setAttribute('x', '13.8');
+    inset.setAttribute('y', '13');
+    inset.setAttribute('width', '8');
+    inset.setAttribute('height', '5.8');
+    inset.setAttribute('rx', '1.2');
+    inset.setAttribute('fill', '#ffffff');
 
     const lines = doc.createElementNS(ns, 'path');
-    lines.setAttribute('d', 'M9 14h7.5M9 18h6');
-    lines.setAttribute('stroke', stroke);
+    lines.setAttribute('d', 'M7.2 10.2h5.8M7.2 14h4.2');
+    lines.setAttribute('stroke', '#ffffff');
     lines.setAttribute('stroke-width', '1.8');
     lines.setAttribute('stroke-linecap', 'round');
 
     svg.append(frame, inset, lines);
+    if (active) {
+      svg.appendChild(createActiveUnderlineBar());
+    }
     return svg;
   }
 
   function createSubtitleToggleIcon(active: boolean): SVGSVGElement {
     const ns = 'http://www.w3.org/2000/svg';
-    const stroke = active ? '#c99455' : '#ffffff';
     const svg = doc.createElementNS(ns, 'svg');
-    svg.setAttribute('viewBox', '0 0 36 36');
-    svg.setAttribute('width', '100%');
-    svg.setAttribute('height', '100%');
-    svg.setAttribute('aria-hidden', 'true');
-    Object.assign(svg.style, {
-      width: '22px',
-      height: '22px',
-      display: 'block',
-      pointerEvents: 'none',
-    });
+    applyNativeIconSvgSizing(svg);
 
     const box = doc.createElementNS(ns, 'rect');
-    box.setAttribute('x', '5');
-    box.setAttribute('y', '8');
-    box.setAttribute('width', '26');
-    box.setAttribute('height', '20');
-    box.setAttribute('rx', '2.5');
+    box.setAttribute('x', '3.5');
+    box.setAttribute('y', '5.5');
+    box.setAttribute('width', '21');
+    box.setAttribute('height', '16');
+    box.setAttribute('rx', '2.4');
     box.setAttribute('fill', 'none');
-    box.setAttribute('stroke', stroke);
+    box.setAttribute('stroke', '#ffffff');
     box.setAttribute('stroke-width', '2');
 
     const line1 = doc.createElementNS(ns, 'path');
-    line1.setAttribute('d', 'M9.5 15h17');
-    line1.setAttribute('stroke', stroke);
+    line1.setAttribute('d', 'M7.5 11.2h13');
+    line1.setAttribute('stroke', '#ffffff');
     line1.setAttribute('stroke-width', '2');
     line1.setAttribute('stroke-linecap', 'round');
 
     const line2 = doc.createElementNS(ns, 'path');
-    line2.setAttribute('d', 'M9.5 21h12');
-    line2.setAttribute('stroke', active ? '#c99455' : 'rgba(255,255,255,0.72)');
+    line2.setAttribute('d', 'M7.5 15.8h9.5');
+    line2.setAttribute('stroke', 'rgba(255, 255, 255, 0.9)');
     line2.setAttribute('stroke-width', '2');
     line2.setAttribute('stroke-linecap', 'round');
 
     svg.append(box, line1, line2);
+    if (active) {
+      svg.appendChild(createActiveUnderlineBar());
+    }
     return svg;
+  }
+
+  function ensureControlsStylesheet(): void {
+    if (doc.getElementById(YOUTUBE_CONTROLS_STYLE_ID)) return;
+    const style = doc.createElement('style');
+    style.id = YOUTUBE_CONTROLS_STYLE_ID;
+    style.textContent = /* css */ `
+      button#${SUBTITLE_TOGGLE_BUTTON_ID}.ytp-button,
+      button#${PIP_BUTTON_ID}.ytp-button {
+        width: 48px !important;
+        min-width: 48px !important;
+        height: 100% !important;
+        padding: 0 !important;
+        margin: 0 !important;
+        border: none !important;
+        background: transparent !important;
+        display: inline-flex !important;
+        align-items: center !important;
+        justify-content: center !important;
+        flex: 0 0 48px !important;
+        box-sizing: border-box !important;
+        vertical-align: top !important;
+        opacity: 0.92;
+        transition: opacity 120ms ease;
+      }
+      .ytp-delhi-modern button#${SUBTITLE_TOGGLE_BUTTON_ID}.ytp-button,
+      .ytp-delhi-modern button#${PIP_BUTTON_ID}.ytp-button {
+        width: 44px !important;
+        min-width: 44px !important;
+        flex: 0 0 44px !important;
+      }
+      .ytp-big-mode button#${SUBTITLE_TOGGLE_BUTTON_ID}.ytp-button,
+      .ytp-big-mode button#${PIP_BUTTON_ID}.ytp-button {
+        width: 54px !important;
+        min-width: 54px !important;
+        flex: 0 0 54px !important;
+      }
+      button#${SUBTITLE_TOGGLE_BUTTON_ID}.ytp-button:hover,
+      button#${PIP_BUTTON_ID}.ytp-button:hover,
+      button#${SUBTITLE_TOGGLE_BUTTON_ID}.ytp-button[aria-pressed="true"],
+      button#${PIP_BUTTON_ID}.ytp-button[aria-pressed="true"] {
+        opacity: 1;
+      }
+      button#${SUBTITLE_TOGGLE_BUTTON_ID}.ytp-button > svg,
+      button#${PIP_BUTTON_ID}.ytp-button > svg {
+        width: 28px !important;
+        height: 28px !important;
+        min-width: 28px !important;
+        min-height: 28px !important;
+        max-width: 28px !important;
+        max-height: 28px !important;
+        padding: 0 !important;
+        margin: 0 !important;
+        flex: 0 0 28px !important;
+        box-sizing: content-box !important;
+        display: block !important;
+        overflow: visible !important;
+        pointer-events: none !important;
+      }
+      .ytp-big-mode button#${SUBTITLE_TOGGLE_BUTTON_ID}.ytp-button > svg,
+      .ytp-big-mode button#${PIP_BUTTON_ID}.ytp-button > svg {
+        width: 34px !important;
+        height: 34px !important;
+        min-width: 34px !important;
+        min-height: 34px !important;
+        max-width: 34px !important;
+        max-height: 34px !important;
+        flex: 0 0 34px !important;
+      }
+    `;
+    (doc.head ?? doc.documentElement)?.appendChild(style);
   }
 
   function styleYtpControlButton(button: HTMLButtonElement): void {
@@ -425,10 +521,10 @@ export function createYoutubeMainController(
       border: 'none',
       outline: 'none',
       cursor: 'pointer',
-      width: '36px',
-      flex: '0 0 36px',
+      width: '48px',
+      flex: '0 0 48px',
       height: '100%',
-      padding: '0',
+      padding: '0px',
       display: 'inline-flex',
       alignItems: 'center',
       justifyContent: 'center',
@@ -441,6 +537,8 @@ export function createYoutubeMainController(
     if (!isPlaybackPage()) return;
     const rightControls = doc.querySelector<HTMLElement>('.ytp-right-controls');
     if (!rightControls) return;
+
+    ensureControlsStylesheet();
 
     const targetContainer =
       rightControls.querySelector<HTMLElement>('.ytp-right-controls-left') ??
@@ -536,6 +634,59 @@ export function createYoutubeMainController(
     }
   }
 
+  function syncNativeCaptionStyleFromPlayer(force = false): void {
+    if (destroyed) return;
+    const moviePlayer = doc.getElementById('movie_player') as
+      | (HTMLElement & { getSubtitlesUserSettings?: () => unknown })
+      | null;
+    let livePlayerSettings: unknown = null;
+    try {
+      livePlayerSettings = moviePlayer?.getSubtitlesUserSettings?.() ?? null;
+    } catch {
+      livePlayerSettings = null;
+    }
+    const nextTheme = readLocalYoutubeCaptionTheme(win, doc, livePlayerSettings);
+    if (force || !areYoutubeNativeThemesEqual(lastBroadcastedTheme, nextTheme)) {
+      lastBroadcastedTheme = nextTheme;
+      postBridgeMessage({
+        source: BRAND.ytBridgeSourceMain,
+        type: 'native-caption-style-update',
+        theme: nextTheme,
+      });
+    }
+  }
+
+  function handlePlayerStyleInteraction(event: Event): void {
+    if (destroyed) return;
+    const target = event.target as HTMLElement | null;
+    if (
+      target &&
+      typeof target.closest === 'function' &&
+      !target.closest('#movie_player, .html5-video-player, .ytp-popup, .ytp-settings-menu')
+    ) {
+      return;
+    }
+    const raf =
+      win.requestAnimationFrame?.bind(win) ??
+      ((cb: FrameRequestCallback) => setTimeout(() => cb(Date.now()), 16));
+    raf(() => {
+      if (!destroyed) syncNativeCaptionStyleFromPlayer(false);
+    });
+    if (pendingThemeTimer !== null) {
+      clearTimeout(pendingThemeTimer);
+    }
+    pendingThemeTimer = setTimeout(() => {
+      pendingThemeTimer = null;
+      syncNativeCaptionStyleFromPlayer(false);
+    }, 65);
+  }
+
+  function handleCaptionStorageEvent(event: StorageEvent): void {
+    if (!event.key || event.key === YOUTUBE_CAPTION_STORAGE_KEY) {
+      syncNativeCaptionStyleFromPlayer(false);
+    }
+  }
+
   function scanPage(): void {
     if (destroyed) return;
     const nextVideoId = extractYoutubeVideoId(win.location?.href ?? '');
@@ -548,6 +699,7 @@ export function createYoutubeMainController(
     ensurePlayerButtons();
     bindActiveVideo();
     pipPlayer.handleVideoCheck();
+    syncNativeCaptionStyleFromPlayer(false);
 
     if (subtitlesEnabled && currentVideoId) {
       setTimeout(() => {
@@ -605,6 +757,7 @@ export function createYoutubeMainController(
       subtitlesEnabled = Boolean(settings.youtubeAutoEnable);
       pipPlayer.updateSettings(settings);
       syncPlayerButtons();
+      syncNativeCaptionStyleFromPlayer(true);
 
       // Replay any early `document_start` captured caption tracks for the active video
       const activeVid =
@@ -636,12 +789,18 @@ export function createYoutubeMainController(
     win.addEventListener('yt-navigate-finish', handleNavigation);
     win.addEventListener('yt-page-data-updated', scheduleScan);
     win.addEventListener('popstate', handleNavigation);
+    win.addEventListener('storage', handleCaptionStorageEvent);
+    doc.addEventListener('click', handlePlayerStyleInteraction, true);
+    doc.addEventListener('keyup', handlePlayerStyleInteraction, true);
 
     cleanupFns.push(() => {
       win.removeEventListener('message', handleWindowMessage);
       win.removeEventListener('yt-navigate-finish', handleNavigation);
       win.removeEventListener('yt-page-data-updated', scheduleScan);
       win.removeEventListener('popstate', handleNavigation);
+      win.removeEventListener('storage', handleCaptionStorageEvent);
+      doc.removeEventListener('click', handlePlayerStyleInteraction, true);
+      doc.removeEventListener('keyup', handlePlayerStyleInteraction, true);
     });
 
     const attachObserver = () => {
@@ -680,6 +839,10 @@ export function createYoutubeMainController(
   function destroy(): void {
     if (destroyed) return;
     destroyed = true;
+    if (pendingThemeTimer !== null) {
+      clearTimeout(pendingThemeTimer);
+      pendingThemeTimer = null;
+    }
     playerObserver?.disconnect();
     playerObserver = null;
     detachVideoListeners?.();
@@ -692,6 +855,7 @@ export function createYoutubeMainController(
         // Ignore cleanup failure
       }
     }
+    doc.getElementById(YOUTUBE_CONTROLS_STYLE_ID)?.remove();
     doc.getElementById(SUBTITLE_TOGGLE_BUTTON_ID)?.remove();
     doc.getElementById(PIP_BUTTON_ID)?.remove();
     pipPlayer.destroy();

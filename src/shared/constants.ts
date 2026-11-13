@@ -383,6 +383,8 @@ export function createDefaultMarginConfig(): MarginConfig {
       sourceScalePercent: 100,
       translationScalePercent: 70,
       stylePreset: 'youtube-native',
+      bgOpacityPercent: null,
+      translationTint: 'follow',
       position: 'bottom',
     },
     urlRules: {

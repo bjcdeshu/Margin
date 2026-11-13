@@ -10,6 +10,7 @@ import {
   createYoutubeMainController,
   shouldAutoBootMainEntry,
   SUBTITLE_TOGGLE_BUTTON_ID,
+  YOUTUBE_CONTROLS_STYLE_ID,
 } from '../../src/youtube/main-entry';
 import {
   clampSeekTime,
@@ -20,6 +21,11 @@ import {
   YoutubePipPlayer,
   type PipCapableVideoElement,
 } from '../../src/youtube/pip-player';
+import {
+  parseYoutubeNativeCaptionSettings,
+  resolveEffectiveNativeThemeVariables,
+  YOUTUBE_CAPTION_STORAGE_KEY,
+} from '../../src/youtube/shared';
 
 function createMockVideo(overrides: Partial<PipCapableVideoElement> = {}): PipCapableVideoElement {
   const video = document.createElement('video') as PipCapableVideoElement;
@@ -710,15 +716,212 @@ describe('YouTube Bilingual Document PiP & Guardrail 2 Fallback', () => {
     expect(translateSpy).toHaveBeenCalledTimes(1);
     expect(isolatedCtrl.getCues()[0]?.trans).toBe('保持好奇');
 
-    // Verify YouTube Native default preset (100% original / 70% translation) & compact 36px control buttons
+    // Verify YouTube Native default preset (100% original / 70% translation) & native-style 48px/28px control buttons with #ff0033 active underline
     const overlayHost = document.getElementById(SUBTITLE_OVERLAY_HOST_ID);
     const wrap = overlayHost?.shadowRoot?.getElementById('margin-sub-wrap');
     expect(wrap?.dataset.stylePreset).toBe('youtube-native');
     expect(wrap?.style.getPropertyValue('--margin-sub-orig-scale')).toBe('1.000');
 
+    const controlsStyle = document.getElementById(YOUTUBE_CONTROLS_STYLE_ID);
+    expect(controlsStyle?.textContent).toContain('.ytp-delhi-modern');
+    expect(controlsStyle?.textContent).toContain('padding: 0 !important');
+
+    expect(
+      toggleBtn.querySelector('[data-margin-active-bar="true"]')?.getAttribute('fill'),
+    ).toBe('#ff0033');
+
     const pipBtn = document.getElementById(PIP_BUTTON_ID) as HTMLButtonElement;
-    expect(pipBtn.style.width).toBe('36px');
-    expect(pipBtn.querySelector('svg')?.style.width).toBe('22px');
+    expect(pipBtn.style.width).toBe('48px');
+    expect(pipBtn.querySelector('svg')?.style.width).toBe('28px');
+    expect(pipBtn.querySelector('svg')?.style.padding).toBe('0px');
+    expect(pipBtn.querySelector('[data-margin-active-bar="true"]')).toBeNull();
+
+    isolatedCtrl.destroy();
+    mainCtrl.destroy();
+  });
+
+  it('parses YouTube native caption settings (including 0% opacity, #ff0 yellow, edge styles, small-caps & font scale)', () => {
+    const parsedFromStorage = parseYoutubeNativeCaptionSettings(
+      JSON.stringify({
+        data: JSON.stringify({
+          color: '#ff0',
+          textOpacity: 0.75,
+          background: '#080808',
+          backgroundOpacity: 0,
+          windowColor: '#0000ff',
+          windowOpacity: 0.25,
+          charEdgeStyle: 4,
+          fontFamily: 7,
+          fontSizeIncrement: 1,
+        }),
+        expiration: Date.now() + 86400000,
+      }),
+    );
+
+    expect(parsedFromStorage.textColorCss).toBe('rgba(255, 255, 0, 0.75)');
+    expect(parsedFromStorage.bgColorCss).toBe('rgba(8, 8, 8, 0)');
+    expect(parsedFromStorage.windowBgCss).toBe('rgba(0, 0, 255, 0.25)');
+    expect(parsedFromStorage.textShadowCss).toContain('-1.2px -1.2px 0');
+    expect(parsedFromStorage.fontVariantCss).toBe('small-caps');
+    expect(parsedFromStorage.fontScaleMultiplier).toBe(1.5);
+
+    // Override background opacity and translation tint in Margin Studio
+    const resolvedVars = resolveEffectiveNativeThemeVariables(parsedFromStorage, {
+      bgOpacityPercent: 50,
+      translationTint: 'amber',
+    });
+    expect(resolvedVars.fgCss).toBe('rgba(255, 255, 0, 0.75)');
+    expect(resolvedVars.bgCss).toBe('rgba(8, 8, 8, 0.5)');
+    expect(resolvedVars.transFgCss).toBe('rgba(255, 217, 125, 0.98)');
+  });
+
+  it('syncs YouTube native caption options live while video is paused AND auto-lifts above visible control bar', async () => {
+    vi.useRealTimers();
+    window.location.href = 'https://www.youtube.com/watch?v=hybridSync01';
+    window.localStorage.removeItem(YOUTUBE_CAPTION_STORAGE_KEY);
+
+    let livePlayerCaptionSettings: Record<string, unknown> = {
+      color: '#ffffff',
+      textOpacity: 1,
+      background: '#080808',
+      backgroundOpacity: 0.75,
+      charEdgeStyle: 0,
+      fontSizeIncrement: 0,
+    };
+
+    document.body.innerHTML = `
+      <div id="movie_player" class="html5-video-player ytp-delhi-modern">
+        <video class="html5-main-video"></video>
+        <div class="ytp-chrome-bottom">
+          <div class="ytp-progress-bar-container"></div>
+          <div class="ytp-chrome-controls">
+            <div class="ytp-right-controls">
+              <div class="ytp-right-controls-left"></div>
+            </div>
+          </div>
+        </div>
+        <div class="ytp-popup ytp-settings-menu">
+          <button id="yt-mock-yellow-option" type="button">Yellow</button>
+        </div>
+      </div>
+    `;
+
+    const moviePlayer = document.getElementById('movie_player') as HTMLElement & {
+      getSubtitlesUserSettings?: () => unknown;
+    };
+    moviePlayer.getSubtitlesUserSettings = () => livePlayerCaptionSettings;
+
+    // Mock player height = 500px, progress bar top = 440px (60px from bottom)
+    vi.spyOn(moviePlayer, 'getBoundingClientRect').mockReturnValue({
+      top: 0,
+      bottom: 500,
+      left: 0,
+      right: 888,
+      width: 888,
+      height: 500,
+      x: 0,
+      y: 0,
+      toJSON: () => ({}),
+    });
+    const progressEl = moviePlayer.querySelector('.ytp-progress-bar-container') as HTMLElement;
+    vi.spyOn(progressEl, 'getBoundingClientRect').mockReturnValue({
+      top: 440,
+      bottom: 444,
+      left: 12,
+      right: 876,
+      width: 864,
+      height: 4,
+      x: 12,
+      y: 440,
+      toJSON: () => ({}),
+    });
+
+    const videoEl = moviePlayer.querySelector('video') as HTMLVideoElement;
+    Object.defineProperty(videoEl, 'paused', { value: true, configurable: true });
+    Object.defineProperty(videoEl, 'currentTime', { value: 1.0, configurable: true });
+
+    window.fetch = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes('/api/timedtext')) {
+        return new Response(
+          JSON.stringify({
+            events: [
+              {
+                tStartMs: 0,
+                dDurationMs: 4000,
+                segs: [{ utf8: 'While I explore.' }],
+              },
+            ],
+          }),
+          { status: 200 },
+        );
+      }
+      return new Response('{}', { status: 200 });
+    });
+
+    const mainCtrl = createYoutubeMainController();
+    const isolatedCtrl = createSubtitleIsolatedController({
+      loadConfig: async () => createDefaultMarginConfig(),
+      subscribeConfig: () => () => {},
+      translateBatch: async (req) => ({
+        ok: true,
+        requestId: req.requestId,
+        providerId: 'mock',
+        model: 'mock',
+        items: req.items.map((it) => ({ id: it.id, trans: '还有活火山。' })),
+        diagnostic: {} as never,
+      }),
+    });
+
+    mainCtrl.start();
+    await isolatedCtrl.start();
+    await new Promise((r) => setTimeout(r, 25));
+
+    await window.fetch(
+      'https://www.youtube.com/api/timedtext?v=hybridSync01&lang=en&fmt=json3',
+    );
+    window.postMessage(
+      {
+        source: BRAND.ytBridgeSourceMain,
+        type: 'playhead-tick',
+        videoId: 'hybridSync01',
+        currentTimeMs: 1000,
+        paused: true,
+      } satisfies YoutubeMainBridgeMessage,
+      '*',
+    );
+    await new Promise((r) => setTimeout(r, 40));
+
+    const overlayHost = document.getElementById(SUBTITLE_OVERLAY_HOST_ID);
+    const wrap = overlayHost?.shadowRoot?.getElementById('margin-sub-wrap') as HTMLElement;
+    expect(wrap).toBeTruthy();
+
+    // Controls visible (`!ytp-autohide`): bottom offset lifted above 60px scrub bar (`60 + 14 = 74px`)
+    expect(wrap.style.getPropertyValue('--margin-sub-bottom-px')).toBe('74px');
+
+    // Auto-hide controls (`ytp-autohide` added while video is paused): glides down to `round(500 * 0.048) = 24px`
+    moviePlayer.classList.add('ytp-autohide');
+    await new Promise((r) => setTimeout(r, 20));
+    expect(wrap.style.getPropertyValue('--margin-sub-bottom-px')).toBe('24px');
+
+    // User pauses & clicks "Yellow + 25% background" inside `.ytp-settings-menu` -> updates paused overlay & PiP live!
+    livePlayerCaptionSettings = {
+      color: '#ff0',
+      textOpacity: 1,
+      background: '#080808',
+      backgroundOpacity: 0.25,
+      charEdgeStyle: 1,
+      fontSizeIncrement: 1,
+    };
+    (document.getElementById('yt-mock-yellow-option') as HTMLButtonElement).click();
+    await new Promise((r) => setTimeout(r, 85));
+
+    expect(wrap.style.getPropertyValue('--margin-yt-fg')).toBe('rgba(255, 255, 0, 1)');
+    expect(wrap.style.getPropertyValue('--margin-yt-bg')).toBe('rgba(8, 8, 8, 0.25)');
+    expect(wrap.style.getPropertyValue('--margin-yt-scale-mult')).toBe('1.500');
+    expect(mainCtrl.getPipPlayer().getCueState().nativeTheme?.textColorCss).toBe(
+      'rgba(255, 255, 0, 1)',
+    );
 
     isolatedCtrl.destroy();
     mainCtrl.destroy();

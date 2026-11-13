@@ -1,12 +1,16 @@
 import { SHADOW_HOST_RESET_CSS } from '@shared/shadow-styles';
 import type { MarginActiveCueState, SubtitleSettings } from '@shared/types';
 import {
+  applyNativeThemeVariablesToElement,
+  areYoutubeNativeThemesEqual,
   clampFontSizePercent,
   clampSeekTime,
   cleanPipCueText,
   computePipDimensions,
   normalizeActiveCueState,
+  normalizeBgOpacityOverride,
   normalizeSubtitleStylePreset,
+  normalizeTranslationTint,
   PIP_BUTTON_ID,
   PIP_CLEAR_DELAY_MS,
   PIP_NOTICE_DURATION_MS,
@@ -198,6 +202,9 @@ export class YoutubePipPlayer {
       sourceScalePercent: this.cueState.sourceScalePercent,
       translationScalePercent: this.cueState.translationScalePercent,
       stylePreset: this.cueState.stylePreset,
+      bgOpacityPercent: this.cueState.bgOpacityPercent,
+      translationTint: this.cueState.translationTint,
+      nativeTheme: this.cueState.nativeTheme,
       position: this.cueState.position,
       ...input,
     });
@@ -218,6 +225,12 @@ export class YoutubePipPlayer {
       normalized.sourceScalePercent !== this.cueState.sourceScalePercent ||
       normalized.translationScalePercent !== this.cueState.translationScalePercent ||
       normalized.stylePreset !== this.cueState.stylePreset ||
+      normalized.bgOpacityPercent !== this.cueState.bgOpacityPercent ||
+      normalized.translationTint !== this.cueState.translationTint ||
+      !areYoutubeNativeThemesEqual(
+        normalized.nativeTheme,
+        this.cueState.nativeTheme,
+      ) ||
       normalized.position !== this.cueState.position ||
       normalized.mode !== this.cueState.mode;
 
@@ -229,6 +242,9 @@ export class YoutubePipPlayer {
         sourceScalePercent: normalized.sourceScalePercent,
         translationScalePercent: normalized.translationScalePercent,
         stylePreset: normalized.stylePreset,
+        bgOpacityPercent: normalized.bgOpacityPercent,
+        translationTint: normalized.translationTint,
+        nativeTheme: normalized.nativeTheme,
         position: normalized.position,
       };
       this.renderPipSubtitles();
@@ -251,6 +267,9 @@ export class YoutubePipPlayer {
           sourceScalePercent: this.cueState.sourceScalePercent,
           translationScalePercent: this.cueState.translationScalePercent,
           stylePreset: this.cueState.stylePreset,
+          bgOpacityPercent: this.cueState.bgOpacityPercent,
+          translationTint: this.cueState.translationTint,
+          nativeTheme: this.cueState.nativeTheme,
           position: this.cueState.position,
         });
         this.renderPipSubtitles();
@@ -263,7 +282,11 @@ export class YoutubePipPlayer {
       Partial<
         Pick<
           SubtitleSettings,
-          'sourceScalePercent' | 'translationScalePercent' | 'stylePreset'
+          | 'sourceScalePercent'
+          | 'translationScalePercent'
+          | 'stylePreset'
+          | 'bgOpacityPercent'
+          | 'translationTint'
         >
       >,
   ): void {
@@ -280,6 +303,14 @@ export class YoutubePipPlayer {
         settings.stylePreset !== undefined
           ? normalizeSubtitleStylePreset(settings.stylePreset)
           : (this.cueState.stylePreset ?? 'youtube-native'),
+      bgOpacityPercent:
+        settings.bgOpacityPercent !== undefined
+          ? normalizeBgOpacityOverride(settings.bgOpacityPercent)
+          : this.cueState.bgOpacityPercent,
+      translationTint:
+        settings.translationTint !== undefined
+          ? normalizeTranslationTint(settings.translationTint)
+          : this.cueState.translationTint,
       position: settings.position,
     });
     this.renderPipSubtitles();
@@ -293,6 +324,9 @@ export class YoutubePipPlayer {
       sourceScalePercent: this.cueState.sourceScalePercent,
       translationScalePercent: this.cueState.translationScalePercent,
       stylePreset: this.cueState.stylePreset,
+      bgOpacityPercent: this.cueState.bgOpacityPercent,
+      translationTint: this.cueState.translationTint,
+      nativeTheme: this.cueState.nativeTheme,
       position: this.cueState.position,
     });
     this.renderPipSubtitles();
@@ -773,6 +807,7 @@ export class YoutubePipPlayer {
     const preset = normalizeSubtitleStylePreset(this.cueState.stylePreset);
     container.style.setProperty('--margin-orig-scale', (origPct / 100).toFixed(3));
     container.style.setProperty('--margin-trans-scale', (transPct / 100).toFixed(3));
+    applyNativeThemeVariablesToElement(container, this.cueState);
     container.dataset.stylePreset = preset;
     container.dataset.position = this.cueState.position;
     if (root) {
@@ -940,6 +975,14 @@ function buildPipWindowStyles(): string {
     #margin-pip-subtitles {
       --margin-orig-scale: 1;
       --margin-trans-scale: 0.7;
+      --margin-yt-fg: rgba(255, 255, 255, 1);
+      --margin-yt-trans-fg: rgba(255, 255, 255, 0.96);
+      --margin-yt-bg: rgba(8, 8, 8, 0.75);
+      --margin-yt-win-bg: rgba(8, 8, 8, 0);
+      --margin-yt-shadow: none;
+      --margin-yt-font: "YouTube Noto", Roboto, Arial, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Noto Sans SC", sans-serif;
+      --margin-yt-variant: normal;
+      --margin-yt-scale-mult: 1;
       position: absolute;
       left: 4%;
       right: 4%;
@@ -952,6 +995,17 @@ function buildPipWindowStyles(): string {
       pointer-events: none;
       text-align: center;
       font-family: "YouTube Noto", Roboto, Arial, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Noto Sans SC", sans-serif;
+    }
+    #margin-pip-subtitles[data-style-preset="youtube-native"] {
+      font-family: var(--margin-yt-font);
+      font-variant: var(--margin-yt-variant, normal);
+      background: var(--margin-yt-win-bg, transparent);
+      width: fit-content;
+      max-width: 92%;
+      margin-left: auto;
+      margin-right: auto;
+      padding: 2px 4px;
+      border-radius: 3px;
     }
     #margin-pip-subtitles[data-position="top"] {
       bottom: auto;
@@ -973,10 +1027,14 @@ function buildPipWindowStyles(): string {
       text-shadow: none;
       line-height: 1.48;
     }
+    #margin-pip-subtitles[data-style-preset="youtube-native"] .margin-pip-line {
+      max-width: 100%;
+    }
     .margin-sub-seg {
       display: inline;
-      background: rgba(8, 8, 8, 0.75);
-      color: #ffffff;
+      background: var(--margin-yt-bg, rgba(8, 8, 8, 0.75));
+      color: var(--margin-yt-fg, #ffffff);
+      text-shadow: var(--margin-yt-shadow, none);
       padding: 2px 7px;
       border-radius: 2px;
       border: none;
@@ -984,17 +1042,17 @@ function buildPipWindowStyles(): string {
       -webkit-box-decoration-break: clone;
     }
     .margin-pip-original {
-      color: #ffffff;
-      font-size: calc(clamp(14px, 3.2vw, 24px) * var(--margin-orig-scale, 1));
+      color: var(--margin-yt-fg, #ffffff);
+      font-size: calc(clamp(14px, 3.2vw, 24px) * var(--margin-orig-scale, 1) * var(--margin-yt-scale-mult, 1));
       font-weight: 500;
     }
     .margin-pip-translated {
-      color: rgba(255, 255, 255, 0.96);
-      font-size: calc(clamp(14px, 3.2vw, 24px) * var(--margin-trans-scale, 0.7));
+      color: var(--margin-yt-trans-fg, rgba(255, 255, 255, 0.96));
+      font-size: calc(clamp(14px, 3.2vw, 24px) * var(--margin-trans-scale, 0.7) * var(--margin-yt-scale-mult, 1));
       font-weight: 500;
     }
     .margin-pip-translated .margin-sub-seg {
-      color: rgba(255, 255, 255, 0.96);
+      color: var(--margin-yt-trans-fg, rgba(255, 255, 255, 0.96));
     }
     #margin-pip-subtitles[data-style-preset="cinema-outline"] {
       gap: 3px;

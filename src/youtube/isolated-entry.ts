@@ -17,6 +17,7 @@ import type {
   TranslateBatchRequest,
   TranslateBatchResponse,
   YoutubeMainBridgeMessage,
+  YoutubeNativeCaptionTheme,
 } from '@shared/types';
 import { isUrlExcluded } from '@shared/url-match';
 import {
@@ -24,14 +25,21 @@ import {
   SubtitleBatchScheduler,
 } from './batching';
 import {
+  applyNativeThemeVariablesToElement,
+  areYoutubeNativeThemesEqual,
   buildSourceTrackFingerprint,
   clampFontSizePercent,
+  DEFAULT_YOUTUBE_NATIVE_CAPTION_THEME,
   extractYoutubeVideoId,
   normalizeActiveCueState,
+  normalizeBgOpacityOverride,
   normalizeSubtitleStylePreset,
+  normalizeTranslationTint,
   PIP_CLEAR_DELAY_MS,
+  readLocalYoutubeCaptionTheme,
   resolveEffectiveTranslationScale,
   resolveRenderedCueLines,
+  YOUTUBE_CAPTION_STORAGE_KEY,
   type YoutubeExtendedBridgeMessage,
 } from './shared';
 import {
@@ -107,11 +115,20 @@ export function createSubtitleIsolatedController(
   let domObserver: MutationObserver | null = null;
   let playerResizeObserver: ResizeObserver | null = null;
   let observedPlayerContainer: HTMLElement | null = null;
+  let playerClassObserver: MutationObserver | null = null;
+  let observedClassContainer: HTMLElement | null = null;
+  let pendingCaptionSyncTimer: ReturnType<typeof setTimeout> | null = null;
   let ownedOverlayHost: HTMLElement | null = null;
   let boundHtml5Video: HTMLVideoElement | null = null;
   let detachHtml5Listeners: (() => void) | null = null;
   let hadRuntimeIdAtStart = false;
   let destroyed = false;
+
+  const isYoutube = isYoutubeHostname(win.location?.hostname ?? '');
+  let hasReceivedMainThemeBridge = false;
+  let currentNativeTheme: YoutubeNativeCaptionTheme = isYoutube
+    ? readLocalYoutubeCaptionTheme(win, doc)
+    : { ...DEFAULT_YOUTUBE_NATIVE_CAPTION_THEME };
 
   function buildConfiguredCueDefaults(): Partial<MarginActiveCueState> {
     const transScale = resolveEffectiveTranslationScale(config.subtitles);
@@ -124,11 +141,16 @@ export function createSubtitleIsolatedController(
       ),
       translationScalePercent: transScale,
       stylePreset: normalizeSubtitleStylePreset(config.subtitles.stylePreset),
+      bgOpacityPercent: normalizeBgOpacityOverride(
+        config.subtitles.bgOpacityPercent,
+      ),
+      translationTint: normalizeTranslationTint(
+        config.subtitles.translationTint,
+      ),
+      ...(isYoutube ? { nativeTheme: currentNativeTheme } : {}),
       position: config.subtitles.position,
     };
   }
-
-  const isYoutube = isYoutubeHostname(win.location?.hostname ?? '');
 
   const scheduler = new SubtitleBatchScheduler({
     translateBatch: translateFn,
@@ -237,6 +259,53 @@ export function createSubtitleIsolatedController(
     return null;
   }
 
+  function computeOverlayBottomOffsetPx(
+    container: HTMLElement,
+    playerHeight: number,
+  ): number {
+    if (!isYoutube) {
+      return doc.fullscreenElement ? 70 : 52;
+    }
+
+    const controlsAutoHidden =
+      container.classList.contains('ytp-autohide') &&
+      !container.classList.contains('ytp-settings-shown');
+
+    if (controlsAutoHidden) {
+      return playerHeight > 0
+        ? Math.max(24, Math.min(56, Math.round(playerHeight * 0.048)))
+        : doc.fullscreenElement
+          ? 48
+          : 28;
+    }
+
+    const isBig =
+      Boolean(doc.fullscreenElement) ||
+      container.classList.contains('ytp-big-mode');
+    const fallbackVisibleBottom = isBig ? 104 : 78;
+
+    const playerRect = container.getBoundingClientRect?.();
+    const barEl =
+      container.querySelector<HTMLElement>('.ytp-progress-bar-container') ??
+      container.querySelector<HTMLElement>('.ytp-chrome-bottom');
+    const barRect = barEl?.getBoundingClientRect?.();
+
+    if (
+      playerRect &&
+      barRect &&
+      playerRect.height > 0 &&
+      barRect.top > playerRect.top &&
+      barRect.top < playerRect.bottom
+    ) {
+      const clearance = Math.round(playerRect.bottom - barRect.top + 14);
+      const minClearance = isBig ? 96 : 74;
+      const maxClearance = isBig ? 184 : 156;
+      return Math.min(maxClearance, Math.max(minClearance, clearance));
+    }
+
+    return fallbackVisibleBottom;
+  }
+
   function syncOverlayBaseFontSize(
     container: HTMLElement,
     wrapper: HTMLElement,
@@ -251,23 +320,48 @@ export function createSubtitleIsolatedController(
         : doc.fullscreenElement
           ? 26
           : 18;
+    const bottomPx = computeOverlayBottomOffsetPx(container, playerHeight);
     wrapper.style.setProperty('--margin-sub-base-px', `${basePx}px`);
+    wrapper.style.setProperty('--margin-sub-bottom-px', `${bottomPx}px`);
   }
 
   function ensurePlayerResizeObserver(container: HTMLElement): void {
-    if (typeof ResizeObserver === 'undefined') return;
-    if (observedPlayerContainer === container && playerResizeObserver) return;
-    playerResizeObserver?.disconnect();
-    observedPlayerContainer = container;
-    playerResizeObserver = new ResizeObserver(() => {
-      if (destroyed) return;
-      const host = doc.getElementById(SUBTITLE_OVERLAY_HOST_ID);
-      const wrapper = host?.shadowRoot?.getElementById('margin-sub-wrap');
-      if (wrapper) {
-        syncOverlayBaseFontSize(container, wrapper);
+    if (typeof ResizeObserver !== 'undefined') {
+      if (observedPlayerContainer !== container || !playerResizeObserver) {
+        playerResizeObserver?.disconnect();
+        observedPlayerContainer = container;
+        playerResizeObserver = new ResizeObserver(() => {
+          if (destroyed) return;
+          const host = doc.getElementById(SUBTITLE_OVERLAY_HOST_ID);
+          const wrapper = host?.shadowRoot?.getElementById('margin-sub-wrap');
+          if (wrapper) {
+            syncOverlayBaseFontSize(container, wrapper);
+          }
+        });
+        playerResizeObserver.observe(container);
       }
-    });
-    playerResizeObserver.observe(container);
+    }
+
+    if (
+      isYoutube &&
+      typeof MutationObserver !== 'undefined' &&
+      (observedClassContainer !== container || !playerClassObserver)
+    ) {
+      playerClassObserver?.disconnect();
+      observedClassContainer = container;
+      playerClassObserver = new MutationObserver(() => {
+        if (destroyed) return;
+        const host = doc.getElementById(SUBTITLE_OVERLAY_HOST_ID);
+        const wrapper = host?.shadowRoot?.getElementById('margin-sub-wrap');
+        if (wrapper) {
+          syncOverlayBaseFontSize(container, wrapper);
+        }
+      });
+      playerClassObserver.observe(container, {
+        attributes: true,
+        attributeFilter: ['class'],
+      });
+    }
   }
 
   function ensureOverlayShadowRoot(): ShadowRoot | null {
@@ -334,6 +428,9 @@ export function createSubtitleIsolatedController(
     playerResizeObserver?.disconnect();
     playerResizeObserver = null;
     observedPlayerContainer = null;
+    playerClassObserver?.disconnect();
+    playerClassObserver = null;
+    observedClassContainer = null;
     const existingHost = doc.getElementById(SUBTITLE_OVERLAY_HOST_ID);
     if (!options.contextInvalidated || (ownedOverlayHost && existingHost === ownedOverlayHost)) {
       existingHost?.remove();
@@ -367,6 +464,7 @@ export function createSubtitleIsolatedController(
     const preset = normalizeSubtitleStylePreset(cue.stylePreset);
     wrapper.style.setProperty('--margin-sub-orig-scale', (origPct / 100).toFixed(3));
     wrapper.style.setProperty('--margin-sub-trans-scale', (transPct / 100).toFixed(3));
+    applyNativeThemeVariablesToElement(wrapper, cue);
     wrapper.dataset.stylePreset = preset;
     wrapper.dataset.position = cue.position;
     wrapper.toggleAttribute('data-fullscreen', Boolean(doc.fullscreenElement));
@@ -417,6 +515,12 @@ export function createSubtitleIsolatedController(
       normalized.sourceScalePercent !== activeCueState.sourceScalePercent ||
       normalized.translationScalePercent !== activeCueState.translationScalePercent ||
       normalized.stylePreset !== activeCueState.stylePreset ||
+      normalized.bgOpacityPercent !== activeCueState.bgOpacityPercent ||
+      normalized.translationTint !== activeCueState.translationTint ||
+      !areYoutubeNativeThemesEqual(
+        normalized.nativeTheme,
+        activeCueState.nativeTheme,
+      ) ||
       normalized.position !== activeCueState.position;
 
     activeCueState = normalized;
@@ -498,6 +602,15 @@ export function createSubtitleIsolatedController(
     }
     const msg = event.data as Partial<YoutubeExtendedBridgeMessage> | null;
     if (!msg || typeof msg !== 'object' || msg.source !== BRAND.ytBridgeSourceMain) {
+      return;
+    }
+
+    if (msg.type === 'native-caption-style-update' && msg.theme) {
+      hasReceivedMainThemeBridge = true;
+      if (!areYoutubeNativeThemesEqual(currentNativeTheme, msg.theme)) {
+        currentNativeTheme = msg.theme;
+        refreshActiveCueFromPlayhead();
+      }
       return;
     }
 
@@ -724,12 +837,67 @@ export function createSubtitleIsolatedController(
     applyOverlayDom(activeCueState);
   }
 
+  function syncLocalCaptionThemeFromStorage(fromStorageEvent = false): void {
+    if (destroyed || !isYoutube) return;
+    // Once MAIN world bridges `getSubtitlesUserSettings()`, defer click polling to MAIN world
+    if (hasReceivedMainThemeBridge && !fromStorageEvent) return;
+    if (fromStorageEvent) {
+      let hasStored = false;
+      try {
+        hasStored = Boolean(win.localStorage?.getItem(YOUTUBE_CAPTION_STORAGE_KEY));
+      } catch {
+        hasStored = false;
+      }
+      if (!hasStored && hasReceivedMainThemeBridge) return;
+    }
+    const nextTheme = readLocalYoutubeCaptionTheme(win, doc);
+    if (!areYoutubeNativeThemesEqual(currentNativeTheme, nextTheme)) {
+      currentNativeTheme = nextTheme;
+      refreshActiveCueFromPlayhead();
+    }
+  }
+
+  function handleStorageEvent(event: StorageEvent): void {
+    if (!event.key || event.key === YOUTUBE_CAPTION_STORAGE_KEY) {
+      syncLocalCaptionThemeFromStorage(true);
+    }
+  }
+
+  function handlePlayerMenuInteraction(event: Event): void {
+    if (destroyed || !isYoutube) return;
+    const target = event.target as HTMLElement | null;
+    if (
+      target &&
+      typeof target.closest === 'function' &&
+      !target.closest('#movie_player, .html5-video-player, .ytp-popup, .ytp-settings-menu')
+    ) {
+      return;
+    }
+    const raf =
+      win.requestAnimationFrame?.bind(win) ??
+      ((cb: FrameRequestCallback) => setTimeout(() => cb(Date.now()), 16));
+    raf(() => {
+      if (!destroyed) syncLocalCaptionThemeFromStorage();
+    });
+    if (pendingCaptionSyncTimer !== null) {
+      clearTimeout(pendingCaptionSyncTimer);
+    }
+    pendingCaptionSyncTimer = setTimeout(() => {
+      pendingCaptionSyncTimer = null;
+      syncLocalCaptionThemeFromStorage();
+    }, 65);
+  }
+
   async function start(): Promise<void> {
     if (destroyed) return;
     hadRuntimeIdAtStart = Boolean(globalThis.chrome?.runtime?.id);
 
     if (isYoutube) {
+      currentNativeTheme = readLocalYoutubeCaptionTheme(win, doc);
       win.addEventListener('message', handleYoutubeBridgeMessage);
+      win.addEventListener('storage', handleStorageEvent);
+      doc.addEventListener('click', handlePlayerMenuInteraction, true);
+      doc.addEventListener('keyup', handlePlayerMenuInteraction, true);
     }
     doc.addEventListener('fullscreenchange', handleFullscreenChange);
 
@@ -794,8 +962,15 @@ export function createSubtitleIsolatedController(
       clearInterval(playheadPollTimer);
       playheadPollTimer = null;
     }
+    if (pendingCaptionSyncTimer !== null) {
+      clearTimeout(pendingCaptionSyncTimer);
+      pendingCaptionSyncTimer = null;
+    }
     if (isYoutube) {
       win.removeEventListener('message', handleYoutubeBridgeMessage);
+      win.removeEventListener('storage', handleStorageEvent);
+      doc.removeEventListener('click', handlePlayerMenuInteraction, true);
+      doc.removeEventListener('keyup', handlePlayerMenuInteraction, true);
     }
     doc.removeEventListener('fullscreenchange', handleFullscreenChange);
     try {
@@ -842,26 +1017,37 @@ function buildInPlayerOverlayCss(): string {
     }
     #margin-sub-wrap {
       --margin-sub-base-px: 18px;
+      --margin-sub-bottom-px: 52px;
       --margin-sub-orig-scale: 1;
       --margin-sub-trans-scale: 0.7;
+      --margin-yt-fg: rgba(255, 255, 255, 1);
+      --margin-yt-trans-fg: rgba(255, 255, 255, 0.96);
+      --margin-yt-bg: rgba(8, 8, 8, 0.75);
+      --margin-yt-win-bg: rgba(8, 8, 8, 0);
+      --margin-yt-shadow: none;
+      --margin-yt-font: "YouTube Noto", Roboto, Arial, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Noto Sans SC", sans-serif;
+      --margin-yt-variant: normal;
+      --margin-yt-scale-mult: 1;
       position: absolute;
       left: 5%;
       right: 5%;
-      bottom: 52px;
+      bottom: var(--margin-sub-bottom-px, 52px);
       display: flex;
       flex-direction: column;
       align-items: center;
       gap: 2px;
       text-align: center;
       pointer-events: none;
+      transition: bottom 180ms cubic-bezier(0.2, 0, 0, 1);
       font-family: "YouTube Noto", Roboto, Arial, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Noto Sans SC", sans-serif;
     }
     #margin-sub-wrap[data-position="top"] {
       bottom: auto;
       top: 34px;
+      transition: none;
     }
     #margin-sub-wrap[data-fullscreen] {
-      bottom: 70px;
+      bottom: var(--margin-sub-bottom-px, 70px);
     }
     #margin-sub-wrap[data-fullscreen][data-position="top"] {
       bottom: auto;
@@ -870,6 +1056,17 @@ function buildInPlayerOverlayCss(): string {
     #margin-sub-wrap[hidden],
     .margin-sub-line[hidden] {
       display: none !important;
+    }
+    #margin-sub-wrap[data-style-preset="youtube-native"] {
+      font-family: var(--margin-yt-font);
+      font-variant: var(--margin-yt-variant, normal);
+      background: var(--margin-yt-win-bg, transparent);
+      width: fit-content;
+      max-width: 90%;
+      margin-left: auto;
+      margin-right: auto;
+      padding: 2px 4px;
+      border-radius: 3px;
     }
     .margin-sub-line {
       width: fit-content;
@@ -884,10 +1081,14 @@ function buildInPlayerOverlayCss(): string {
       box-sizing: border-box;
       line-height: 1.48;
     }
+    #margin-sub-wrap[data-style-preset="youtube-native"] .margin-sub-line {
+      max-width: min(100%, 960px);
+    }
     .margin-sub-seg {
       display: inline;
-      background: rgba(8, 8, 8, 0.75);
-      color: #ffffff;
+      background: var(--margin-yt-bg, rgba(8, 8, 8, 0.75));
+      color: var(--margin-yt-fg, #ffffff);
+      text-shadow: var(--margin-yt-shadow, none);
       padding: 2px 7px;
       border-radius: 2px;
       border: none;
@@ -895,17 +1096,17 @@ function buildInPlayerOverlayCss(): string {
       -webkit-box-decoration-break: clone;
     }
     .margin-sub-original {
-      color: #ffffff;
-      font-size: calc(var(--margin-sub-base-px, 18px) * var(--margin-sub-orig-scale, 1));
+      color: var(--margin-yt-fg, #ffffff);
+      font-size: calc(var(--margin-sub-base-px, 18px) * var(--margin-sub-orig-scale, 1) * var(--margin-yt-scale-mult, 1));
       font-weight: 500;
     }
     .margin-sub-translated {
-      color: rgba(255, 255, 255, 0.96);
-      font-size: calc(var(--margin-sub-base-px, 18px) * var(--margin-sub-trans-scale, 0.7));
+      color: var(--margin-yt-trans-fg, rgba(255, 255, 255, 0.96));
+      font-size: calc(var(--margin-sub-base-px, 18px) * var(--margin-sub-trans-scale, 0.7) * var(--margin-yt-scale-mult, 1));
       font-weight: 500;
     }
     .margin-sub-translated .margin-sub-seg {
-      color: rgba(255, 255, 255, 0.96);
+      color: var(--margin-yt-trans-fg, rgba(255, 255, 255, 0.96));
     }
     #margin-sub-wrap[data-style-preset="cinema-outline"] {
       gap: 3px;

@@ -45,7 +45,7 @@ describe('Margin shared contracts & temperature engine', () => {
   it('locks brand constants and Shadow DOM CSS reset invariants', () => {
     expect(BRAND.name).toBe('Margin');
     expect(BRAND.slug).toBe('margin');
-    expect(BRAND.version).toBe('2.3.0');
+    expect(BRAND.version).toBe('2.3.1');
     expect(BRAND.pinnedExtensionId).toMatch(/^[a-p]{32}$/);
     expect(SHADOW_HOST_RESET_CSS).toContain('all: initial !important');
     expect(SHADOW_HOST_RESET_CSS).toContain('font-size: 16px !important');
@@ -70,6 +70,16 @@ describe('Margin shared contracts & temperature engine', () => {
     expect(defaults.subtitles.sourceScalePercent).toBe(100);
     expect(defaults.subtitles.translationScalePercent).toBe(70);
     expect(defaults.subtitles.stylePreset).toBe('youtube-native');
+    expect(defaults.subtitles.bgOpacityPercent).toBeNull();
+    expect(defaults.subtitles.translationTint).toBe('follow');
+
+    // Verify `bgOpacityPercent: 0` (0% transparent) is preserved and never coerced to null
+    const zeroOpacityCfg = createDefaultMarginConfig();
+    zeroOpacityCfg.subtitles.bgOpacityPercent = 0;
+    zeroOpacityCfg.subtitles.translationTint = 'amber';
+    const backfilled = backfillStoredConfig(zeroOpacityCfg);
+    expect(backfilled.config.subtitles.bgOpacityPercent).toBe(0);
+    expect(backfilled.config.subtitles.translationTint).toBe('amber');
   });
 
   it('normalizes legacy undefined and empty-string temperatures to omit (never 0)', () => {

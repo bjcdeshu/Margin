@@ -137,12 +137,27 @@ export function backfillStoredConfig(stored: MarginConfig): {
       sub.stylePreset === 'warm-paper'
         ? sub.stylePreset
         : 'youtube-native';
+    const nextBgOpacity =
+      sub.bgOpacityPercent === null || sub.bgOpacityPercent === undefined
+        ? null
+        : Number.isFinite(Number(sub.bgOpacityPercent))
+          ? Math.max(0, Math.min(100, Math.round(Number(sub.bgOpacityPercent))))
+          : null;
+    const nextTranslationTint =
+      sub.translationTint === 'warm-ivory' ||
+      sub.translationTint === 'amber' ||
+      sub.translationTint === 'cyan' ||
+      sub.translationTint === 'follow'
+        ? sub.translationTint
+        : 'follow';
 
     if (
       sub.sourceScalePercent !== nextSourceScale ||
       sub.translationScalePercent !== nextTransScale ||
       sub.fontSizePercent !== nextTransScale ||
-      sub.stylePreset !== nextPreset
+      sub.stylePreset !== nextPreset ||
+      sub.bgOpacityPercent !== nextBgOpacity ||
+      sub.translationTint !== nextTranslationTint
     ) {
       stored.subtitles = {
         ...defaults.subtitles,
@@ -151,6 +166,8 @@ export function backfillStoredConfig(stored: MarginConfig): {
         translationScalePercent: nextTransScale,
         fontSizePercent: nextTransScale,
         stylePreset: nextPreset,
+        bgOpacityPercent: nextBgOpacity,
+        translationTint: nextTranslationTint,
       };
       mutated = true;
     }

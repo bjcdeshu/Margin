@@ -176,6 +176,18 @@ export interface HoverSettings {
 
 export type SubtitleStylePreset = 'youtube-native' | 'cinema-outline' | 'warm-paper';
 
+export type SubtitleTranslationTint = 'follow' | 'warm-ivory' | 'amber' | 'cyan';
+
+export interface YoutubeNativeCaptionTheme {
+  textColorCss: string;
+  bgColorCss: string;
+  windowBgCss: string;
+  textShadowCss: string;
+  fontFamilyCss: string;
+  fontVariantCss: string;
+  fontScaleMultiplier: number;
+}
+
 export interface SubtitleSettings {
   autoEnable: boolean;
   youtubeAutoEnable: boolean;
@@ -185,6 +197,10 @@ export interface SubtitleSettings {
   sourceScalePercent: number;
   translationScalePercent: number;
   stylePreset: SubtitleStylePreset;
+  /** `null` / `undefined` follows YouTube native caption background opacity (default 75%). */
+  bgOpacityPercent?: number | null;
+  /** Optional secondary color differentiation for the translated line; `'follow'` matches native. */
+  translationTint?: SubtitleTranslationTint;
   position: 'bottom' | 'top';
 }
 
@@ -387,6 +403,9 @@ export interface MarginActiveCueState {
   sourceScalePercent?: number;
   translationScalePercent?: number;
   stylePreset?: SubtitleStylePreset;
+  bgOpacityPercent?: number | null;
+  translationTint?: SubtitleTranslationTint;
+  nativeTheme?: YoutubeNativeCaptionTheme;
   position: 'bottom' | 'top';
 }
 

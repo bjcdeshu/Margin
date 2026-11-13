@@ -2540,8 +2540,9 @@ body {
 
 .mp-subtitle-preview-stack[data-preset="youtube-native"] .margin-sub-seg {
   display: inline;
-  background: rgba(8, 8, 8, 0.75);
+  background: var(--mp-preview-bg, rgba(8, 8, 8, 0.75));
   color: #ffffff;
+  text-shadow: var(--mp-preview-shadow, none);
   padding: 2px 7px;
   border-radius: 2px;
   box-decoration-break: clone;
@@ -2549,7 +2550,7 @@ body {
 }
 
 .mp-subtitle-preview-stack[data-preset="youtube-native"] .mp-subtitle-preview-line--trans .margin-sub-seg {
-  color: rgba(255, 255, 255, 0.94);
+  color: var(--mp-preview-trans-fg, rgba(255, 255, 255, 0.94));
   font-weight: 400;
 }
 
