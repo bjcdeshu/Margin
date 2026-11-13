@@ -4,6 +4,7 @@ import {
   isAtomicInlineElement,
   isExcludedElement,
 } from './dom-walker';
+import { inspectOriginalLinkAppearance } from './effective-text-style';
 
 export const INLINE_FORMATTING_TAGS: ReadonlySet<string> = new Set([
   'A',
@@ -125,6 +126,56 @@ export interface ReconstructedRichDom {
 
 export interface RichDomLocaleOptions {
   stripSourceLocaleAttrs?: boolean;
+  preserveLinkAppearance?: boolean;
+}
+
+const clonedLinkOriginMap = new WeakMap<Element, Element>();
+
+export function bindClonedLinkOrigin(
+  cloneAnchor: Element,
+  origAnchor: Element,
+): void {
+  clonedLinkOriginMap.set(cloneAnchor, origAnchor);
+}
+
+export function getClonedLinkOrigin(cloneAnchor: Element): Element | undefined {
+  return clonedLinkOriginMap.get(cloneAnchor);
+}
+
+export function applyPreservedLinkAppearance(
+  cloneAnchor: Element,
+  origAnchor: Element,
+): void {
+  const { color, noUnderline } = inspectOriginalLinkAppearance(origAnchor);
+  if (noUnderline) {
+    cloneAnchor.setAttribute('data-margin-no-underline', 'true');
+  } else {
+    cloneAnchor.removeAttribute('data-margin-no-underline');
+  }
+
+  if (cloneAnchor instanceof HTMLElement) {
+    if (color) {
+      cloneAnchor.setAttribute('data-margin-has-link-color', 'true');
+      cloneAnchor.style.setProperty('--margin-link-color', color);
+    } else {
+      cloneAnchor.removeAttribute('data-margin-has-link-color');
+      cloneAnchor.style.removeProperty('--margin-link-color');
+      if (!cloneAnchor.getAttribute('style')?.trim()) {
+        cloneAnchor.removeAttribute('style');
+      }
+    }
+  }
+}
+
+export function refreshClonedLinksAppearance(rootEl: ParentNode): void {
+  const anchors = rootEl.querySelectorAll('a');
+  for (let i = 0; i < anchors.length; i++) {
+    const cloneAnchor = anchors[i];
+    const origAnchor = clonedLinkOriginMap.get(cloneAnchor);
+    if (origAnchor && origAnchor.isConnected) {
+      applyPreservedLinkAppearance(cloneAnchor, origAnchor);
+    }
+  }
 }
 
 function escapeLiteralMarkerInRawText(raw: string): string {
@@ -202,6 +253,11 @@ export function cloneFormattingElementSafely(
         clone.setAttribute('href', safeHref);
       }
     }
+  }
+
+  if (options?.preserveLinkAppearance && origEl.tagName.toUpperCase() === 'A') {
+    bindClonedLinkOrigin(clone, origEl);
+    applyPreservedLinkAppearance(clone, origEl);
   }
 
   return clone;

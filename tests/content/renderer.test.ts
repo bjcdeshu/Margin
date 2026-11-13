@@ -64,6 +64,8 @@ describe('renderer & content orchestrator: themes, reversible target-only, retry
     document.body.innerHTML = '';
     document.documentElement.removeAttribute('data-margin-mask-revealed');
     document.documentElement.removeAttribute('lang');
+    document.documentElement.removeAttribute('dark');
+    document.documentElement.removeAttribute('style');
   });
 
   afterEach(() => {
@@ -2078,8 +2080,12 @@ describe('renderer & content orchestrator: themes, reversible target-only, retry
   it('prevents CJK Han-Unification ransom-note glyph mixing and RTL inversion across X Japanese emoji tweets, Arabic RTL tweets, editorial serif articles, and SelectionPopover', async () => {
     // 1. Verify WEBPAGE_INJECTED_CSS drops `font: inherit;` in favor of explicit typographic inheritance + target font rule
     expect(WEBPAGE_INJECTED_CSS).not.toContain('font: inherit;');
-    expect(WEBPAGE_INJECTED_CSS).toContain('font-size: inherit;');
-    expect(WEBPAGE_INJECTED_CSS).toContain('font-weight: inherit;');
+    expect(WEBPAGE_INJECTED_CSS).toContain(
+      'font-size: var(--margin-effective-font-size, inherit);',
+    );
+    expect(WEBPAGE_INJECTED_CSS).toContain(
+      'font-weight: var(--margin-effective-font-weight, inherit);',
+    );
     expect(WEBPAGE_INJECTED_CSS).toContain(
       'font-family: var(--margin-target-font-family) !important;',
     );
@@ -2297,5 +2303,333 @@ describe('renderer & content orchestrator: themes, reversible target-only, retry
     expect(selBody.getAttribute('dir')).toBe('rtl');
 
     popover.destroy();
+  });
+
+  it('inherits effective host text style & preserves link appearance across YouTube Dark Mode cards (shimmer, streaming, bilingual, target-only, Polymer #video-title, Watch H1, LIVE badge), X @mentions, and live Dark <-> Light toggles', async () => {
+    // Verify CSS rules for zero-specificity link fallback, preserved link rules, weakening, and dark-friendly inline retry
+    expect(WEBPAGE_INJECTED_CSS).not.toContain(
+      '.margin-trans-root[data-margin-injected="true"] a {',
+    );
+    expect(WEBPAGE_INJECTED_CSS).toContain(
+      ':where(.margin-trans-root[data-margin-injected="true"]) :where(a)',
+    );
+    expect(WEBPAGE_INJECTED_CSS).toContain(
+      '.margin-trans-root[data-margin-injected="true"] a[data-margin-has-link-color="true"]',
+    );
+    expect(WEBPAGE_INJECTED_CSS).toContain(
+      '.margin-trans-root[data-margin-injected="true"] a[data-margin-no-underline="true"]:not(:hover)',
+    );
+    expect(WEBPAGE_INJECTED_CSS).toContain(
+      'color-mix(in srgb, var(--margin-effective-color, currentColor) 74%, #8d877a 26%)',
+    );
+    expect(WEBPAGE_INJECTED_CSS).not.toContain('background: #fbfaf6;');
+
+    // Simulate authentic YouTube Dark Mode (`<html dark style="font-size: 10px">`, body with NO color rule)
+    document.documentElement.setAttribute('dark', '');
+    document.documentElement.style.fontSize = '10px';
+
+    const hostStyle = document.createElement('style');
+    hostStyle.textContent = `
+      html[dark] { --yt-spec-text-primary: rgb(241, 241, 241); }
+      html:not([dark]) { --yt-spec-text-primary: rgb(15, 15, 15); }
+      a { color: rgb(62, 166, 255); text-decoration: underline; }
+      .yt-lockup-metadata-view-model__heading-reset {
+        margin: 0;
+        font-size: inherit;
+        font-weight: inherit;
+      }
+      .yt-lockup-metadata-view-model__title {
+        color: var(--yt-spec-text-primary);
+        font-family: Roboto, Arial, sans-serif;
+        font-size: 16px;
+        line-height: 22px;
+        font-weight: 500;
+        text-decoration: none;
+      }
+      #video-title {
+        color: var(--yt-spec-text-primary);
+        font-size: 14px;
+        line-height: 20px;
+        font-weight: 500;
+        text-decoration: none;
+      }
+      h1.watch-h1 {
+        font-size: 10px;
+        font-weight: 400;
+      }
+      yt-formatted-string.ytd-watch-metadata {
+        color: var(--yt-spec-text-primary);
+        font-size: 20px;
+        line-height: 28px;
+        font-weight: 700;
+      }
+      .live-badge {
+        color: rgb(255, 78, 69);
+        font-size: 11px;
+        font-weight: 700;
+      }
+      .x-tweet {
+        color: rgb(231, 233, 234);
+        font-size: 15px;
+      }
+      .r-1cvl2hr {
+        color: rgb(29, 155, 240);
+        text-decoration: none;
+      }
+      .lead-prose {
+        color: rgb(212, 212, 216);
+        font-size: 16px;
+        font-weight: 400;
+      }
+      .lead-prose strong {
+        font-weight: 700;
+        color: rgb(255, 255, 255);
+      }
+    `;
+    document.head.appendChild(hostStyle);
+
+    document.body.innerHTML = `
+      <section id="yt-feed">
+        <h3 id="yt-card-1" class="yt-lockup-metadata-view-model__heading-reset">
+          <a class="yt-lockup-metadata-view-model__title" href="/watch?v=1">
+            <span class="yt-core-attributed-string" role="text">Elden Ring Pro Plays Phantom Blade Zero</span>
+          </a>
+        </h3>
+        <h3 id="yt-polymer-card" class="title-and-badge">
+          <a id="video-title" class="yt-simple-endpoint" href="/watch?v=2">
+            <yt-formatted-string>CYCLING THE WORLD | Award-Winning Adventure Documentary</yt-formatted-string>
+          </a>
+        </h3>
+        <h1 id="yt-watch-h1" class="watch-h1">
+          <yt-formatted-string class="ytd-watch-metadata">PHANTOM BLADE Ø DAY 7 | Hellwalker Difficulty</yt-formatted-string>
+        </h1>
+        <h3 id="yt-live-card" class="yt-lockup-metadata-view-model__heading-reset">
+          <span class="live-badge">LIVE</span>
+          <a class="yt-lockup-metadata-view-model__title" href="/watch?v=3">How This Man Spent 7 Years Digging a 2-Story Home Inside a Mountain</a>
+        </h3>
+        <div id="x-dark-tweet" data-testid="tweetText" class="x-tweet">Huge showcase from <a class="r-1cvl2hr" href="https://x.com/FromSoftware">@FromSoftware</a> tonight!</div>
+        <p id="lead-para" class="lead-prose"><strong>Lead:</strong> Detailed breakdown of the rendering pipeline.</p>
+      </section>
+    `;
+
+    const ytCard1 = document.getElementById('yt-card-1')!;
+    const ytPolymer = document.getElementById('yt-polymer-card')!;
+    const ytWatchH1 = document.getElementById('yt-watch-h1')!;
+    const ytLiveCard = document.getElementById('yt-live-card')!;
+    const xTweet = document.getElementById('x-dark-tweet')!;
+    const leadPara = document.getElementById('lead-para')!;
+
+    const config = createDefaultMarginConfig();
+    config.targetLang = 'zh-CN';
+    config.webpage.displayMode = 'bilingual';
+    config.providers['google-free'].stream = 'on';
+
+    let emitPartial!: () => void;
+    const partialGate = new Promise<void>((r) => {
+      emitPartial = r;
+    });
+    let finishStream!: () => void;
+    const finishGate = new Promise<void>((r) => {
+      finishStream = r;
+    });
+
+    const renderer = new WebpageRenderer({
+      config,
+      getUrl: () => 'https://www.youtube.com/',
+      transport: async (req, callbacks) => {
+        await partialGate;
+        for (const it of req.items) {
+          if (it.text.includes('Elden Ring')) {
+            callbacks.onItemReady?.({
+              id: it.id,
+              trans: '<m0>《艾尔登法环》高手挑战',
+              partial: true,
+            });
+          }
+        }
+        await finishGate;
+        return {
+          ok: true,
+          requestId: req.requestId,
+          providerId: 'google-free',
+          model: 'gtx',
+          items: req.items.map((it) => {
+            if (it.text.includes('Elden Ring')) {
+              return { id: it.id, trans: '<m0><m1>《艾尔登法环》高手挑战《影之刃零》</m1></m0>' };
+            }
+            if (it.text.includes('CYCLING THE WORLD')) {
+              return { id: it.id, trans: '<m0>单车环游世界｜获奖探险纪录片</m0>' };
+            }
+            if (it.text.includes('PHANTOM BLADE')) {
+              return { id: it.id, trans: '《影之刃零》第 7 天｜地狱行者难度实况' };
+            }
+            if (it.text.includes('Digging a 2-Story Home')) {
+              return {
+                id: it.id,
+                trans: '<m0>直播</m0> <m1>这位男子如何花 7 年时间在山体里凿出一栋两层住宅</m1>',
+              };
+            }
+            if (it.text.includes('@FromSoftware')) {
+              return { id: it.id, trans: '今晚来自 <m0>@FromSoftware</m0> 的震撼演示！' };
+            }
+            return { id: it.id, trans: '<m0>导语：</m0>渲染管线的详细解析。' };
+          }),
+          diagnostic: makeMockDiagnostic(),
+        };
+      },
+    });
+
+    const translatePromise = renderer.translateWholePage();
+
+    // Stage 1: Loading shimmer inherits effective #f1f1f1 color & 16px font-size instead of 10px black!
+    await vi.waitFor(() => {
+      const shimmer = ytCard1.querySelector(
+        '.margin-trans-loading[data-margin-loading="1"]',
+      ) as HTMLElement | null;
+      expect(shimmer).not.toBeNull();
+      expect(shimmer!.style.getPropertyValue('--margin-effective-color')).toBe(
+        'rgb(241, 241, 241)',
+      );
+      expect(
+        shimmer!.style.getPropertyValue('--margin-effective-font-size'),
+      ).toBe('16px');
+    });
+
+    // Stage 2: Streaming (`paintPartialSlot`) keeps effective #f1f1f1 color & 16px font-size after cssText reset!
+    emitPartial();
+    await vi.waitFor(() => {
+      const streaming = ytCard1.querySelector(
+        '.margin-trans-root[data-margin-streaming="1"]',
+      ) as HTMLElement | null;
+      expect(streaming).not.toBeNull();
+      expect(
+        streaming!.style.getPropertyValue('--margin-effective-color'),
+      ).toBe('rgb(241, 241, 241)');
+      expect(
+        streaming!.style.getPropertyValue('--margin-effective-font-size'),
+      ).toBe('16px');
+      expect(
+        streaming!.style.getPropertyValue('--margin-effective-line-height'),
+      ).toBe('22px');
+      expect(
+        streaming!.style.getPropertyValue('--margin-effective-font-weight'),
+      ).toBe('500');
+    });
+
+    // Stage 3: Final rich DOM reconstruction across all card & prose types
+    finishStream();
+    await translatePromise;
+
+    const card1Root = ytCard1.querySelector('.margin-trans-root') as HTMLElement;
+    const card1Link = card1Root.querySelector('a') as HTMLAnchorElement;
+    expect(card1Root.style.getPropertyValue('--margin-effective-color')).toBe(
+      'rgb(241, 241, 241)',
+    );
+    expect(
+      card1Root.style.getPropertyValue('--margin-effective-font-size'),
+    ).toBe('16px');
+    expect(card1Link.getAttribute('data-margin-no-underline')).toBe('true');
+    expect(card1Link.getAttribute('data-margin-has-link-color')).toBe('true');
+    expect(card1Link.style.getPropertyValue('--margin-link-color')).toBe(
+      'rgb(241, 241, 241)',
+    );
+
+    // Polymer stripped-ID card keeps #f1f1f1 & no-underline instead of global blue `a` rule
+    const polymerRoot = ytPolymer.querySelector('.margin-trans-root') as HTMLElement;
+    const polymerLink = polymerRoot.querySelector('a') as HTMLAnchorElement;
+    expect(polymerLink.hasAttribute('id')).toBe(false);
+    expect(polymerLink.getAttribute('data-margin-no-underline')).toBe('true');
+    expect(polymerLink.style.getPropertyValue('--margin-link-color')).toBe(
+      'rgb(241, 241, 241)',
+    );
+    expect(
+      polymerRoot.style.getPropertyValue('--margin-effective-font-size'),
+    ).toBe('14px');
+
+    // Watch H1 > yt-formatted-string
+    const watchRoot = ytWatchH1.querySelector('.margin-trans-root') as HTMLElement;
+    expect(watchRoot.style.getPropertyValue('--margin-effective-color')).toBe(
+      'rgb(241, 241, 241)',
+    );
+    expect(
+      watchRoot.style.getPropertyValue('--margin-effective-font-size'),
+    ).toBe('20px');
+    expect(
+      watchRoot.style.getPropertyValue('--margin-effective-font-weight'),
+    ).toBe('700');
+
+    // Sibling LIVE badge + title
+    const liveRoot = ytLiveCard.querySelector('.margin-trans-root') as HTMLElement;
+    expect(liveRoot.style.getPropertyValue('--margin-effective-color')).toBe(
+      'rgb(241, 241, 241)',
+    );
+    expect(
+      liveRoot.style.getPropertyValue('--margin-effective-font-size'),
+    ).toBe('16px');
+
+    // X dark tweet with blue @FromSoftware mention + <p><strong>Lead:</strong> body</p>
+    const xRoot = xTweet.querySelector('.margin-trans-root') as HTMLElement;
+    const xMention = xRoot.querySelector('a') as HTMLAnchorElement;
+    expect(xRoot.style.getPropertyValue('--margin-effective-color')).toBe(
+      'rgb(231, 233, 234)',
+    );
+    expect(xMention.style.getPropertyValue('--margin-link-color')).toBe(
+      'rgb(29, 155, 240)',
+    );
+    expect(xMention.getAttribute('data-margin-no-underline')).toBe('true');
+
+    const leadRoot = leadPara.querySelector('.margin-trans-root') as HTMLElement;
+    expect(leadRoot.style.getPropertyValue('--margin-effective-color')).toBe(
+      'rgb(212, 212, 216)',
+    );
+    expect(
+      leadRoot.style.getPropertyValue('--margin-effective-font-weight'),
+    ).toBe('');
+
+    // Switch to `target-only` mode -> still resolves & preserves effective style inside `.margin-orig-source`!
+    const targetOnlyCfg = structuredClone(config);
+    targetOnlyCfg.webpage.displayMode = 'target-only';
+    renderer.updateConfig(targetOnlyCfg);
+    expect(card1Root.getAttribute('data-margin-layout')).toBe('replace');
+    expect(card1Root.style.getPropertyValue('--margin-effective-color')).toBe(
+      'rgb(241, 241, 241)',
+    );
+
+    // Live Dark -> Light -> Dark toggle on `html[dark]` updates both effective host color and cloned links!
+    document.documentElement.removeAttribute('dark');
+    await vi.waitFor(() => {
+      expect(card1Root.style.getPropertyValue('--margin-effective-color')).toBe(
+        'rgb(15, 15, 15)',
+      );
+      expect(card1Link.style.getPropertyValue('--margin-link-color')).toBe(
+        'rgb(15, 15, 15)',
+      );
+      expect(polymerLink.style.getPropertyValue('--margin-link-color')).toBe(
+        'rgb(15, 15, 15)',
+      );
+      expect(watchRoot.style.getPropertyValue('--margin-effective-color')).toBe(
+        'rgb(15, 15, 15)',
+      );
+    });
+
+    document.documentElement.setAttribute('dark', '');
+    await vi.waitFor(() => {
+      expect(card1Root.style.getPropertyValue('--margin-effective-color')).toBe(
+        'rgb(241, 241, 241)',
+      );
+      expect(card1Link.style.getPropertyValue('--margin-link-color')).toBe(
+        'rgb(241, 241, 241)',
+      );
+      expect(polymerLink.style.getPropertyValue('--margin-link-color')).toBe(
+        'rgb(241, 241, 241)',
+      );
+    });
+
+    // Clean stop() / restorePage() removes all injected nodes and disconnects themeObserver
+    renderer.stop();
+    expect(document.body.querySelectorAll('[data-margin-injected]').length).toBe(0);
+    expect(document.body.querySelectorAll('[data-margin-orig-wrap]').length).toBe(0);
+
+    renderer.destroy();
   });
 });

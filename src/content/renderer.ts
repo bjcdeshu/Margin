@@ -34,11 +34,29 @@ import {
   inferDomainStyleGuide,
 } from './dom-walker';
 import {
+  applyEffectiveHostTextStyle,
+  resolveEffectiveHostTextStyle,
+} from './effective-text-style';
+import {
   reconstructRichDom,
+  refreshClonedLinksAppearance,
   stripResidualMarkers,
   tokenizeParagraph,
   type TokenizedParagraph,
 } from './rich-text';
+
+export * from './effective-text-style';
+
+const THEME_OBSERVER_ATTRIBUTES: string[] = [
+  'class',
+  'style',
+  'dark',
+  'theme',
+  'data-theme',
+  'data-color-mode',
+  'data-bs-theme',
+  'color-scheme',
+];
 
 export const DEFAULT_LRU_CAPACITY = 2000;
 export const VIEWPORT_ROOT_MARGIN = '300px 0px 2200px 0px';
@@ -63,14 +81,14 @@ export const WEBPAGE_INJECTED_CSS = /* css */ `
 
 .margin-trans-root[data-margin-injected="true"],
 .margin-trans-block[data-margin-injected="true"] {
-  font-size: inherit;
-  font-weight: inherit;
+  font-size: var(--margin-effective-font-size, inherit);
+  font-weight: var(--margin-effective-font-weight, inherit);
   font-style: inherit;
   font-stretch: inherit;
   font-variant: inherit;
-  line-height: inherit;
-  letter-spacing: inherit;
-  color: inherit;
+  line-height: var(--margin-effective-line-height, inherit);
+  letter-spacing: var(--margin-effective-letter-spacing, inherit);
+  color: var(--margin-effective-color, inherit);
   word-break: break-word;
 }
 
@@ -106,15 +124,23 @@ export const WEBPAGE_INJECTED_CSS = /* css */ `
   white-space: pre-line;
 }
 
-.margin-trans-root[data-margin-injected="true"] a {
-  color: inherit;
+:where(.margin-trans-root[data-margin-injected="true"]) :where(a) {
+  color: var(--margin-link-color, var(--margin-effective-color, inherit));
   text-decoration: underline;
-  text-decoration-color: rgba(140, 90, 33, 0.48);
+  text-decoration-color: color-mix(in srgb, currentColor 45%, transparent);
   text-underline-offset: 2px;
 }
 
-.margin-trans-root[data-margin-injected="true"] a:hover {
+:where(.margin-trans-root[data-margin-injected="true"]) :where(a):hover {
   text-decoration-color: currentColor;
+}
+
+.margin-trans-root[data-margin-injected="true"] a[data-margin-has-link-color="true"] {
+  color: var(--margin-link-color);
+}
+
+.margin-trans-root[data-margin-injected="true"] a[data-margin-no-underline="true"]:not(:hover) {
+  text-decoration: none;
 }
 
 /* Quiet proportional warm-paper breathing shimmer bar */
@@ -202,7 +228,7 @@ html[data-margin-mask-revealed="true"] .margin-trans-root[data-margin-theme="mas
 /* Theme: weakening */
 .margin-trans-root[data-margin-theme="weakening"] {
   opacity: 0.76;
-  color: color-mix(in srgb, currentColor 74%, #8d877a 26%);
+  color: color-mix(in srgb, var(--margin-effective-color, currentColor) 74%, #8d877a 26%);
   transition:
     opacity 160ms cubic-bezier(0.2, 0.72, 0.2, 1),
     color 160ms cubic-bezier(0.2, 0.72, 0.2, 1);
@@ -211,7 +237,7 @@ html[data-margin-mask-revealed="true"] .margin-trans-root[data-margin-theme="mas
 .margin-trans-root[data-margin-theme="weakening"]:hover,
 .margin-trans-root[data-margin-theme="weakening"]:focus-within {
   opacity: 1;
-  color: inherit;
+  color: var(--margin-effective-color, inherit);
 }
 
 /* Quiet inline retry button on failed batch items */
@@ -226,23 +252,26 @@ html[data-margin-mask-revealed="true"] .margin-trans-root[data-margin-theme="mas
   font-family: ui-sans-serif, system-ui, -apple-system, sans-serif;
   font-size: 12px;
   line-height: 1.35;
-  color: #8c5a21;
-  background: #fbfaf6;
-  border: 1px solid rgba(140, 90, 33, 0.36);
+  color: color-mix(in srgb, #c99455 64%, var(--margin-effective-color, currentColor) 36%);
+  background: color-mix(in srgb, #c99455 12%, transparent);
+  border: 1px solid color-mix(in srgb, #c99455 40%, transparent);
   border-radius: 4px;
   cursor: pointer;
   vertical-align: baseline;
   user-select: none;
-  transition: background-color 160ms cubic-bezier(0.2, 0.72, 0.2, 1);
+  transition:
+    background-color 160ms cubic-bezier(0.2, 0.72, 0.2, 1),
+    border-color 160ms cubic-bezier(0.2, 0.72, 0.2, 1);
 }
 
 .margin-inline-retry[data-margin-injected="true"]:hover {
-  background: rgba(140, 90, 33, 0.09);
-  color: #6f4417;
+  background: color-mix(in srgb, #c99455 22%, transparent);
+  border-color: color-mix(in srgb, #c99455 58%, transparent);
+  color: color-mix(in srgb, #c99455 78%, var(--margin-effective-color, currentColor) 22%);
 }
 
 .margin-inline-retry[data-margin-injected="true"]:focus-visible {
-  outline: 2px solid #8c5a21;
+  outline: 2px solid #c99455;
   outline-offset: 1px;
 }
 
@@ -874,6 +903,10 @@ export class WebpageRenderer {
 
   private intersectionObserver: IntersectionObserver | null = null;
   private mutationObserver: MutationObserver | null = null;
+  private themeObserver: MutationObserver | null = null;
+  private themeObservedBody: Element | null = null;
+  private themeMediaCleanup: (() => void) | null = null;
+  private cancelScheduledThemeSync: (() => void) | null = null;
   private fullscreenCleanup: (() => void) | null = null;
   private scrollCleanup: (() => void) | null = null;
   private scrollThrottleTimer: ReturnType<typeof setTimeout> | null = null;
@@ -1542,8 +1575,10 @@ export class WebpageRenderer {
       approxPlainLen ??
       (blockEl.textContent ?? '').replace(/\s+/g, ' ').trim().length;
     const layout = this.computeLayoutMode(blockEl, sourceLen);
+    const effectiveStyle = resolveEffectiveHostTextStyle(blockEl);
 
     this.ensureStylesInjected();
+    this.ensureThemeObserver();
     this.runInternalDomMutation(() => {
       const loading = this.doc.createElement('span');
       loading.className = 'margin-trans-block margin-trans-loading';
@@ -1559,6 +1594,7 @@ export class WebpageRenderer {
         'aria-label',
         this.config.interfaceLang === 'en' ? 'Translating' : '正在翻译',
       );
+      applyEffectiveHostTextStyle(loading, effectiveStyle);
 
       const line1 = this.doc.createElement('span');
       line1.className = 'margin-shimmer-line';
@@ -1902,11 +1938,12 @@ export class WebpageRenderer {
       return { fallbackPlain: false };
     }
 
+    const effectiveStyle = resolveEffectiveHostTextStyle(blockEl);
     const reconstructed = reconstructRichDom(
       translatedText,
       tokenized,
       this.doc,
-      { stripSourceLocaleAttrs: true },
+      { stripSourceLocaleAttrs: true, preserveLinkAppearance: true },
     );
     const theme = this.resolveEffectiveTheme();
     const layout = this.computeLayoutMode(
@@ -1915,6 +1952,7 @@ export class WebpageRenderer {
       displayMode,
     );
 
+    this.ensureThemeObserver();
     this.runInternalDomMutation(() => {
       this.clearBlockInjectedElements(blockEl);
 
@@ -1930,6 +1968,7 @@ export class WebpageRenderer {
       span.setAttribute('data-margin-theme', theme);
       span.setAttribute('data-margin-layout', layout);
       this.applyTargetLocaleTypography(span, blockEl);
+      applyEffectiveHostTextStyle(span, effectiveStyle);
       if (reconstructed.fallbackPlain) {
         span.setAttribute('data-margin-fallback-plain', 'true');
       }
@@ -1971,6 +2010,7 @@ export class WebpageRenderer {
     options: { forceBilingual?: boolean; priority?: RequestPriority } = {},
   ): void {
     this.ensureStylesInjected();
+    this.ensureThemeObserver();
     if (errorMessage) {
       this.lastError = errorMessage;
     }
@@ -1997,6 +2037,7 @@ export class WebpageRenderer {
         if (!task.block.isConnected || this.hasMountedTranslation(task.block)) {
           continue;
         }
+        const effectiveStyle = resolveEffectiveHostTextStyle(task.block);
         this.clearBlockInjectedElements(task.block);
         this.failedBlockTasks.set(task.block, task);
 
@@ -2009,6 +2050,7 @@ export class WebpageRenderer {
           ? `Translation failed (${errorMessage}) — click to retry batch`
           : 'Retry failed translation batch';
         btn.textContent = '↻';
+        applyEffectiveHostTextStyle(btn, effectiveStyle);
         btn.addEventListener('click', (ev) => {
           ev.preventDefault();
           ev.stopPropagation();
@@ -2201,6 +2243,8 @@ export class WebpageRenderer {
       }
 
       this.ensureStylesInjected();
+      this.ensureThemeObserver();
+      const effectiveStyle = resolveEffectiveHostTextStyle(task.block);
       const displayMode: DisplayMode = options.forceBilingual
         ? 'bilingual'
         : this.config.webpage.displayMode;
@@ -2247,6 +2291,7 @@ export class WebpageRenderer {
         container.setAttribute('data-margin-theme', theme);
         container.setAttribute('data-margin-layout', layout);
         this.applyTargetLocaleTypography(container, task.block);
+        applyEffectiveHostTextStyle(container, effectiveStyle);
 
         const textNode = this.doc.createTextNode(previewText);
         container.replaceChildren(textNode);
@@ -3366,6 +3411,173 @@ export class WebpageRenderer {
     }
   }
 
+  private syncHostThemeStyles(): void {
+    const blocksToSync = new Set<HTMLElement>();
+    for (const blk of Array.from(this.translatedBlockSet)) {
+      if (blk.isConnected) {
+        blocksToSync.add(blk);
+      } else {
+        this.translatedBlockSet.delete(blk);
+      }
+    }
+    for (const blk of this.inFlightBlockSet) {
+      if (blk.isConnected) {
+        blocksToSync.add(blk);
+      }
+    }
+    for (const blk of this.failedBlockTasks.keys()) {
+      if (blk.isConnected) {
+        blocksToSync.add(blk);
+      }
+    }
+    if (blocksToSync.size === 0) return;
+
+    this.runInternalDomMutation(() => {
+      for (const blockEl of blocksToSync) {
+        const effectiveStyle = resolveEffectiveHostTextStyle(blockEl);
+        for (let i = 0; i < blockEl.children.length; i++) {
+          const child = blockEl.children[i];
+          if (
+            child instanceof HTMLElement &&
+            child.getAttribute('data-margin-injected') === 'true'
+          ) {
+            applyEffectiveHostTextStyle(child, effectiveStyle);
+            if (child.classList.contains('margin-trans-root')) {
+              refreshClonedLinksAppearance(child);
+            }
+          }
+        }
+      }
+    });
+  }
+
+  private scheduleHostThemeSync(): void {
+    if (this.cancelScheduledThemeSync !== null) return;
+    const win = this.doc.defaultView;
+    const raf =
+      win?.requestAnimationFrame?.bind(win) ??
+      (typeof requestAnimationFrame === 'function'
+        ? requestAnimationFrame
+        : null);
+    const caf =
+      win?.cancelAnimationFrame?.bind(win) ??
+      (typeof cancelAnimationFrame === 'function'
+        ? cancelAnimationFrame
+        : null);
+
+    let settled = false;
+    let rafHandle: number | null = null;
+    let timerHandle: ReturnType<typeof setTimeout> | null = null;
+
+    const flush = () => {
+      if (settled) return;
+      settled = true;
+      if (rafHandle !== null) {
+        caf?.(rafHandle);
+        rafHandle = null;
+      }
+      if (timerHandle !== null) {
+        clearTimeout(timerHandle);
+        timerHandle = null;
+      }
+      this.cancelScheduledThemeSync = null;
+      this.syncHostThemeStyles();
+    };
+
+    if (raf) {
+      rafHandle = raf(flush);
+    }
+    timerHandle = setTimeout(flush, 16);
+
+    this.cancelScheduledThemeSync = () => {
+      settled = true;
+      if (rafHandle !== null) {
+        caf?.(rafHandle);
+        rafHandle = null;
+      }
+      if (timerHandle !== null) {
+        clearTimeout(timerHandle);
+        timerHandle = null;
+      }
+    };
+  }
+
+  private ensureThemeObserver(): void {
+    if (
+      typeof MutationObserver !== 'undefined' &&
+      !this.themeObserver
+    ) {
+      this.themeObserver = new MutationObserver((mutations) => {
+        if (this.internalDomDepth > 0) return;
+        for (const m of mutations) {
+          if (m.type === 'attributes') {
+            this.scheduleHostThemeSync();
+            break;
+          }
+        }
+      });
+
+      const docEl = this.doc.documentElement;
+      if (docEl) {
+        this.themeObserver.observe(docEl, {
+          attributes: true,
+          attributeFilter: THEME_OBSERVER_ATTRIBUTES,
+        });
+      }
+      this.themeObservedBody = null;
+    }
+
+    if (
+      this.themeObserver &&
+      this.doc.body &&
+      this.doc.body !== this.doc.documentElement &&
+      this.themeObservedBody !== this.doc.body
+    ) {
+      this.themeObserver.observe(this.doc.body, {
+        attributes: true,
+        attributeFilter: THEME_OBSERVER_ATTRIBUTES,
+      });
+      this.themeObservedBody = this.doc.body;
+    }
+
+    if (!this.themeMediaCleanup) {
+      const win =
+        this.doc.defaultView ??
+        (typeof window !== 'undefined' ? window : null);
+      if (win && typeof win.matchMedia === 'function') {
+        try {
+          const mql = win.matchMedia('(prefers-color-scheme: dark)');
+          const onMediaChange = () => {
+            this.scheduleHostThemeSync();
+          };
+          if (typeof mql.addEventListener === 'function') {
+            mql.addEventListener('change', onMediaChange);
+            this.themeMediaCleanup = () => {
+              mql.removeEventListener('change', onMediaChange);
+            };
+          } else if (typeof mql.addListener === 'function') {
+            mql.addListener(onMediaChange);
+            this.themeMediaCleanup = () => {
+              mql.removeListener(onMediaChange);
+            };
+          }
+        } catch {
+          // Ignore matchMedia errors in restricted environments
+        }
+      }
+    }
+  }
+
+  private cleanupThemeObserver(): void {
+    this.cancelScheduledThemeSync?.();
+    this.cancelScheduledThemeSync = null;
+    this.themeObserver?.disconnect();
+    this.themeObserver = null;
+    this.themeObservedBody = null;
+    this.themeMediaCleanup?.();
+    this.themeMediaCleanup = null;
+  }
+
   private ensureSpaMutationObserver(): void {
     if (this.mutationObserver || typeof MutationObserver === 'undefined') return;
     const root = this.doc.body;
@@ -3393,6 +3605,7 @@ export class WebpageRenderer {
     this.sessionTotalBlocks = 0;
     this.sessionDoneBlocks = 0;
     this.ensureStylesInjected();
+    this.ensureThemeObserver();
     this.ensureScrollEvictionListener();
     const blocks = extractParagraphBlocks(this.doc.body, {
       targetLang: this.config.targetLang,
@@ -3411,6 +3624,7 @@ export class WebpageRenderer {
     this.sessionTotalBlocks = 0;
     this.sessionDoneBlocks = 0;
     this.ensureStylesInjected();
+    this.ensureThemeObserver();
     this.ensureScrollEvictionListener();
     this.ensureSpaMutationObserver();
     const blocks = extractParagraphBlocks(this.doc.body, {
@@ -3423,6 +3637,11 @@ export class WebpageRenderer {
     return this.translateWholePage();
   }
 
+  stop(): void {
+    this.cleanupThemeObserver();
+    this.restorePage();
+  }
+
   disable(): void {
     this.restorePage();
   }
@@ -3433,6 +3652,7 @@ export class WebpageRenderer {
    */
   restorePage(options: { onlyOwnedNodes?: boolean } = {}): void {
     const onlyOwned = Boolean(options.onlyOwnedNodes);
+    this.cleanupThemeObserver();
     const ownedBlocksSnapshot = new Set<HTMLElement>(this.translatedBlockSet);
     for (const blk of this.failedBlockTasks.keys()) {
       ownedBlocksSnapshot.add(blk);
@@ -3644,10 +3864,17 @@ export class WebpageRenderer {
 
         if (prevDisplayMode !== newDisplayMode) {
           if (newDisplayMode === 'target-only') {
+            const effectiveStyle = resolveEffectiveHostTextStyle(parentBlock);
             this.wrapOriginalContentForTargetOnly(parentBlock);
+            applyEffectiveHostTextStyle(span, effectiveStyle);
           } else {
             this.unwrapOriginalContent(parentBlock);
+            applyEffectiveHostTextStyle(
+              span,
+              resolveEffectiveHostTextStyle(parentBlock),
+            );
           }
+          refreshClonedLinksAppearance(span);
         }
 
         const meta = this.mountedMeta.get(parentBlock);
@@ -3678,6 +3905,7 @@ export class WebpageRenderer {
 
   destroy(options: { contextInvalidated?: boolean } = {}): void {
     const contextInvalidated = Boolean(options.contextInvalidated);
+    this.cleanupThemeObserver();
     this.restorePage({ onlyOwnedNodes: contextInvalidated });
     this.clearStatusHideTimer();
     this.statusHost?.remove();

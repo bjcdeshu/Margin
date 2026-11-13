@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it } from 'vitest';
 import {
   cloneFormattingElementSafely,
   reconstructRichDom,
+  refreshClonedLinksAppearance,
   stripResidualMarkers,
   tokenizeParagraph,
 } from '../../src/content/rich-text';
@@ -288,5 +289,92 @@ describe('rich-text: <mN> tokenizer, zero-innerHTML reconstructor & per-item fal
     expect(emojiImg?.getAttribute('src')).toBe(
       'https://abs-0.twimg.com/emoji/v2/svg/1f62d.svg',
     );
+  });
+
+  it('preserves host link color & no-underline on stripped-ID YouTube titles and X mentions when preserveLinkAppearance is enabled and refreshes on live theme switches', () => {
+    document.documentElement.setAttribute('dark', '');
+    const style = document.createElement('style');
+    style.textContent = `
+      html[dark] { --yt-spec-text-primary: rgb(241, 241, 241); }
+      html:not([dark]) { --yt-spec-text-primary: rgb(15, 15, 15); }
+      a { color: rgb(62, 166, 255); text-decoration: underline; }
+      #video-title { color: var(--yt-spec-text-primary); text-decoration: none; }
+      .x-mention { color: rgb(29, 155, 240); text-decoration: none; }
+      .prose-link { color: rgb(96, 165, 250); text-decoration: underline; }
+    `;
+    document.head.appendChild(style);
+
+    const polymerH3 = document.createElement('h3');
+    polymerH3.innerHTML = `<a id="video-title" class="yt-simple-endpoint" href="/watch?v=2"><yt-formatted-string>CYCLING THE WORLD</yt-formatted-string></a>`;
+    const tweet = document.createElement('div');
+    tweet.innerHTML = `Follow <a class="x-mention" href="https://x.com/FromSoftware">@FromSoftware</a> and <a class="prose-link" href="/guide">the guide</a>.`;
+    document.body.append(polymerH3, tweet);
+
+    // 1. Default (preserveLinkAppearance: false/omitted) adds zero link-appearance attributes
+    const polymerTokenized = tokenizeParagraph(polymerH3);
+    const defaultResult = reconstructRichDom(
+      '<m0>单车环游世界</m0>',
+      polymerTokenized,
+      document,
+    );
+    const defaultHost = document.createElement('div');
+    defaultHost.appendChild(defaultResult.fragment);
+    const defaultLink = defaultHost.querySelector('a')!;
+    expect(defaultLink.hasAttribute('id')).toBe(false);
+    expect(defaultLink.hasAttribute('data-margin-has-link-color')).toBe(false);
+    expect(defaultLink.hasAttribute('data-margin-no-underline')).toBe(false);
+
+    // 2. preserveLinkAppearance: true captures #video-title white + no-underline even though `id` is stripped!
+    const preservedPolymer = reconstructRichDom(
+      '<m0>单车环游世界</m0>',
+      polymerTokenized,
+      document,
+      { stripSourceLocaleAttrs: true, preserveLinkAppearance: true },
+    );
+    const polymerOut = document.createElement('span');
+    polymerOut.appendChild(preservedPolymer.fragment);
+    document.body.appendChild(polymerOut);
+
+    const clonedPolymerLink = polymerOut.querySelector('a') as HTMLAnchorElement;
+    expect(clonedPolymerLink.hasAttribute('id')).toBe(false);
+    expect(clonedPolymerLink.getAttribute('data-margin-no-underline')).toBe('true');
+    expect(clonedPolymerLink.getAttribute('data-margin-has-link-color')).toBe('true');
+    expect(
+      clonedPolymerLink.style.getPropertyValue('--margin-link-color'),
+    ).toBe('rgb(241, 241, 241)');
+
+    // 3. Mixed mention (no-underline blue) + prose link (underlined blue)
+    const tweetTokenized = tokenizeParagraph(tweet);
+    const preservedTweet = reconstructRichDom(
+      '关注 <m0>@FromSoftware</m0> 并阅读<m1>技术指南</m1>。',
+      tweetTokenized,
+      document,
+      { stripSourceLocaleAttrs: true, preserveLinkAppearance: true },
+    );
+    const tweetOut = document.createElement('span');
+    tweetOut.appendChild(preservedTweet.fragment);
+    document.body.appendChild(tweetOut);
+
+    const [clonedMention, clonedProse] = Array.from(
+      tweetOut.querySelectorAll('a'),
+    ) as HTMLAnchorElement[];
+    expect(clonedMention.getAttribute('data-margin-no-underline')).toBe('true');
+    expect(clonedMention.style.getPropertyValue('--margin-link-color')).toBe(
+      'rgb(29, 155, 240)',
+    );
+    expect(clonedProse.hasAttribute('data-margin-no-underline')).toBe(false);
+    expect(clonedProse.style.getPropertyValue('--margin-link-color')).toBe(
+      'rgb(96, 165, 250)',
+    );
+
+    // 4. Live Dark -> Light toggle refreshes `--margin-link-color` from WeakMap origin
+    document.documentElement.removeAttribute('dark');
+    refreshClonedLinksAppearance(polymerOut);
+    expect(
+      clonedPolymerLink.style.getPropertyValue('--margin-link-color'),
+    ).toBe('rgb(15, 15, 15)');
+
+    document.head.innerHTML = '';
+    document.documentElement.removeAttribute('dark');
   });
 });
