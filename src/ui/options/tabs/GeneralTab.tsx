@@ -11,8 +11,12 @@ import type {
   UiColorMode,
 } from '@shared/types';
 import {
+  CollapsibleSection,
+  EmptyState,
   FieldRow,
+  Icon,
   SegmentedControl,
+  SettingGroup,
   StatusPill,
   ToggleSwitch,
   describeAutoTranslateMode,
@@ -112,6 +116,7 @@ export function GeneralTab({ draft, onMutate }: GeneralTabProps) {
           </div>
         </div>
 
+        <SettingGroup label={lang === 'en' ? 'Languages' : '语言'}>
         <FieldRow
           label={lang === 'en' ? 'Target Language' : '默认目标语言'}
           hint={lang === 'en' ? 'Primary language for webpage, PDF, subtitles & images' : '网页、PDF、视频字幕与图片翻译的目标语言'}
@@ -176,7 +181,9 @@ export function GeneralTab({ draft, onMutate }: GeneralTabProps) {
             }
           />
         </FieldRow>
+        </SettingGroup>
 
+        <SettingGroup label={lang === 'en' ? 'Typography & Style' : '排版与译文样式'}>
         <FieldRow label={lang === 'en' ? 'Display Mode' : '默认显示模式'}>
           <SegmentedControl
             ariaLabel={lang === 'en' ? 'Webpage Display Mode' : '默认显示模式'}
@@ -228,26 +235,34 @@ export function GeneralTab({ draft, onMutate }: GeneralTabProps) {
             }
           />
         </FieldRow>
+        </SettingGroup>
 
         {/* Per-domain theme overrides (compact disclosure) */}
-        <details
-          class="mp-advanced-details"
-          open={draft.webpage.themePatterns.length > 0}
+        <CollapsibleSection
+          quiet
+          icon="globe"
+          defaultOpen={draft.webpage.themePatterns.length > 0}
+          title={
+            lang === 'en'
+              ? 'Per-Site Translation Style Overrides'
+              : '按站点定制译文样式 (themePatterns)'
+          }
+          meta={
+            <StatusPill tone="mono">
+              {draft.webpage.themePatterns.length}
+            </StatusPill>
+          }
+          bodyClass="mp-stack mp-theme-rules-body"
         >
-          <summary class="mp-advanced-summary">
-            <span>
-              {lang === 'en'
-                ? 'Per-Site Translation Style Overrides'
-                : '按站点定制译文样式 (themePatterns)'}
-            </span>
-            <span style={{ display: 'inline-flex', alignItems: 'center', gap: '8px' }}>
-              <StatusPill tone="mono">
-                {draft.webpage.themePatterns.length}
-              </StatusPill>
-              <span class="mp-advanced-chevron">▸</span>
-            </span>
-          </summary>
-          <div class="mp-advanced-body" style={{ paddingTop: '8px' }}>
+            {draft.webpage.themePatterns.length === 0 ? (
+              <EmptyState
+                title={lang === 'en' ? 'No per-site overrides' : '暂无站点样式规则'}
+              >
+                {lang === 'en'
+                  ? 'e.g. use Fade on https://arxiv.org/* while keeping the global style elsewhere.'
+                  : '例如：在 https://arxiv.org/* 使用「淡化」，其余站点沿用全局样式。'}
+              </EmptyState>
+            ) : null}
             <div class="mp-flat-list">
               {draft.webpage.themePatterns.map((rule, idx) => (
                 <div key={idx} class="mp-flat-item">
@@ -286,7 +301,7 @@ export function GeneralTab({ draft, onMutate }: GeneralTabProps) {
                   </select>
                   <button
                     type="button"
-                    class="mp-btn mp-btn--ghost mp-btn--sm"
+                    class="mp-icon-btn"
                     aria-label={`Remove theme rule ${idx}`}
                     onClick={() =>
                       onMutate((d) => {
@@ -296,12 +311,12 @@ export function GeneralTab({ draft, onMutate }: GeneralTabProps) {
                       })
                     }
                   >
-                    ×
+                    <Icon name="x" size={13} />
                   </button>
                 </div>
               ))}
             </div>
-            <div style={{ paddingTop: '8px' }}>
+            <div>
               <button
                 type="button"
                 class="mp-btn mp-btn--sm"
@@ -314,11 +329,11 @@ export function GeneralTab({ draft, onMutate }: GeneralTabProps) {
                   })
                 }
               >
-                + {lang === 'en' ? 'Add Site Style Rule' : '添加站点样式规则'}
+                <Icon name="plus" size={12} />
+                {lang === 'en' ? 'Add Site Style Rule' : '添加站点样式规则'}
               </button>
             </div>
-          </div>
-        </details>
+        </CollapsibleSection>
       </section>
 
       {/* Section 2: Scene Routing Matrix (Primary prominent, inherited sub-scenes calm) */}
@@ -336,6 +351,7 @@ export function GeneralTab({ draft, onMutate }: GeneralTabProps) {
           </div>
         </div>
 
+        <SettingGroup>
         {SCENES_ORDER.map((scene) => {
           const isPrimary = scene === 'webpage';
           const rawValue = draft.routing[scene];
@@ -427,6 +443,7 @@ export function GeneralTab({ draft, onMutate }: GeneralTabProps) {
             </FieldRow>
           );
         })}
+        </SettingGroup>
       </section>
 
       {/* Section 3: Compact Studio Appearance */}
@@ -444,6 +461,7 @@ export function GeneralTab({ draft, onMutate }: GeneralTabProps) {
           </div>
         </div>
 
+        <SettingGroup>
         <FieldRow
           label={lang === 'en' ? 'Color Theme' : '工作台色彩主题'}
           hint={
@@ -482,6 +500,7 @@ export function GeneralTab({ draft, onMutate }: GeneralTabProps) {
             }
           />
         </FieldRow>
+        </SettingGroup>
       </section>
     </div>
   );

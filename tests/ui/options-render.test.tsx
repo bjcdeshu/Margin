@@ -878,4 +878,63 @@ describe('Quiet Paper 6-Tab Settings Studio (OptionsApp)', () => {
     });
     expect(container.querySelector('[data-testid="import-audit-summary"]')).not.toBeNull();
   });
+
+  it('renders v2.3.0 studio badge, triggers save on Ctrl+S, and keeps env macro disclosure collapsed by default in PromptsGlossaryTab', async () => {
+    await saveMarginConfig(createDefaultMarginConfig());
+
+    await act(async () => {
+      render(<OptionsApp initialTab="prompts" />, container);
+    });
+    await flushMicrotasks();
+
+    // 1. Studio footer displays v2.3.0 badge & keyboard shortcut hint
+    const footerVersion = container.querySelector('.mp-nav-footer .mp-pill--mono');
+    expect(footerVersion?.textContent).toBe('v2.3.0');
+    const saveBtn = container.querySelector(
+      '[data-testid="options-save-btn"]',
+    ) as HTMLButtonElement;
+    expect(saveBtn.textContent).toMatch(/Ctrl\+S|⌘S/);
+
+    // 2. Advanced Macro Snippets (env) <details> disclosure is collapsed by default
+    const detailsEls = Array.from(container.querySelectorAll('details'));
+    const envDetails = detailsEls.find((d) =>
+      d.querySelector('summary')?.textContent?.includes('高级宏变量片段 (env)'),
+    ) as HTMLDetailsElement | undefined;
+    expect(envDetails).toBeDefined();
+    expect(envDetails!.open).toBe(false);
+    expect(envDetails!.hasAttribute('open')).toBe(false);
+    expect(envDetails!.textContent).toContain('thread_prompt');
+    expect(envDetails!.textContent).toContain('context_window_prompt');
+
+    // 3. Make a draft edit and trigger save via Ctrl+S keyboard shortcut
+    const promptTa = container.querySelector(
+      '[data-testid="assistant-prompt-textarea"]',
+    ) as HTMLTextAreaElement;
+    await act(async () => {
+      promptTa.value = `${promptTa.value}\n# v2.3.0 shortcut edit`;
+      promptTa.dispatchEvent(new Event('input', { bubbles: true }));
+    });
+    expect(
+      container.querySelector('[data-testid="options-unsaved-pill"]')?.textContent,
+    ).toBe('有未保存更改');
+
+    await act(async () => {
+      const evt = new KeyboardEvent('keydown', {
+        key: 's',
+        ctrlKey: true,
+        bubbles: true,
+        cancelable: true,
+      });
+      window.dispatchEvent(evt);
+    });
+    await flushMicrotasks();
+
+    expect(
+      container.querySelector('[data-testid="options-save-status"]')?.textContent,
+    ).toBe('已保存');
+    const persisted = await getMarginConfig();
+    expect(persisted.assistants['builtin-yaml'].prompt).toContain(
+      '# v2.3.0 shortcut edit',
+    );
+  });
 });

@@ -14,6 +14,7 @@ import { getCapabilityCache, recordModelCapability } from '@shared/storage';
 import {
   makeCapabilityKey,
   resolveEffectiveTemperature,
+  shouldStripReasoningEffortAndRetry,
   shouldStripTemperatureAndRetry,
 } from '@shared/temperature';
 import type {
@@ -31,8 +32,15 @@ import {
   resolveEndpointForProvider,
 } from './endpoint';
 import { executeGoogleWebCall } from './google-web';
-import { executeOpenAiChatCall } from './openai-chat';
-import { abortableSleep, defaultProviderPool } from './pool';
+import {
+  buildOpenAiChatRequestBody,
+  executeOpenAiChatCall,
+} from './openai-chat';
+import {
+  abortableSleep,
+  defaultProviderPool,
+  resolveRequestPriority,
+} from './pool';
 import { ProviderTimeoutError } from './timeout';
 import {
   type ExecuteBatchOptions,
@@ -112,6 +120,7 @@ async function runSelfHealingAiCompletion(
   input: SelfHealingAiExecutionInput,
 ): Promise<SelfHealingAiExecutionOutput> {
   const {
+    scene,
     provider,
     assistant,
     systemPrompt,
@@ -125,8 +134,10 @@ async function runSelfHealingAiCompletion(
     requestTimeoutMs,
     streamIdleTimeoutMs,
     signal,
+    priority,
   } = input;
 
+  const effectivePriority = resolveRequestPriority(scene, priority);
   const t0 = Date.now();
   const resolvedEndpoint = resolveEndpointForProvider(provider);
   const capabilityKey = makeCapabilityKey(resolvedEndpoint, provider.model);
@@ -142,6 +153,7 @@ async function runSelfHealingAiCompletion(
 
   let currentTemperature: number | undefined = resolvedTemp.value;
   let currentTrace: TemperatureTrace = resolvedTemp.trace;
+  let omitReasoningEffort = cachedCapability?.supportsReasoningEffort === false;
 
   // Anthropic extended thinking forbids custom temperature
   if (
@@ -155,6 +167,8 @@ async function runSelfHealingAiCompletion(
 
   let attempts = 0;
   let transientRetriesUsed = 0;
+  let strippedTemperature = false;
+  let strippedReasoningEffort = false;
   let recoveredFromUnsupportedParam = false;
 
   while (true) {
@@ -171,19 +185,54 @@ async function runSelfHealingAiCompletion(
         }
       : undefined;
 
+    const sentReasoningEffort =
+      provider.protocol === 'openai-chat' &&
+      !omitReasoningEffort &&
+      buildOpenAiChatRequestBody({
+        provider,
+        scene,
+        systemPrompt: '',
+        userPrompt: '',
+        effectiveTemperature: currentTemperature,
+        omitReasoningEffort,
+        stream,
+      }).reasoning_effort !== undefined;
+
     const apiKey = pool.acquireApiKey(provider.id, provider.apiKeys);
 
     try {
-      const callResult = await pool.schedule(provider, signal, async () => {
-        if (provider.protocol === 'anthropic-messages') {
-          return executeAnthropicMessagesCall({
+      const callResult = await pool.schedule(
+        provider,
+        signal,
+        async () => {
+          if (provider.protocol === 'anthropic-messages') {
+            return executeAnthropicMessagesCall({
+              provider,
+              scene,
+              endpoint: resolvedEndpoint,
+              apiKey,
+              systemPrompt,
+              userPrompt,
+              imageDataUrl,
+              effectiveTemperature: currentTemperature,
+              stream,
+              onDelta: wrappedOnDelta,
+              fetchImpl,
+              requestTimeoutMs,
+              streamIdleTimeoutMs,
+              signal,
+            });
+          }
+          return executeOpenAiChatCall({
             provider,
+            scene,
             endpoint: resolvedEndpoint,
             apiKey,
             systemPrompt,
             userPrompt,
             imageDataUrl,
             effectiveTemperature: currentTemperature,
+            omitReasoningEffort,
             stream,
             onDelta: wrappedOnDelta,
             fetchImpl,
@@ -191,23 +240,9 @@ async function runSelfHealingAiCompletion(
             streamIdleTimeoutMs,
             signal,
           });
-        }
-        return executeOpenAiChatCall({
-          provider,
-          endpoint: resolvedEndpoint,
-          apiKey,
-          systemPrompt,
-          userPrompt,
-          imageDataUrl,
-          effectiveTemperature: currentTemperature,
-          stream,
-          onDelta: wrappedOnDelta,
-          fetchImpl,
-          requestTimeoutMs,
-          streamIdleTimeoutMs,
-          signal,
-        });
-      });
+        },
+        effectivePriority,
+      );
 
       return {
         ok: true,
@@ -229,15 +264,16 @@ async function runSelfHealingAiCompletion(
       if (err instanceof ProviderHttpError) {
         const status = err.status;
 
-        // Defense 4: Automatic HTTP 400/422 unsupported `temperature` strip-and-retry + capability cache!
+        // Defense 4a: Automatic HTTP 400/422 unsupported `temperature` strip-and-retry + capability cache!
         if (
-          !recoveredFromUnsupportedParam &&
+          !strippedTemperature &&
           shouldStripTemperatureAndRetry(
             status,
             err.bodyText,
             currentTemperature !== undefined,
           )
         ) {
+          strippedTemperature = true;
           currentTemperature = undefined;
           currentTrace = 'retried-after-400';
           recoveredFromUnsupportedParam = true;
@@ -249,6 +285,29 @@ async function runSelfHealingAiCompletion(
           });
 
           // 1 immediate transparent retry without `temperature`
+          continue;
+        }
+
+        // Defense 4b: Automatic HTTP 400/422 unsupported `reasoning_effort` strip-and-retry + capability cache!
+        if (
+          !strippedReasoningEffort &&
+          shouldStripReasoningEffortAndRetry(
+            status,
+            err.bodyText,
+            sentReasoningEffort,
+          )
+        ) {
+          strippedReasoningEffort = true;
+          omitReasoningEffort = true;
+          recoveredFromUnsupportedParam = true;
+
+          await recordModelCapability(capabilityKey, {
+            supportsReasoningEffort: false,
+            learnedFromStatus: status,
+            updatedAt: Date.now(),
+          });
+
+          // 1 immediate transparent retry without `reasoning_effort`
           continue;
         }
 
@@ -341,7 +400,10 @@ export async function executeBatchWithProvider(
     requestTimeoutMs,
     streamIdleTimeoutMs,
     signal,
+    priority,
   } = options;
+
+  const effectivePriority = resolveRequestPriority(scene, priority);
 
   const knownSecrets: string[] = [
     ...provider.apiKeys,
@@ -415,32 +477,37 @@ export async function executeBatchWithProvider(
       lastEndpoint = currentEndpoint;
 
       try {
-        const mtResult = await pool.schedule(provider, signal, async () => {
-          if (provider.protocol === 'deeplx') {
-            return executeDeepLXCall({
+        const mtResult = await pool.schedule(
+          provider,
+          signal,
+          async () => {
+            if (provider.protocol === 'deeplx') {
+              return executeDeepLXCall({
+                provider,
+                endpoint: currentEndpoint,
+                apiKey,
+                texts: protectedTexts,
+                fromLang,
+                toLang,
+                fetchImpl,
+                requestTimeoutMs,
+                signal,
+              });
+            }
+            return executeGoogleWebCall({
               provider,
               endpoint: currentEndpoint,
-              apiKey,
               texts: protectedTexts,
               fromLang,
               toLang,
               fetchImpl,
               requestTimeoutMs,
               signal,
+              maxCharsPerChunk: provider.maxCharsPerBatch,
             });
-          }
-          return executeGoogleWebCall({
-            provider,
-            endpoint: currentEndpoint,
-            texts: protectedTexts,
-            fromLang,
-            toLang,
-            fetchImpl,
-            requestTimeoutMs,
-            signal,
-            maxCharsPerChunk: provider.maxCharsPerBatch,
-          });
-        });
+          },
+          effectivePriority,
+        );
 
         const outputs: BatchItemOutput[] = [];
         for (
@@ -656,6 +723,18 @@ export async function executeBatchWithProvider(
     return { ok: true, items: [], diagnostic };
   }
 
+  const domainOrUrl = context?.url || context?.domain;
+  const { placeholderMap } = protectGlossaryTokens(
+    items.map((it) => it.text),
+    glossary,
+    domainOrUrl,
+  );
+  const restoreItemGlossary = (item: BatchItemOutput): BatchItemOutput => {
+    if (placeholderMap.size === 0 || !item.trans) return item;
+    const restored = restoreGlossaryTokens(item.trans, placeholderMap);
+    return restored === item.trans ? item : { ...item, trans: restored };
+  };
+
   const { systemPrompt, userPrompt } = codec.encode({
     scene,
     fromLang,
@@ -685,7 +764,7 @@ export async function executeBatchWithProvider(
             const readyItems = streamParser.push(delta);
             if (onItemReady) {
               for (const item of readyItems) {
-                onItemReady(item);
+                onItemReady(restoreItemGlossary(item));
               }
             }
           }
@@ -697,6 +776,7 @@ export async function executeBatchWithProvider(
     requestTimeoutMs,
     streamIdleTimeoutMs,
     signal,
+    priority: effectivePriority,
   });
 
   if (!execOut.ok) {
@@ -753,14 +833,19 @@ export async function executeBatchWithProvider(
   let decodedItems: BatchItemOutput[];
   if (streamParser) {
     const finalized = streamParser.finish();
-    decodedItems = finalized.allItems;
+    decodedItems = finalized.allItems
+      .filter((it) => !it.partial)
+      .map(restoreItemGlossary);
     if (onItemReady) {
       for (const item of finalized.newlyReady) {
-        onItemReady(item);
+        onItemReady(restoreItemGlossary(item));
       }
     }
   } else {
-    decodedItems = codec.decode(execOut.content, items, { scene, assistant });
+    decodedItems = codec
+      .decode(execOut.content, items, { scene, assistant })
+      .filter((it) => !it.partial)
+      .map(restoreItemGlossary);
     if (onItemReady) {
       for (const item of decodedItems) {
         onItemReady(item);
@@ -862,7 +947,10 @@ export async function executeVisionWithProvider(
     requestTimeoutMs,
     streamIdleTimeoutMs,
     signal,
+    priority,
   } = options;
+
+  const effectivePriority = resolveRequestPriority('image', priority);
 
   const knownSecrets: string[] = [
     ...provider.apiKeys,
@@ -925,6 +1013,7 @@ export async function executeVisionWithProvider(
     requestTimeoutMs,
     streamIdleTimeoutMs,
     signal,
+    priority,
   });
 
   if (!execOut.ok) {

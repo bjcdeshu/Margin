@@ -15,7 +15,15 @@ import type {
   MarginConfig,
   ModelCapabilityMap,
 } from '@shared/types';
-import { FieldRow, StatusPill } from '../../components';
+import {
+  EditorialBadge,
+  EmptyState,
+  FieldRow,
+  Icon,
+  Metric,
+  SettingGroup,
+  StatusPill,
+} from '../../components';
 
 export interface StagedMigrationState {
   rawImportText: string;
@@ -249,6 +257,17 @@ export function MigrationDiagnosticsTab({
       ? importPreview.config.providers[previewPrimaryId]
       : undefined;
 
+  const en = lang === 'en';
+  const capabilityCount = Object.keys(capabilityCache).length;
+  const okCount = diagnostics.filter((snap) => snap.kind === 'ok').length;
+  const latencySamples = diagnostics
+    .map((snap) => snap.latencyMs)
+    .filter((ms): ms is number => typeof ms === 'number' && Number.isFinite(ms));
+  const medianLatency =
+    latencySamples.length > 0
+      ? [...latencySamples].sort((a, b) => a - b)[Math.floor(latencySamples.length / 2)]
+      : null;
+
   return (
     <div>
       {/* Section 1: 1-Click Legacy JSON Importer */}
@@ -256,12 +275,12 @@ export function MigrationDiagnosticsTab({
         <div class="mp-section-head">
           <div>
             <h2 class="mp-section-title">
-              {lang === 'en'
+              {en
                 ? '1-Click Legacy JSON Importer'
                 : '一键导入配置 (Immersive / myAItranslate / Margin JSON)'}
             </h2>
             <p class="mp-section-desc">
-              {lang === 'en'
+              {en
                 ? 'Imports channels, custom <yaml>/%% assistants, glossary, and inherit routing while repairing "temperatre" typos.'
                 : '自动迁移翻译渠道、Aloxaf <yaml>/%% 助手、术语库与场景联动，修复 "temperatre" 拼写并剔除悬浮球冗余项。'}
             </p>
@@ -271,112 +290,118 @@ export function MigrationDiagnosticsTab({
         {/* Immediate Top Summary + Apply CTA (Zero scrolling required after file upload/parse!) */}
         {importPreview ? (
           <div
-            class="mp-editorial-note"
+            class="mp-card mp-audit-card"
+            data-state={importApplied ? 'applied' : 'pending'}
             data-testid="import-audit-summary"
-            style={{
-              display: 'flex',
-              flexDirection: 'column',
-              gap: '10px',
-              padding: '14px 16px',
-              marginBottom: '12px',
-              borderLeftColor: importApplied ? 'var(--ok-ink)' : 'var(--action-solid)',
-            }}
           >
-            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: '10px' }}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
-                <strong style={{ fontSize: '13.5px', color: 'var(--ink)' }}>
+            <div class="mp-audit-head">
+              <div class="mp-row">
+                <span class="mp-audit-glyph" aria-hidden="true">
+                  <Icon name={importApplied ? 'check' : 'shield'} size={14} />
+                </span>
+                <strong class="mp-audit-title">
                   {importApplied
-                    ? lang === 'en'
+                    ? en
                       ? 'Import Audit Summary (Applied)'
                       : '配置迁移审计摘要（已正式应用）'
-                    : lang === 'en'
+                    : en
                       ? 'Import Audit Summary (Pending Apply)'
                       : '配置迁移审计摘要（待确认应用）'}
                 </strong>
                 {!importApplied ? (
                   <StatusPill tone="accent" dataTestId="import-pending-warning">
-                    {lang === 'en'
+                    {en
                       ? 'Not yet active — click Apply Now'
                       : '尚未写入生效 · 请点击右侧「立即应用导入配置」'}
                   </StatusPill>
                 ) : (
-                  <StatusPill tone="ok">
-                    {lang === 'en' ? 'Active in Browser' : '已写入浏览器生效'}
-                  </StatusPill>
+                  <StatusPill tone="ok">{en ? 'Active in Browser' : '已写入浏览器生效'}</StatusPill>
                 )}
               </div>
 
               <button
                 type="button"
-                class="mp-btn mp-btn--solid"
+                class={importApplied ? 'mp-btn' : 'mp-btn mp-btn--solid'}
                 data-testid="apply-import-btn"
                 onClick={() => void handleConfirmApplyImport()}
               >
+                <Icon name={importApplied ? 'refresh' : 'download'} size={13} />
                 {importApplied
-                  ? lang === 'en'
+                  ? en
                     ? 'Re-apply Imported Config'
                     : '已应用（点击可重新写入）'
-                  : lang === 'en'
+                  : en
                     ? 'Apply Imported Config Now'
                     : '立即应用导入配置'}
               </button>
             </div>
 
             {/* Key Stats */}
-            <div class="mp-chip-list">
-              <StatusPill tone="accent">
-                {lang === 'en'
-                  ? `Providers: ${importPreview.stats.providersImported}`
-                  : `导入渠道: ${importPreview.stats.providersImported}`}
-              </StatusPill>
-              <StatusPill tone="accent">
-                {lang === 'en'
-                  ? `Assistants: ${importPreview.stats.assistantsImported}`
-                  : `导入助手: ${importPreview.stats.assistantsImported}`}
-              </StatusPill>
-              <StatusPill tone="neutral">
-                {lang === 'en'
-                  ? `Glossary: ${importPreview.stats.glossaryEntriesImported}`
-                  : `术语条目: ${importPreview.stats.glossaryEntriesImported}`}
-              </StatusPill>
-              <StatusPill tone="ok">
-                {lang === 'en'
-                  ? `Normalized Fixes: ${importPreview.stats.normalizedFields}`
-                  : `自动规范化修复: ${importPreview.stats.normalizedFields}`}
-              </StatusPill>
+            <div class="mp-metric-grid mp-audit-metrics">
+              <Metric
+                icon="cpu"
+                label={en ? 'Providers' : '导入渠道'}
+                value={importPreview.stats.providersImported}
+              />
+              <Metric
+                icon="sparkle"
+                label={en ? 'Assistants' : '导入助手'}
+                value={importPreview.stats.assistantsImported}
+              />
+              <Metric
+                icon="book"
+                label={en ? 'Glossary' : '术语条目'}
+                value={importPreview.stats.glossaryEntriesImported}
+              />
+              <Metric
+                icon="check"
+                label={en ? 'Normalized Fixes' : '自动规范化修复'}
+                value={importPreview.stats.normalizedFields}
+              />
             </div>
 
             {/* Scene Routing & Ignored Keys Preview */}
-            <div style={{ fontSize: '12px', color: 'var(--muted)', display: 'flex', flexDirection: 'column', gap: '4px' }}>
-              <div>
-                {lang === 'en' ? 'Primary Routing:' : '解析后主服务路由：'}{' '}
-                <span class="mp-mono" style={{ color: 'var(--ink)' }}>
-                  webpage → {previewPrimaryProvider ? `${previewPrimaryProvider.name} (${previewPrimaryProvider.model})` : previewPrimaryId}
+            <dl class="mp-kv">
+              <dt>{en ? 'Primary Routing' : '解析后主服务路由'}</dt>
+              <dd>
+                <span class="mp-mono mp-kv-strong">
+                  webpage →{' '}
+                  {previewPrimaryProvider
+                    ? `${previewPrimaryProvider.name} (${previewPrimaryProvider.model})`
+                    : previewPrimaryId}
                 </span>
-                {' · '}
+              </dd>
+              <dt>{en ? 'Scene Routes' : '场景路由'}</dt>
+              <dd>
                 <span class="mp-mono">
-                  input={importPreview.config.routing.input}, subtitle={importPreview.config.routing.subtitle}, image={importPreview.config.routing.image}
+                  input={importPreview.config.routing.input}, subtitle=
+                  {importPreview.config.routing.subtitle}, image={importPreview.config.routing.image}
                 </span>
-              </div>
+              </dd>
               {importPreview.stats.ignoredLegacyKeys.length > 0 ? (
-                <div>
-                  {lang === 'en' ? 'Dropped Legacy Clutter:' : '已忽略旧版悬浮球/侧栏冗余键：'}{' '}
-                  <span class="mp-mono">{importPreview.stats.ignoredLegacyKeys.join(', ')}</span>
-                </div>
+                <>
+                  <dt>{en ? 'Dropped Legacy Clutter' : '已忽略旧版悬浮球/侧栏冗余键'}</dt>
+                  <dd>
+                    <span class="mp-mono">{importPreview.stats.ignoredLegacyKeys.join(', ')}</span>
+                  </dd>
+                </>
               ) : null}
-            </div>
+            </dl>
 
             {/* Collapsible Detailed Audit Log Entries so CTA stays concise */}
             {importPreview.audit.length > 0 ? (
-              <details>
-                <summary class="mp-muted" style={{ cursor: 'pointer', fontSize: '12px' }}>
-                  {lang === 'en'
-                    ? `View detailed audit entries (${importPreview.audit.length})`
-                    : `展开查看详细迁移审计明细 (${importPreview.audit.length} 条)`}
+              <details class="mp-audit-details">
+                <summary class="mp-audit-summary">
+                  <Icon name="chevron-right" size={12} class="mp-audit-chevron" />
+                  <span>
+                    {en
+                      ? `View detailed audit entries (${importPreview.audit.length})`
+                      : `展开查看详细迁移审计明细 (${importPreview.audit.length} 条)`}
+                  </span>
                 </summary>
-                <div style={{ display: 'flex', flexDirection: 'column', gap: '4px', paddingTop: '8px', marginTop: '6px', borderTop: '1px solid var(--rule-soft)' }}>
+                <div class="mp-flat-list mp-audit-list">
                   {importPreview.audit.map((item, idx) => (
-                    <div key={idx} style={{ display: 'flex', alignItems: 'baseline', gap: '8px', fontSize: '12px' }}>
+                    <div key={idx} class="mp-flat-item mp-audit-item">
                       <StatusPill
                         tone={
                           item.level === 'warning'
@@ -398,52 +423,61 @@ export function MigrationDiagnosticsTab({
         ) : null}
 
         {importError ? (
-          <div class="mp-editorial-note" style={{ borderLeftColor: 'var(--danger-ink)' }}>
-            <StatusPill tone="danger">{lang === 'en' ? 'Parse Error' : '解析错误'}</StatusPill>{' '}
-            {importError}
+          <div class="mp-editorial-note mp-editorial-note--danger mp-row mp-row--tight">
+            <StatusPill tone="danger">{en ? 'Parse Error' : '解析错误'}</StatusPill>{' '}
+            <span class="mp-grow">{importError}</span>
           </div>
         ) : null}
 
-        <FieldRow
-          stacked
-          label={lang === 'en' ? 'Choose JSON File or Paste Below' : '选择 JSON 配置文件或直接粘贴'}
-        >
-          <div style={{ width: '100%', display: 'flex', flexDirection: 'column', gap: '8px' }}>
-            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '8px', flexWrap: 'wrap' }}>
-              <input
-                type="file"
-                accept=".json,application/json"
-                aria-label={lang === 'en' ? 'Import Legacy JSON File' : '选择旧版 JSON 配置文件'}
-                onChange={(e) => {
-                  const file = (e.currentTarget as HTMLInputElement).files?.[0];
-                  handleFileUpload(file);
-                }}
-              />
-              <button
-                type="button"
-                class="mp-btn mp-btn--solid"
-                data-testid="parse-legacy-json-btn"
-                onClick={() => parseImportInput(rawImportText)}
-              >
-                {lang === 'en' ? 'Preview Import & Audit' : '解析并预览迁移报告'}
-              </button>
-            </div>
-
-            <textarea
-              class="mp-textarea mp-textarea--mono"
-              data-testid="legacy-json-textarea"
-              placeholder='{"translationServices": ..., "customAiAssistants": ...}'
-              value={rawImportText}
-              onInput={(e) => {
-                const text = (e.currentTarget as HTMLTextAreaElement).value;
-                updateStaged((prev) => ({
-                  ...prev,
-                  rawImportText: text,
-                }));
+        <div class="mp-code-frame">
+          <div class="mp-code-frame-head">
+            <span class="mp-frame-label">
+              <Icon name="upload" size={12} />
+              <span>{en ? 'Choose JSON File or Paste Below' : '选择 JSON 配置文件或直接粘贴'}</span>
+            </span>
+            <input
+              type="file"
+              class="mp-file-input"
+              accept=".json,application/json"
+              aria-label={en ? 'Import Legacy JSON File' : '选择旧版 JSON 配置文件'}
+              onChange={(e) => {
+                const file = (e.currentTarget as HTMLInputElement).files?.[0];
+                handleFileUpload(file);
               }}
             />
           </div>
-        </FieldRow>
+          <textarea
+            class="mp-textarea mp-textarea--mono"
+            data-testid="legacy-json-textarea"
+            placeholder='{"translationServices": ..., "customAiAssistants": ...}'
+            value={rawImportText}
+            onInput={(e) => {
+              const text = (e.currentTarget as HTMLTextAreaElement).value;
+              updateStaged((prev) => ({
+                ...prev,
+                rawImportText: text,
+              }));
+            }}
+          />
+          <div class="mp-code-frame-foot">
+            <span class="mp-frame-hint mp-tnum">
+              {rawImportText.trim()
+                ? en
+                  ? `${rawImportText.length.toLocaleString()} chars`
+                  : `${rawImportText.length.toLocaleString()} 字符`
+                : 'Immersive · myAItranslate · Margin'}
+            </span>
+            <button
+              type="button"
+              class="mp-btn mp-btn--solid mp-btn--sm"
+              data-testid="parse-legacy-json-btn"
+              onClick={() => parseImportInput(rawImportText)}
+            >
+              <Icon name="search" size={12} />
+              {en ? 'Preview Import & Audit' : '解析并预览迁移报告'}
+            </button>
+          </div>
+        </div>
       </section>
 
       {/* Section 2: Export Configuration */}
@@ -451,78 +485,101 @@ export function MigrationDiagnosticsTab({
         <div class="mp-section-head">
           <div>
             <h2 class="mp-section-title">
-              {lang === 'en' ? 'Export Configuration' : '导出配置与本机备份'}
+              {en ? 'Export Configuration' : '导出配置与本机备份'}
             </h2>
             <p class="mp-section-desc">
-              {lang === 'en'
+              {en
                 ? 'Redacted export strips all API keys by default so you can share setups safely.'
                 : '默认导出脱敏配置（自动清空 apiKeys）；仅在勾选下方选项时导出含密钥的完整备份。'}
             </p>
           </div>
+          <StatusPill tone={includeSecrets ? 'danger' : 'ok'}>
+            {includeSecrets
+              ? en
+                ? 'Includes keys'
+                : '含密钥'
+              : en
+                ? 'Redacted'
+                : '已脱敏'}
+          </StatusPill>
         </div>
 
-        <FieldRow
-          label={
-            lang === 'en'
-              ? 'Include API Keys for Local Backup'
-              : '包含 API 密钥用于本机备份'
-          }
-          hint={
-            includeSecrets
-              ? lang === 'en'
-                ? 'Caution: exported JSON will contain plaintext API keys. Keep strictly private.'
-                : '注意：勾选后导出的 JSON 含明文 API 密钥，仅供本机或私密迁移备份，请勿公开分享。'
-              : lang === 'en'
-                ? 'Unchecked (default): exports safe redacted configuration without API keys.'
-                : '未勾选（默认）：导出零密钥脱敏配置，可安全分享。'
-          }
-        >
-          <input
-            type="checkbox"
-            data-testid="export-include-secrets-checkbox"
-            checked={includeSecrets}
-            onChange={(e) => {
-              setIncludeSecrets((e.currentTarget as HTMLInputElement).checked);
-              setExportedPreview(null);
-            }}
-          />
-        </FieldRow>
+        <SettingGroup>
+          <FieldRow
+            label={en ? 'Include API Keys for Local Backup' : '包含 API 密钥用于本机备份'}
+            hint={
+              includeSecrets
+                ? en
+                  ? 'Caution: exported JSON will contain plaintext API keys. Keep strictly private.'
+                  : '注意：勾选后导出的 JSON 含明文 API 密钥，仅供本机或私密迁移备份，请勿公开分享。'
+                : en
+                  ? 'Unchecked (default): exports safe redacted configuration without API keys.'
+                  : '未勾选（默认）：导出零密钥脱敏配置，可安全分享。'
+            }
+          >
+            <input
+              type="checkbox"
+              class="mp-checkbox"
+              data-testid="export-include-secrets-checkbox"
+              checked={includeSecrets}
+              onChange={(e) => {
+                setIncludeSecrets((e.currentTarget as HTMLInputElement).checked);
+                setExportedPreview(null);
+              }}
+            />
+          </FieldRow>
+        </SettingGroup>
 
-        <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap', paddingTop: '6px' }}>
+        <div class="mp-row mp-action-row">
           <button
             type="button"
             class="mp-btn mp-btn--solid"
             data-testid="export-copy-btn"
             onClick={() => void handleGenerateExport(false)}
           >
+            <Icon name={includeSecrets ? 'lock' : 'shield'} size={13} />
             {includeSecrets
-              ? lang === 'en'
+              ? en
                 ? 'Copy Full Backup JSON'
                 : '复制完整备份配置'
-              : lang === 'en'
+              : en
                 ? 'Export Redacted Config (Copy)'
                 : '导出脱敏配置'}
           </button>
 
-          <button
-            type="button"
-            class="mp-btn"
-            onClick={() => void handleGenerateExport(true)}
-          >
-            {lang === 'en' ? 'Download .json File' : '下载 .json 文件'}
+          <button type="button" class="mp-btn" onClick={() => void handleGenerateExport(true)}>
+            <Icon name="download" size={13} />
+            {en ? 'Download .json File' : '下载 .json 文件'}
           </button>
 
-          {exportStatus ? <StatusPill tone="ok">{exportStatus}</StatusPill> : null}
+          {exportStatus ? (
+            <EditorialBadge tone="ok">{exportStatus}</EditorialBadge>
+          ) : null}
         </div>
 
         {exportedPreview ? (
-          <textarea
-            readOnly
-            class="mp-textarea mp-textarea--mono"
-            data-testid="export-json-preview"
-            style={{ marginTop: '10px', minHeight: '96px' }}
-            value={exportedPreview}
-          />
+          <div class="mp-code-frame mp-export-frame">
+            <div class="mp-code-frame-head">
+              <span class="mp-frame-label">
+                <Icon name="file" size={12} />
+                <span>{en ? 'JSON preview' : 'JSON 预览'}</span>
+              </span>
+              <span class="mp-row mp-row--tight">
+                <span class="mp-pill mp-pill--mono">
+                  {exportedPreview.length.toLocaleString()} {en ? 'chars' : '字符'}
+                </span>
+                <StatusPill tone={includeSecrets ? 'danger' : 'ok'}>
+                  {includeSecrets ? (en ? 'full backup' : '完整备份') : en ? 'redacted' : '脱敏'}
+                </StatusPill>
+              </span>
+            </div>
+            <textarea
+              readOnly
+              class="mp-textarea mp-textarea--mono"
+              data-testid="export-json-preview"
+              value={exportedPreview}
+            />
+          </div>
         ) : null}
       </section>
 
@@ -531,88 +588,108 @@ export function MigrationDiagnosticsTab({
         <div class="mp-section-head">
           <div>
             <h2 class="mp-section-title">
-              {lang === 'en' ? 'Zero-Secret Diagnostics Log' : '零密钥脱敏诊断与能力缓存'}
+              {en ? 'Zero-Secret Diagnostics Log' : '零密钥脱敏诊断与能力缓存'}
             </h2>
             <p class="mp-section-desc">
-              {lang === 'en'
+              {en
                 ? 'Inspect HTTP statuses, latency, and temperature traces without ever recording prompts or API keys.'
                 : '记录每次请求的端点路径、延迟、温度策略轨迹 (temperatureTrace) 与 400 自动剥离缓存，绝不记录密钥或正文。'}
             </p>
           </div>
+          <button
+            type="button"
+            class="mp-btn mp-btn--solid"
+            data-testid="copy-diagnostics-btn"
+            onClick={() => void handleCopyDiagnosticReport()}
+          >
+            <Icon name="pulse" size={13} />
+            {en ? 'Copy Redacted Diagnostic JSON' : '复制脱敏诊断报告 JSON'}
+          </button>
+        </div>
 
-          <div style={{ display: 'flex', gap: '6px', flexWrap: 'wrap' }}>
-            <button
-              type="button"
-              class="mp-btn mp-btn--solid"
-              data-testid="copy-diagnostics-btn"
-              onClick={() => void handleCopyDiagnosticReport()}
-            >
-              {lang === 'en'
-                ? 'Copy Redacted Diagnostic JSON'
-                : '复制脱敏诊断报告 JSON'}
-            </button>
+        <div class="mp-card mp-diag-card">
+          <div class="mp-metric-grid">
+            <Metric icon="pulse" label={en ? 'Snapshots' : '诊断快照'} value={diagnostics.length} />
+            <Metric
+              icon="check"
+              label={en ? 'Succeeded' : '成功'}
+              value={okCount}
+              unit={diagnostics.length > 0 ? `/ ${diagnostics.length}` : undefined}
+            />
+            <Metric
+              icon="bolt"
+              label={en ? 'Median latency' : '延迟中位数'}
+              value={medianLatency ?? '—'}
+              unit={medianLatency !== null ? 'ms' : undefined}
+            />
+            <Metric
+              icon="database"
+              label={en ? 'Capability cache' : '能力缓存'}
+              value={capabilityCount}
+            />
+          </div>
+          <div class="mp-diag-actions">
             <button
               type="button"
               class="mp-btn mp-btn--sm"
               onClick={() => void handleClearTranslationCache()}
             >
-              {lang === 'en' ? 'Clear Translation Cache' : '清空译文缓存'}
+              <Icon name="refresh" size={12} />
+              {en ? 'Clear Translation Cache' : '清空译文缓存'}
             </button>
             <button
               type="button"
               class="mp-btn mp-btn--sm"
               onClick={() => void handleClearCapabilityCache()}
             >
-              {lang === 'en'
-                ? `Clear Capability Cache (${Object.keys(capabilityCache).length})`
-                : `清空能力缓存 (${Object.keys(capabilityCache).length})`}
+              <Icon name="database" size={12} />
+              {en
+                ? `Clear Capability Cache (${capabilityCount})`
+                : `清空能力缓存 (${capabilityCount})`}
             </button>
             <button
               type="button"
               class="mp-btn mp-btn--ghost mp-btn--sm"
               onClick={() => void handleClearDiagnostics()}
             >
-              {lang === 'en' ? 'Clear Log' : '清空日志'}
+              <Icon name="trash" size={12} />
+              {en ? 'Clear Log' : '清空日志'}
             </button>
           </div>
         </div>
 
         {diagNotice ? (
-          <div class="mp-editorial-note">
-            <StatusPill tone="ok">{diagNotice}</StatusPill>
-          </div>
+          <div class="mp-editorial-note mp-editorial-note--ok">{diagNotice}</div>
         ) : null}
 
         {diagnostics.length === 0 ? (
-          <p class="mp-muted" style={{ fontSize: '12.5px', margin: '8px 0 0' }}>
-            {lang === 'en'
-              ? 'No diagnostic entries recorded yet.'
-              : '暂无最近诊断记录。点击渠道页「测试连接」或触发翻译后将在此显示脱敏快照。'}
-          </p>
+          <div class="mp-diag-empty">
+            <EmptyState title={en ? 'No diagnostic entries recorded yet.' : '暂无最近诊断记录'}>
+              {en
+                ? 'Run “Test Connection” on a channel or translate a page to see redacted snapshots here.'
+                : '点击渠道页「测试连接」或触发翻译后将在此显示脱敏快照。'}
+            </EmptyState>
+          </div>
         ) : (
-          <div class="mp-flat-list">
+          <div class="mp-flat-list mp-diag-list">
             {diagnostics.map((snap, idx) => (
-              <div
-                key={`${snap.time}-${idx}`}
-                class="mp-flat-item"
-                style={{ flexWrap: 'wrap', justifyContent: 'space-between' }}
-              >
-                <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
-                  <StatusPill tone={snap.kind === 'ok' ? 'ok' : 'danger'}>
-                    {snap.kind} {snap.httpStatus ? `(${snap.httpStatus})` : ''}
-                  </StatusPill>
-                  <span class="mp-mono">
-                    {snap.provider.id} · {snap.provider.model}
-                  </span>
-                  <StatusPill tone="mono">{snap.parameters.temperatureTrace}</StatusPill>
-                  <span class="mp-muted" style={{ fontSize: '12px' }}>
-                    {snap.scene} · {snap.latencyMs}ms
-                  </span>
-                </div>
+              <div key={`${snap.time}-${idx}`} class="mp-flat-item mp-diag-row">
+                <span
+                  class={snap.kind === 'ok' ? 'mp-diag-dot mp-diag-dot--ok' : 'mp-diag-dot mp-diag-dot--danger'}
+                  aria-hidden="true"
+                />
+                <StatusPill tone={snap.kind === 'ok' ? 'ok' : 'danger'}>
+                  {snap.kind} {snap.httpStatus ? `(${snap.httpStatus})` : ''}
+                </StatusPill>
+                <span class="mp-mono mp-diag-provider">
+                  {snap.provider.id} · {snap.provider.model}
+                </span>
+                <StatusPill tone="mono">{snap.parameters.temperatureTrace}</StatusPill>
+                <span class="mp-diag-meta mp-tnum">
+                  {snap.scene} · {snap.latencyMs}ms
+                </span>
                 {snap.sanitizedError ? (
-                  <div class="mp-muted mp-mono" style={{ width: '100%', fontSize: '11.5px' }}>
-                    {snap.sanitizedError}
-                  </div>
+                  <div class="mp-diag-error mp-mono">{snap.sanitizedError}</div>
                 ) : null}
               </div>
             ))}

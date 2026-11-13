@@ -235,6 +235,42 @@ export function backfillStoredConfig(stored: MarginConfig): {
     mutated = true;
   }
 
+  // 6. Prompt System v3 Sliding Context (`thread_prompt` & `context_window_prompt`) non-destructive refresh
+  if ((stored.promptSystemVersion ?? 1) < 3) {
+    const v2StockPrompts: Readonly<Record<string, string>> = {
+      'builtin-yaml':
+        '{{title_prompt}}{{summary_prompt}}{{style_prompt}}{{glossary_prompt}}Translate into {{to}}:\n<yaml>\n{{yaml}}\n</yaml>',
+      'builtin-yaml-thinking':
+        '{{title_prompt}}{{summary_prompt}}{{style_prompt}}{{glossary_prompt}}Translate into {{to}} with brief `thinking` and polished `trans`:\n<yaml>\n{{yaml}}\n</yaml>',
+      'builtin-delimiter':
+        '{{title_prompt}}{{style_prompt}}{{glossary_prompt}}{{text}}',
+    };
+
+    for (const builtinId of [
+      'builtin-yaml',
+      'builtin-yaml-thinking',
+      'builtin-delimiter',
+    ] as const) {
+      const targetBuiltin = BUILTIN_ASSISTANTS[builtinId];
+      const existing = stored.assistants[builtinId];
+      if (!existing) {
+        stored.assistants[builtinId] = cloneAssistantConfig(targetBuiltin);
+        continue;
+      }
+      existing.env ??= {};
+      existing.env.thread_prompt ??= targetBuiltin.env.thread_prompt;
+      existing.env.context_window_prompt ??=
+        targetBuiltin.env.context_window_prompt;
+
+      if (existing.prompt === v2StockPrompts[builtinId]) {
+        existing.prompt = targetBuiltin.prompt;
+      }
+    }
+
+    stored.promptSystemVersion = 3;
+    mutated = true;
+  }
+
   return { config: stored, mutated };
 }
 
@@ -315,7 +351,10 @@ export async function recordModelCapability(
   entry: ModelCapabilityEntry,
 ): Promise<void> {
   const cache = await getCapabilityCache();
-  cache[capabilityKey] = entry;
+  cache[capabilityKey] = {
+    ...cache[capabilityKey],
+    ...entry,
+  };
   await rawSet(BRAND.storageKeyCapabilityCache, cache);
 }
 

@@ -64,6 +64,8 @@ const PLACEHOLDER_RE = /\{\{\s*([A-Za-z0-9_.-]+)\s*\}\}/g;
 const DEFAULT_OPTIONAL_PROMPT_VARS: Readonly<Record<string, string>> = {
   title_prompt: '',
   summary_prompt: '',
+  thread_prompt: '',
+  context_window_prompt: '',
   terms_prompt: '',
   glossary_prompt: '',
   sub_summary_prompt: '',
@@ -73,6 +75,10 @@ const DEFAULT_OPTIONAL_PROMPT_VARS: Readonly<Record<string, string>> = {
   extra_prompt: '',
   title: '',
   summary: '',
+  prevContext: '',
+  prev_context: '',
+  threadContext: '',
+  thread_context: '',
   styleGuide: '',
   style_guide: '',
   domain: '',
@@ -86,6 +92,10 @@ const DEFAULT_OPTIONAL_PROMPT_VARS: Readonly<Record<string, string>> = {
 const BUILTIN_CONDITIONAL_ENV_DEFAULTS: Readonly<Record<string, string>> = {
   title_prompt: 'Document Title: {{imt_title}}\n',
   summary_prompt: 'Context Summary: {{imt_summary}}\n',
+  thread_prompt:
+    'Thread / Post Topic (context only — do NOT translate): {{threadContext}}\n',
+  context_window_prompt:
+    'Preceding Context (for pronoun/tone continuity only — do NOT translate): {{prevContext}}\n',
   style_prompt: 'Style Guide: {{styleGuide}}\n',
   glossary_prompt: '{{glossaryInstruction}}\n',
   terms_prompt: 'Required Glossary: {{imt_terms}}\n',
@@ -96,6 +106,10 @@ const BUILTIN_CONDITIONAL_ENV_DEFAULTS: Readonly<Record<string, string>> = {
 const PRUNABLE_DYNAMIC_VARS = new Set([
   'title',
   'summary',
+  'prevContext',
+  'prev_context',
+  'threadContext',
+  'thread_context',
   'styleGuide',
   'style_guide',
   'domain',
@@ -169,6 +183,39 @@ export function extractStreamableVisibleText(rawBuffer: string): string {
     return cleaned.slice(0, openIdx);
   }
   return cleaned;
+}
+
+/**
+ * Cleans an active mid-stream partial translation string so intra-item token
+ * previews remain clean and readable mid-sentence without flashing incomplete
+ * `<m0`, `</m0`, `<m-g`, or `</yaml` tag fragments or YAML block-chomp artifacts.
+ */
+export function cleanPartialStreamingTrans(rawTrans: string): string {
+  if (!rawTrans) return '';
+  let s = rawTrans;
+
+  if (/^[ \t]*[|>][-+]?\d*[ \t]*$/.test(s)) {
+    return '';
+  }
+  s = s.replace(/^[ \t]*[|>][-+]?\d*[ \t]+/, '');
+
+  const trimmedStart = s.trimStart();
+  if (trimmedStart.startsWith('"') && !trimmedStart.slice(1).includes('"')) {
+    s = trimmedStart
+      .slice(1)
+      .replace(/\\n/g, '\n')
+      .replace(/\\"/g, '"')
+      .replace(/\\\\/g, '\\')
+      .replace(/\\(?:u[0-9a-fA-F]{0,3})?$/, '');
+  } else if (trimmedStart.startsWith("'") && !trimmedStart.slice(1).includes("'")) {
+    s = trimmedStart.slice(1).replace(/''/g, "'");
+  }
+
+  s = s.replace(/\r?\n[ \t]*(?:`{1,3}|\.\.\.|---)[ \t]*$/, '');
+  s = s.replace(/<(?:\/?[A-Za-z][A-Za-z0-9_-]*[^<>]*|\/)?$/, '');
+  s = s.replace(/＜(?:\/?[A-Za-z][A-Za-z0-9_-]*[^＜＞]*|\/)?$/, '');
+
+  return s.trim();
 }
 
 export function interpolateTemplate(
@@ -252,6 +299,10 @@ export function buildExpandedPromptVariables(
     content_type: richBatch ? 'html' : 'text',
     title: String(context?.title ?? '').trim(),
     summary: String(context?.summary ?? '').trim(),
+    prevContext: String(context?.prevContext ?? '').trim(),
+    prev_context: String(context?.prevContext ?? '').trim(),
+    threadContext: String(context?.threadContext ?? '').trim(),
+    thread_context: String(context?.threadContext ?? '').trim(),
     styleGuide: String(context?.styleGuide ?? '').trim(),
     style_guide: String(context?.styleGuide ?? '').trim(),
     domain: String(context?.domain ?? '').trim(),
@@ -262,6 +313,8 @@ export function buildExpandedPromptVariables(
     imt_theme: String(context?.summary ?? '').trim(),
     imt_summary: String(context?.summary ?? '').trim(),
     imt_description: String(context?.summary ?? '').trim(),
+    imt_prev_context: String(context?.prevContext ?? '').trim(),
+    imt_thread_context: String(context?.threadContext ?? '').trim(),
     imt_style_guide: String(context?.styleGuide ?? '').trim(),
     imt_terms: glossaryVars.imt_terms,
     imt_terms_with_domain: glossaryVars.imt_terms_with_domain,

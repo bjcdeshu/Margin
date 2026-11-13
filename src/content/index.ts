@@ -1,5 +1,8 @@
 import { BRAND } from '@shared/brand';
-import { isExtensionContextValid } from '@shared/messaging';
+import {
+  isExtensionContextValid,
+  requestRuntimeWarmup,
+} from '@shared/messaging';
 import {
   evaluateAutoTranslateDecision,
   type AutoTranslateDecision,
@@ -10,6 +13,7 @@ import type {
   MarginConfig,
   TabCommandMessage,
   TabPageState,
+  TranslationScene,
 } from '@shared/types';
 import {
   isUnsupportedBrowserUrl,
@@ -35,9 +39,20 @@ export * from './input-translate';
 export * from './hover-translate';
 export * from './selection-popover';
 
-const HYDRATION_DEBOUNCE_MS = 220;
+export const FOREIGN_SAMPLE_THRESHOLD = 24;
+export const TWEET_FOREIGN_SAMPLE_THRESHOLD = 18;
+export const HYDRATION_THROTTLE_MS = 60;
 const HYDRATION_MAX_WINDOW_MS = 12_000;
-const HYDRATION_MAX_CHECKS = 15;
+const HYDRATION_MAX_CHECKS = 200;
+
+const TWEET_NOISE_TOKEN_RE =
+  /(?:https?:\/\/\S+|\bwww\.\S+|\b[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}\b|@[A-Za-z0-9_.-]+|#[\p{L}\p{N}_-]+)/gu;
+
+function countMeaningfulSampleLetters(sample: string): number {
+  if (!sample) return 0;
+  const cleaned = sample.replace(TWEET_NOISE_TOKEN_RE, ' ');
+  return cleaned.match(/\p{L}/gu)?.length ?? 0;
+}
 
 type HandledTabCommandType = Exclude<
   TabCommandMessage['type'],
@@ -145,6 +160,10 @@ export interface MarginContentControllerOptions {
   doc?: Document;
   getUrl?: () => string;
   transport?: BatchTransportFn & InputBatchTransportFn & SelectionTransportFn;
+  warmup?: (payload?: {
+    providerId?: string;
+    scene?: TranslationScene;
+  }) => Promise<{ ok: boolean; warmedProviderId?: string }>;
   now?: () => number;
 }
 
@@ -153,6 +172,10 @@ export class MarginContentController {
   private readonly doc: Document;
   private readonly getUrl: () => string;
   private readonly now: () => number;
+  private readonly warmup: (payload?: {
+    providerId?: string;
+    scene?: TranslationScene;
+  }) => Promise<{ ok: boolean; warmedProviderId?: string }>;
 
   readonly renderer: WebpageRenderer;
   readonly inputTranslator: InputQuickTranslator;
@@ -167,8 +190,9 @@ export class MarginContentController {
   private hadRuntimeIdAtMount = false;
   private spaFollowUpTimer: ReturnType<typeof setTimeout> | null = null;
   private hydrationObserver: MutationObserver | null = null;
-  private hydrationDebounceTimer: ReturnType<typeof setTimeout> | null = null;
+  private hydrationThrottleTimer: ReturnType<typeof setTimeout> | null = null;
   private hydrationMaxTimeoutTimer: ReturnType<typeof setTimeout> | null = null;
+  private lastHydrationCheckAt: number | null = null;
   private hydrationCheckCount = 0;
   private unsubscribeStorage: (() => void) | null = null;
   private cleanupRuntimeMessage: (() => void) | null = null;
@@ -188,6 +212,7 @@ export class MarginContentController {
         this.doc.location?.href ||
         (typeof location !== 'undefined' ? location.href : ''));
     this.now = options.now ?? (() => Date.now());
+    this.warmup = options.warmup ?? requestRuntimeWarmup;
 
     this.renderer = new WebpageRenderer({
       config: this.config,
@@ -251,11 +276,12 @@ export class MarginContentController {
   }
 
   evaluateAutoTranslate(): AutoTranslateDecision {
+    const currentUrl = this.getUrl();
     const htmlLang =
       this.doc.documentElement?.getAttribute('lang')?.trim() || undefined;
     const sampleText = samplePageProseForLanguageDetection(this.doc.body);
-    const decision = evaluateAutoTranslateDecision({
-      url: this.getUrl(),
+    let decision = evaluateAutoTranslateDecision({
+      url: currentUrl,
       targetLang: this.config.targetLang,
       webpage: this.config.webpage,
       urlRules: this.config.urlRules,
@@ -263,6 +289,29 @@ export class MarginContentController {
       sampleText,
       manuallyDisabledInSession: this.manuallyDisabledInSession,
     });
+
+    if (decision.reason === 'awaiting-content' && this.doc.body) {
+      const tweetNodes = this.doc.body.querySelectorAll('[data-testid="tweetText"]');
+      for (let i = 0; i < tweetNodes.length; i++) {
+        const tweetSample = samplePageProseForLanguageDetection(tweetNodes[i], 360);
+        if (countMeaningfulSampleLetters(tweetSample) >= TWEET_FOREIGN_SAMPLE_THRESHOLD) {
+          const tweetDecision = evaluateAutoTranslateDecision({
+            url: currentUrl,
+            targetLang: this.config.targetLang,
+            webpage: this.config.webpage,
+            urlRules: this.config.urlRules,
+            htmlLang,
+            sampleText: `${tweetSample} ${tweetSample}`,
+            manuallyDisabledInSession: this.manuallyDisabledInSession,
+          });
+          if (tweetDecision.reason !== 'awaiting-content') {
+            decision = tweetDecision;
+            break;
+          }
+        }
+      }
+    }
+
     if (decision.reason !== 'manual-session-off') {
       this.detectedPageLang = decision.detectedLang;
     }
@@ -292,17 +341,47 @@ export class MarginContentController {
   }
 
   private stopHydrationObserver(): void {
-    if (this.hydrationDebounceTimer !== null) {
-      clearTimeout(this.hydrationDebounceTimer);
-      this.hydrationDebounceTimer = null;
+    if (this.hydrationThrottleTimer !== null) {
+      clearTimeout(this.hydrationThrottleTimer);
+      this.hydrationThrottleTimer = null;
     }
     if (this.hydrationMaxTimeoutTimer !== null) {
       clearTimeout(this.hydrationMaxTimeoutTimer);
       this.hydrationMaxTimeoutTimer = null;
     }
+    this.lastHydrationCheckAt = null;
     this.hydrationObserver?.disconnect();
     this.hydrationObserver = null;
     this.hydrationCheckCount = 0;
+  }
+
+  private attemptAutoTranslateCheck(): void {
+    if (
+      !this.mounted ||
+      this.renderer.isActive ||
+      this.manuallyDisabledInSession
+    ) {
+      this.stopHydrationObserver();
+      return;
+    }
+    if (!isExtensionContextValid(this.hadRuntimeIdAtMount)) {
+      this.destroy({ contextInvalidated: true });
+      return;
+    }
+
+    this.lastHydrationCheckAt = this.now();
+    this.hydrationCheckCount += 1;
+    const decision = this.evaluateAutoTranslate();
+    if (decision.shouldTranslate && !this.renderer.isActive) {
+      this.enablePageTranslation(false);
+      return;
+    }
+    if (
+      !decision.needsHydrationRecheck ||
+      this.hydrationCheckCount >= HYDRATION_MAX_CHECKS
+    ) {
+      this.stopHydrationObserver();
+    }
   }
 
   private startHydrationObserver(): void {
@@ -313,6 +392,7 @@ export class MarginContentController {
     if (!body) return;
 
     this.hydrationCheckCount = 0;
+    this.lastHydrationCheckAt = null;
 
     const onMutations = (mutations: MutationRecord[]) => {
       if (
@@ -339,38 +419,26 @@ export class MarginContentController {
         return;
       }
 
-      if (this.hydrationDebounceTimer !== null) {
+      const nowMs = this.now();
+      const elapsed =
+        this.lastHydrationCheckAt === null
+          ? Number.POSITIVE_INFINITY
+          : nowMs - this.lastHydrationCheckAt;
+
+      if (elapsed >= HYDRATION_THROTTLE_MS && this.hydrationThrottleTimer === null) {
+        this.attemptAutoTranslateCheck();
         return;
       }
 
-      this.hydrationDebounceTimer = setTimeout(() => {
-        this.hydrationDebounceTimer = null;
-        if (
-          !this.mounted ||
-          this.renderer.isActive ||
-          this.manuallyDisabledInSession
-        ) {
-          this.stopHydrationObserver();
-          return;
-        }
-        if (!isExtensionContextValid(this.hadRuntimeIdAtMount)) {
-          this.destroy({ contextInvalidated: true });
-          return;
-        }
+      if (this.hydrationThrottleTimer !== null) {
+        return;
+      }
 
-        this.hydrationCheckCount += 1;
-        const decision = this.evaluateAutoTranslate();
-        if (decision.shouldTranslate && !this.renderer.isActive) {
-          this.enablePageTranslation(false);
-          return;
-        }
-        if (
-          !decision.needsHydrationRecheck ||
-          this.hydrationCheckCount >= HYDRATION_MAX_CHECKS
-        ) {
-          this.stopHydrationObserver();
-        }
-      }, HYDRATION_DEBOUNCE_MS);
+      const waitMs = Math.max(1, HYDRATION_THROTTLE_MS - Math.max(0, elapsed));
+      this.hydrationThrottleTimer = setTimeout(() => {
+        this.hydrationThrottleTimer = null;
+        this.attemptAutoTranslateCheck();
+      }, waitMs);
     };
 
     this.hydrationObserver = new MutationObserver(onMutations);
@@ -458,6 +526,10 @@ export class MarginContentController {
 
     this.mounted = true;
     this.hadRuntimeIdAtMount = Boolean(globalThis.chrome?.runtime?.id);
+
+    if (!this.isCurrentUrlExcluded()) {
+      void this.warmup({ scene: 'webpage' });
+    }
 
     this.inputTranslator.mount();
     this.hoverTranslator.mount();

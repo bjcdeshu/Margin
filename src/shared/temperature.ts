@@ -20,10 +20,25 @@ const STRICT_MODEL_KEYWORD_RE =
 const UNSUPPORTED_TEMP_ERROR_RE =
   /\btemperature\b|unsupported[_\s-]?parameter|unsupported[_\s-]?value|only the default \(1\) value is supported/i;
 
+const UNSUPPORTED_REASONING_EFFORT_ERROR_RE =
+  /\breasoning[_\s-]?effort\b|\breasoningEffort\b/i;
+
 export function isStrictTemperatureModel(model: string): boolean {
   const m = String(model ?? '').trim();
   if (!m) return false;
   return STRICT_MODEL_PREFIX_RE.test(m) || STRICT_MODEL_KEYWORD_RE.test(m);
+}
+
+/**
+ * Matches OpenAI reasoning-family models (`o1*`, `o3*`, `o4*`, `gpt-5*`, `gpt-6*`)
+ * eligible for scene-aware `reasoning_effort: 'low'` on realtime scenes (`webpage`, `hover`, `subtitle`),
+ * excluding `codex` variants where gateways may omit `reasoning_effort`.
+ */
+export function isOpenAiLightReasoningModel(model: string): boolean {
+  const m = String(model ?? '').trim();
+  if (!m) return false;
+  if (/codex/i.test(m)) return false;
+  return STRICT_MODEL_PREFIX_RE.test(m);
 }
 
 /**
@@ -127,4 +142,14 @@ export function shouldStripTemperatureAndRetry(
   if (!sentPayloadHadTemperature) return false;
   if (httpStatus !== 400 && httpStatus !== 422) return false;
   return UNSUPPORTED_TEMP_ERROR_RE.test(String(errorBodyText ?? ''));
+}
+
+export function shouldStripReasoningEffortAndRetry(
+  httpStatus: number,
+  errorBodyText: string,
+  sentPayloadHadReasoningEffort: boolean,
+): boolean {
+  if (!sentPayloadHadReasoningEffort) return false;
+  if (httpStatus !== 400 && httpStatus !== 422) return false;
+  return UNSUPPORTED_REASONING_EFFORT_ERROR_RE.test(String(errorBodyText ?? ''));
 }

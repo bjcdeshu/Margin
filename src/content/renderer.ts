@@ -11,6 +11,7 @@ import type {
   GlossaryEntry,
   MarginConfig,
   PageContextPayload,
+  RequestPriority,
   TabPageState,
   TranslateBatchRequest,
   TranslateBatchResponse,
@@ -19,6 +20,7 @@ import type {
 } from '@shared/types';
 import { resolveThemeForUrl } from '@shared/url-match';
 import {
+  extractFocalThreadContext,
   extractPageContext,
   extractParagraphBlocks,
   findClosestParagraphBlock,
@@ -33,7 +35,11 @@ import {
 } from './rich-text';
 
 export const DEFAULT_LRU_CAPACITY = 2000;
-export const VIEWPORT_ROOT_MARGIN = '600px 0px';
+export const VIEWPORT_ROOT_MARGIN = '300px 0px 2200px 0px';
+export const SPA_MUTATION_DEBOUNCE_MS = 24;
+export const HERO_WAVE_MAX_BLOCKS = 2;
+export const HERO_WAVE_MAX_CHARS = 480;
+export const SCROLL_EVICTION_THROTTLE_MS = 120;
 
 const STYLE_ELEMENT_ID = 'margin-webpage-styles';
 
@@ -49,7 +55,8 @@ export const WEBPAGE_INJECTED_CSS = /* css */ `
   display: none !important;
 }
 
-.margin-trans-root[data-margin-injected="true"] {
+.margin-trans-root[data-margin-injected="true"],
+.margin-trans-block[data-margin-injected="true"] {
   font: inherit;
   color: inherit;
   line-height: inherit;
@@ -85,37 +92,59 @@ export const WEBPAGE_INJECTED_CSS = /* css */ `
   text-decoration-color: currentColor;
 }
 
-/* Immediate per-block in-progress loading indicator */
+/* Quiet proportional warm-paper breathing shimmer bar */
 .margin-trans-loading[data-margin-injected="true"] {
   display: flex !important;
-  align-items: center;
+  flex-direction: column;
+  align-items: flex-start;
   gap: 6px;
-  margin-top: 0.42em;
-  margin-bottom: 0.12em;
-  font-family: "Segoe UI Variable", "Segoe UI", "PingFang SC", "Microsoft YaHei", ui-sans-serif, system-ui, sans-serif;
-  font-size: 12px;
-  font-weight: 400;
-  line-height: 1.4;
-  color: #8c5a21;
-  opacity: 0.86;
+  margin-top: 0.48em;
+  margin-bottom: 0.2em;
   user-select: none;
   pointer-events: none;
 }
 
-.margin-trans-spinner {
-  display: inline-block;
-  width: 12px;
-  height: 12px;
-  border-radius: 50%;
-  border: 1.6px solid rgba(185, 131, 61, 0.28);
-  border-top-color: #b9833d;
-  animation: margin-spin 0.78s linear infinite;
-  flex-shrink: 0;
+.margin-trans-loading[data-margin-injected="true"][data-margin-layout="inline"] {
+  display: inline-flex !important;
+  flex-direction: row;
+  align-items: center;
+  vertical-align: middle;
+  margin-top: 0;
+  margin-bottom: 0;
+  margin-inline-start: 0.48em;
 }
 
-@keyframes margin-spin {
-  to {
-    transform: rotate(360deg);
+.margin-shimmer-line {
+  display: block;
+  height: 0.9em;
+  min-height: 11px;
+  max-height: 16px;
+  border-radius: 5px;
+  background-color: color-mix(in srgb, currentColor 8%, transparent);
+  background-image: linear-gradient(
+    90deg,
+    transparent 0%,
+    rgba(185, 131, 61, 0.16) 50%,
+    transparent 100%
+  );
+  background-size: 220% 100%;
+  background-position: 120% 0;
+  animation: margin-shimmer-sweep 1.5s cubic-bezier(0.4, 0, 0.2, 1) infinite;
+}
+
+.margin-trans-loading[data-margin-layout="inline"] .margin-shimmer-line {
+  display: inline-block;
+  width: 3.6em !important;
+  height: 0.84em;
+  min-height: 10px;
+}
+
+@keyframes margin-shimmer-sweep {
+  0% {
+    background-position: 120% 0;
+  }
+  100% {
+    background-position: -120% 0;
   }
 }
 
@@ -201,8 +230,9 @@ html[data-margin-mask-revealed="true"] .margin-trans-root[data-margin-theme="mas
   .margin-inline-retry[data-margin-injected="true"] {
     transition: none !important;
   }
-  .margin-trans-spinner {
+  .margin-shimmer-line {
     animation: none !important;
+    background-image: none !important;
   }
 }
 `;
@@ -210,7 +240,8 @@ html[data-margin-mask-revealed="true"] .margin-trans-root[data-margin-theme="mas
 const PAGE_STATUS_PILL_CSS = /* css */ `
 ${SHADOW_HOST_RESET_CSS}
 
-.status-pill {
+.status-pill,
+.margin-status-pill {
   position: fixed;
   right: 18px;
   bottom: 18px;
@@ -220,42 +251,80 @@ ${SHADOW_HOST_RESET_CSS}
   gap: 8px;
   max-width: min(420px, calc(100vw - 32px));
   padding: 6px 12px;
-  background: var(--paper);
-  color: var(--ink);
-  border: 1px solid var(--rule-strong);
+  background: rgba(251, 250, 246, 0.94);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+  color: #1c1914;
+  border: 1px solid rgba(28, 25, 20, 0.08);
   border-radius: 999px;
-  box-shadow: 0 6px 20px rgba(21, 20, 17, 0.14);
-  font-size: 12.5px;
+  box-shadow:
+    0 6px 20px rgba(28, 25, 20, 0.08),
+    0 1px 2px rgba(28, 25, 20, 0.04);
+  font-size: 12px;
   line-height: 18px;
+  font-variant-numeric: tabular-nums;
   pointer-events: auto;
   user-select: none;
+  transition:
+    opacity 180ms cubic-bezier(0.2, 0.72, 0.2, 1),
+    padding 180ms cubic-bezier(0.2, 0.72, 0.2, 1),
+    border-color 180ms cubic-bezier(0.2, 0.72, 0.2, 1);
+}
+
+:host([data-display-mode="night"]) .status-pill {
+  background: rgba(23, 21, 18, 0.94);
+  color: #ede8df;
+  border-color: rgba(244, 239, 228, 0.10);
+  box-shadow:
+    0 8px 24px rgba(0, 0, 0, 0.42),
+    0 1px 2px rgba(0, 0, 0, 0.24);
 }
 
 .status-pill[hidden] {
   display: none !important;
 }
 
+.status-pill[data-quiet="true"] {
+  padding: 4px 10px;
+  opacity: 0.78;
+}
+
+.status-pill[data-quiet="true"]:hover {
+  opacity: 1;
+}
+
 .status-pill[data-tone="error"] {
-  border-color: rgba(188, 76, 62, 0.45);
+  border-color: rgba(188, 76, 62, 0.42);
+  opacity: 1;
 }
 
 .spinner {
-  width: 12px;
-  height: 12px;
+  width: 8px;
+  height: 8px;
   border-radius: 50%;
-  border: 1.75px solid var(--rule);
-  border-top-color: var(--accent);
-  animation: status-spin 0.8s linear infinite;
+  background: #8c5a21;
+  box-shadow: 0 0 0 3px rgba(140, 90, 33, 0.16);
+  animation: status-pulse 1.5s cubic-bezier(0.4, 0, 0.2, 1) infinite;
   flex-shrink: 0;
+}
+
+:host([data-display-mode="night"]) .spinner {
+  background: #c99455;
+  box-shadow: 0 0 0 3px rgba(201, 148, 85, 0.2);
 }
 
 .spinner[hidden] {
   display: none !important;
 }
 
-@keyframes status-spin {
-  to {
-    transform: rotate(360deg);
+@keyframes status-pulse {
+  0%, 100% {
+    opacity: 0.95;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 0.45;
+    transform: scale(0.84);
   }
 }
 
@@ -263,11 +332,12 @@ ${SHADOW_HOST_RESET_CSS}
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+  font-variant-numeric: tabular-nums;
 }
 
 .hint {
   color: var(--muted);
-  font-size: 11.5px;
+  font-size: 11px;
   flex-shrink: 0;
 }
 
@@ -279,21 +349,32 @@ ${SHADOW_HOST_RESET_CSS}
   all: unset;
   box-sizing: border-box;
   cursor: pointer;
-  font-size: 11.5px;
+  font-size: 11px;
   font-weight: 500;
   line-height: 16px;
-  padding: 2px 7px;
+  padding: 2px 8px;
   border-radius: 999px;
-  color: var(--link);
-  border: 1px solid var(--rule);
-  background: var(--paper-soft);
+  color: #8c5a21;
+  border: 1px solid rgba(28, 25, 20, 0.09);
+  background: rgba(140, 90, 33, 0.07);
   flex-shrink: 0;
+  transition: background-color 150ms ease, border-color 150ms ease;
+}
+
+:host([data-display-mode="night"]) .action-btn {
+  color: #c99455;
+  border-color: rgba(244, 239, 228, 0.11);
+  background: rgba(201, 148, 85, 0.11);
 }
 
 .action-btn:hover {
-  background: var(--state-hover-surface);
-  border-color: var(--rule-strong);
-  color: var(--link-hover);
+  background: rgba(140, 90, 33, 0.14);
+  border-color: rgba(140, 90, 33, 0.28);
+}
+
+:host([data-display-mode="night"]) .action-btn:hover {
+  background: rgba(201, 148, 85, 0.2);
+  border-color: rgba(201, 148, 85, 0.34);
 }
 
 .action-btn[hidden] {
@@ -317,6 +398,16 @@ ${SHADOW_HOST_RESET_CSS}
 
 .close-btn[hidden] {
   display: none !important;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .status-pill,
+  .action-btn {
+    transition: none !important;
+  }
+  .spinner {
+    animation: none !important;
+  }
 }
 `;
 
@@ -633,6 +724,81 @@ export function isRedundantIdenticalTranslation(
   return normSrc === normTrans;
 }
 
+export const isEffectivelyIdenticalTranslation = isRedundantIdenticalTranslation;
+
+/**
+ * Strips raw or incomplete inline `<mN>` / `</mN>` markup tags from live partial stream
+ * previews so raw tag syntax never flashes mid-sentence before final rich DOM commit.
+ */
+export function stripPartialInlineMarkers(raw: string): string {
+  if (!raw) return '';
+  return raw
+    .replace(/<\/?m\d+\b[^>]*\/?>/gi, '')
+    .replace(/<\/?m\d*[^>]*$/gi, '')
+    .replace(/<\/?$/g, '');
+}
+
+function buildBatchTailContext(
+  tasks: readonly PreparedBlockTask[],
+  maxChars = 220,
+): string {
+  if (tasks.length === 0 || maxChars <= 0) return '';
+  const tailTexts = tasks
+    .slice(-2)
+    .map((t) =>
+      stripResidualMarkers(t.tokenized.text).replace(/\s+/g, ' ').trim(),
+    )
+    .filter(Boolean);
+  if (tailTexts.length === 0) return '';
+  if (tailTexts.length === 1) {
+    return tailTexts[0].length > maxChars
+      ? tailTexts[0].slice(0, maxChars).trim()
+      : tailTexts[0];
+  }
+  const combined = `${tailTexts[0]} ${tailTexts[1]}`;
+  if (combined.length <= maxChars) {
+    return combined;
+  }
+  if (tailTexts[1].length >= maxChars - 24) {
+    return tailTexts[1].slice(0, maxChars).trim();
+  }
+  const budget0 = Math.max(0, maxChars - 1 - tailTexts[1].length);
+  const prefix0 = tailTexts[0].slice(0, budget0).trim();
+  return prefix0
+    ? `${prefix0} ${tailTexts[1]}`
+    : tailTexts[1].slice(0, maxChars).trim();
+}
+
+function nowFrameMs(): number {
+  if (
+    typeof performance !== 'undefined' &&
+    typeof performance.now === 'function'
+  ) {
+    return performance.now();
+  }
+  return Date.now();
+}
+
+interface QueuedViewportEntry {
+  scene: TranslationScene;
+  priority: RequestPriority;
+}
+
+interface InFlightP1BatchTracker {
+  controller: AbortController;
+  tasks: readonly PreparedBlockTask[];
+  hasReceivedAnyItem: boolean;
+  abortedByFastScroll: boolean;
+}
+
+interface SlotStreamState {
+  lastPaintAt: number;
+  pendingPartialText: string | null;
+  cancelScheduled: (() => void) | null;
+  streamContainer: HTMLSpanElement | null;
+  streamTextNode: Text | null;
+}
+
 function hashGlossaryFingerprint(entries: readonly GlossaryEntry[]): string {
   if (!entries || entries.length === 0) return '0';
   let h = 2166136261;
@@ -684,21 +850,28 @@ export class WebpageRenderer {
   private intersectionObserver: IntersectionObserver | null = null;
   private mutationObserver: MutationObserver | null = null;
   private fullscreenCleanup: (() => void) | null = null;
+  private scrollCleanup: (() => void) | null = null;
+  private scrollThrottleTimer: ReturnType<typeof setTimeout> | null = null;
+  private lastScrollCheckAt = 0;
 
   private observedBlocks = new WeakSet<HTMLElement>();
   private readonly inFlightBlocks = new WeakSet<HTMLElement>();
   private readonly inFlightBlockSet = new Set<HTMLElement>();
   private readonly translatedBlockSet = new Set<HTMLElement>();
   private readonly failedBlockTasks = new Map<HTMLElement, PreparedBlockTask>();
+  private readonly inFlightBlockPromises = new WeakMap<HTMLElement, Promise<void>>();
   private readonly mountedMeta = new WeakMap<HTMLElement, MountedBlockMeta>();
   private readonly unclampedStyles = new WeakMap<HTMLElement, SavedUnclampStyle>();
-  private readonly pendingViewportQueue = new Map<HTMLElement, TranslationScene>();
+  private readonly pendingViewportQueue = new Map<HTMLElement, QueuedViewportEntry>();
+  private readonly fallbackOffscreenBlocks = new Set<HTMLElement>();
+  private readonly inFlightP1Batches = new Set<InFlightP1BatchTracker>();
   private readonly ownedInjectedNodes = new Set<Element>();
   private readonly ownedOrigWrappers = new Set<Element>();
 
   private sessionTotalBlocks = 0;
   private sessionDoneBlocks = 0;
   private lastError: string | undefined;
+  private lastBatchTailContext = '';
 
   private statusHost: HTMLElement | null = null;
   private statusPillEl: HTMLElement | null = null;
@@ -725,7 +898,7 @@ export class WebpageRenderer {
         (typeof location !== 'undefined' ? location.href : ''));
     this.cache = options.cache ?? new LruTranslationCache(DEFAULT_LRU_CAPACITY);
     this.transport = options.transport ?? defaultBatchTransport;
-    this.flushDelayMs = options.flushDelayMs ?? 32;
+    this.flushDelayMs = options.flushDelayMs ?? 16;
     this.onManualStop = options.onManualStop;
 
     this.bindFullscreenListener();
@@ -741,6 +914,7 @@ export class WebpageRenderer {
 
   invalidatePageContextCache(): void {
     this.pageContextCache = null;
+    this.lastBatchTailContext = '';
   }
 
   get isMaskRevealed(): boolean {
@@ -853,7 +1027,10 @@ export class WebpageRenderer {
     return `${providerId}:${model}:${assistantId}:${this.config.sourceLang}->${this.config.targetLang}:${enableRichHtml ? '1' : '0'}:${glossaryFp}:${packsFp}:${tokenizedText}`;
   }
 
-  private getPageContext(scene: TranslationScene): PageContextPayload | undefined {
+  private getPageContext(
+    scene: TranslationScene,
+    prevContext?: string,
+  ): PageContextPayload | undefined {
     const currentUrl = this.getUrl();
     let domain = '';
     try {
@@ -869,31 +1046,45 @@ export class WebpageRenderer {
     );
     const provider = this.config.providers[providerId];
     if (provider && !provider.enableContext) {
-      if (!currentUrl && !domain) return undefined;
+      if (!currentUrl && !domain && !prevContext) return undefined;
       const styleGuide = inferDomainStyleGuide(domain, currentUrl);
+      const threadContext = extractFocalThreadContext(this.doc, currentUrl);
       return {
         url: currentUrl,
         domain,
         ...(styleGuide ? { styleGuide } : {}),
+        ...(threadContext ? { threadContext } : {}),
+        ...(prevContext ? { prevContext } : {}),
       };
     }
 
+    let basePayload: PageContextPayload;
     if (this.pageContextCache && this.pageContextCache.url === currentUrl) {
-      return this.pageContextCache.payload;
+      basePayload = this.pageContextCache.payload;
+      if (!basePayload.threadContext && currentUrl) {
+        const lateThread = extractFocalThreadContext(this.doc, currentUrl);
+        if (lateThread) {
+          basePayload = { ...basePayload, threadContext: lateThread };
+          this.pageContextCache = { url: currentUrl, payload: basePayload };
+        }
+      }
+    } else {
+      const extracted = extractPageContext(this.doc, currentUrl);
+      const resolvedUrl = currentUrl || extracted.url;
+      const resolvedDomain = domain || extracted.domain;
+      const styleGuide =
+        extracted.styleGuide ??
+        inferDomainStyleGuide(resolvedDomain, resolvedUrl);
+      basePayload = {
+        ...extracted,
+        url: resolvedUrl,
+        domain: resolvedDomain,
+        ...(styleGuide ? { styleGuide } : {}),
+      };
+      this.pageContextCache = { url: currentUrl, payload: basePayload };
     }
-    const extracted = extractPageContext(this.doc, currentUrl);
-    const resolvedUrl = currentUrl || extracted.url;
-    const resolvedDomain = domain || extracted.domain;
-    const styleGuide =
-      extracted.styleGuide ?? inferDomainStyleGuide(resolvedDomain, resolvedUrl);
-    const payload: PageContextPayload = {
-      ...extracted,
-      url: resolvedUrl,
-      domain: resolvedDomain,
-      ...(styleGuide ? { styleGuide } : {}),
-    };
-    this.pageContextCache = { url: currentUrl, payload };
-    return payload;
+
+    return prevContext ? { ...basePayload, prevContext } : basePayload;
   }
 
   private resolveBatchLimits(scene: TranslationScene): {
@@ -936,7 +1127,9 @@ export class WebpageRenderer {
       const child = blockEl.children[i];
       if (
         child.classList.contains('margin-trans-root') &&
-        child.getAttribute('data-margin-injected') === 'true'
+        child.getAttribute('data-margin-injected') === 'true' &&
+        child.getAttribute('data-margin-loading') !== '1' &&
+        child.getAttribute('data-margin-streaming') !== '1'
       ) {
         return true;
       }
@@ -1267,31 +1460,61 @@ export class WebpageRenderer {
     }
   }
 
-  private mountBlockLoadingIndicator(blockEl: HTMLElement): void {
+  private mountBlockLoadingIndicator(
+    blockEl: HTMLElement,
+    approxPlainLen?: number,
+  ): void {
     if (!blockEl.isConnected || this.hasMountedTranslation(blockEl)) return;
     for (let i = 0; i < blockEl.children.length; i++) {
-      if (blockEl.children[i].classList.contains('margin-trans-loading')) {
+      const ch = blockEl.children[i];
+      if (
+        ch.classList.contains('margin-trans-loading') ||
+        ch.getAttribute('data-margin-streaming') === '1'
+      ) {
         return;
       }
     }
 
+    const sourceLen =
+      approxPlainLen ??
+      (blockEl.textContent ?? '').replace(/\s+/g, ' ').trim().length;
+    const layout = this.computeLayoutMode(blockEl, sourceLen);
+
     this.ensureStylesInjected();
     this.runInternalDomMutation(() => {
       const loading = this.doc.createElement('span');
-      loading.className = 'margin-trans-loading';
+      loading.className = 'margin-trans-block margin-trans-loading';
       loading.setAttribute('data-margin-injected', 'true');
+      loading.setAttribute('data-margin-loading', '1');
+      loading.setAttribute(
+        'data-margin-layout',
+        layout === 'inline' ? 'inline' : 'block',
+      );
       loading.setAttribute('role', 'status');
+      loading.setAttribute('aria-busy', 'true');
+      loading.setAttribute(
+        'aria-label',
+        this.config.interfaceLang === 'en' ? 'Translating' : '正在翻译',
+      );
 
-      const spinner = this.doc.createElement('span');
-      spinner.className = 'margin-trans-spinner';
-      spinner.setAttribute('aria-hidden', 'true');
+      const line1 = this.doc.createElement('span');
+      line1.className = 'margin-shimmer-line';
+      line1.setAttribute('aria-hidden', 'true');
 
-      const label = this.doc.createElement('span');
-      label.className = 'margin-trans-loading-label';
-      label.textContent =
-        this.config.interfaceLang === 'en' ? 'Translating…' : '正在翻译…';
+      if (layout === 'inline') {
+        loading.appendChild(line1);
+      } else if (sourceLen < 80) {
+        line1.style.width = '58%';
+        loading.appendChild(line1);
+      } else {
+        line1.style.width = '88%';
+        const line2 = this.doc.createElement('span');
+        line2.className = 'margin-shimmer-line';
+        line2.setAttribute('aria-hidden', 'true');
+        line2.style.width = '54%';
+        loading.append(line1, line2);
+      }
 
-      loading.append(spinner, label);
       this.ownedInjectedNodes.add(loading);
       this.insertInjectedIntoBlock(blockEl, loading);
       this.unclampForInjectedNode(blockEl, loading);
@@ -1315,7 +1538,8 @@ export class WebpageRenderer {
       style.textContent = PAGE_STATUS_PILL_CSS;
 
       const pill = this.doc.createElement('div');
-      pill.className = 'status-pill';
+      pill.className = 'status-pill margin-status-pill';
+      pill.setAttribute('data-testid', 'margin-status-pill');
       pill.setAttribute('role', 'status');
       pill.setAttribute('aria-live', 'polite');
       pill.hidden = true;
@@ -1349,12 +1573,15 @@ export class WebpageRenderer {
             this.runInternalDomMutation(() => {
               for (const task of failed) {
                 this.clearBlockInjectedElements(task.block);
-                this.mountBlockLoadingIndicator(task.block);
+                this.mountBlockLoadingIndicator(
+                  task.block,
+                  task.tokenized.plainTextLength,
+                );
               }
             });
             this.sessionTotalBlocks += failed.length;
             this.refreshStatusPill();
-            void this.executeBatch(failed);
+            void this.executeBatch(failed, { priority: 0 });
           }
         }
       });
@@ -1396,6 +1623,7 @@ export class WebpageRenderer {
     this.clearStatusHideTimer();
     if (this.statusPillEl) {
       this.statusPillEl.hidden = true;
+      delete this.statusPillEl.dataset.quiet;
     }
     if (this.statusHost) {
       this.statusHost.hidden = true;
@@ -1428,8 +1656,12 @@ export class WebpageRenderer {
 
     if (inFlight > 0) {
       this.clearStatusHideTimer();
-      const total = Math.max(this.sessionTotalBlocks, this.sessionDoneBlocks + inFlight);
+      const total = Math.max(
+        this.sessionTotalBlocks,
+        this.sessionDoneBlocks + inFlight,
+      );
       this.statusPillEl.dataset.tone = 'progress';
+      delete this.statusPillEl.dataset.quiet;
       this.statusSpinnerEl.hidden = false;
       this.statusLabelEl.textContent = isEn
         ? `Margin · Translating (${this.sessionDoneBlocks}/${total})`
@@ -1456,6 +1688,7 @@ export class WebpageRenderer {
           ? `${this.lastError.slice(0, 36)}…`
           : this.lastError;
       this.statusPillEl.dataset.tone = 'error';
+      delete this.statusPillEl.dataset.quiet;
       this.statusSpinnerEl.hidden = true;
       this.statusLabelEl.textContent = isEn
         ? `Margin · Error: ${shortErr}`
@@ -1473,11 +1706,16 @@ export class WebpageRenderer {
     if (this.sessionDoneBlocks > 0) {
       this.clearStatusHideTimer();
       this.statusPillEl.dataset.tone = 'done';
+      this.statusPillEl.dataset.quiet = 'true';
       this.statusSpinnerEl.hidden = true;
-      this.statusLabelEl.textContent = isEn ? '✓ Translation complete' : '✓ 翻译完成';
+      this.statusLabelEl.textContent = isEn
+        ? `✓ Translated ${this.sessionDoneBlocks}`
+        : `✓ 已译 ${this.sessionDoneBlocks} 段`;
       this.statusHintEl.hidden = effectiveTheme !== 'mask';
       if (effectiveTheme === 'mask') {
-        this.statusHintEl.textContent = isEn ? '(Hover to reveal)' : '(悬停查看遮罩)';
+        this.statusHintEl.textContent = isEn
+          ? '(Hover to reveal)'
+          : '(悬停查看遮罩)';
       }
       this.statusActionBtn.hidden = true;
       this.statusCloseBtn.hidden = true;
@@ -1486,7 +1724,7 @@ export class WebpageRenderer {
       this.statusHideTimer = setTimeout(() => {
         this.statusHideTimer = null;
         this.hideStatusPill();
-      }, 1200);
+      }, 1400);
       return;
     }
 
@@ -1619,7 +1857,7 @@ export class WebpageRenderer {
       }
 
       const span = this.doc.createElement('span');
-      span.className = 'margin-trans-root';
+      span.className = 'margin-trans-root margin-trans-block';
       span.setAttribute('data-margin-injected', 'true');
       span.setAttribute('data-margin-theme', theme);
       span.setAttribute('data-margin-layout', layout);
@@ -1661,7 +1899,7 @@ export class WebpageRenderer {
   private mountBatchRetryButtons(
     batchTasks: readonly PreparedBlockTask[],
     errorMessage: string,
-    options: { forceBilingual?: boolean } = {},
+    options: { forceBilingual?: boolean; priority?: RequestPriority } = {},
   ): void {
     this.ensureStylesInjected();
     if (errorMessage) {
@@ -1674,12 +1912,15 @@ export class WebpageRenderer {
           for (const t of batchTasks) {
             this.failedBlockTasks.delete(t.block);
             this.clearBlockInjectedElements(t.block);
-            this.mountBlockLoadingIndicator(t.block);
+            this.mountBlockLoadingIndicator(
+              t.block,
+              t.tokenized.plainTextLength,
+            );
           }
         });
         this.sessionTotalBlocks += batchTasks.length;
         this.refreshStatusPill();
-        void this.executeBatch(batchTasks, options);
+        void this.executeBatch(batchTasks, { ...options, priority: 0 });
       };
 
       for (const task of batchTasks) {
@@ -1730,21 +1971,62 @@ export class WebpageRenderer {
     };
   }
 
-  private async executeBatch(
+  private executeBatch(
     batchTasks: readonly PreparedBlockTask[],
-    options: { forceBilingual?: boolean } = {},
+    options: { forceBilingual?: boolean; priority?: RequestPriority } = {},
+  ): Promise<void> {
+    if (batchTasks.length === 0) return Promise.resolve();
+
+    let runPromise!: Promise<void>;
+    runPromise = this.executeBatchInternal(
+      batchTasks,
+      options,
+      (p) => {
+        for (const task of batchTasks) {
+          this.inFlightBlockPromises.set(task.block, p);
+        }
+      },
+    );
+    for (const task of batchTasks) {
+      if (this.inFlightBlocks.has(task.block)) {
+        this.inFlightBlockPromises.set(task.block, runPromise);
+      }
+    }
+    return runPromise;
+  }
+
+  private async executeBatchInternal(
+    batchTasks: readonly PreparedBlockTask[],
+    options: { forceBilingual?: boolean; priority?: RequestPriority } = {},
+    _onRegistered?: (p: Promise<void>) => void,
   ): Promise<void> {
     if (batchTasks.length === 0) return;
 
     const scene = batchTasks[0].scene;
+    const resolvedPriority: RequestPriority =
+      options.priority ?? (scene === 'hover' ? -1 : 0);
     const { preferStream, providerId } = this.resolveBatchLimits(scene);
     const abortController = new AbortController();
     this.activeControllers.add(abortController);
 
+    let p1Tracker: InFlightP1BatchTracker | null = null;
+    if (scene === 'webpage' && resolvedPriority === 1) {
+      p1Tracker = {
+        controller: abortController,
+        tasks: batchTasks,
+        hasReceivedAnyItem: false,
+        abortedByFastScroll: false,
+      };
+      this.inFlightP1Batches.add(p1Tracker);
+    }
+
     for (const task of batchTasks) {
       this.inFlightBlocks.add(task.block);
       this.inFlightBlockSet.add(task.block);
-      this.mountBlockLoadingIndicator(task.block);
+      this.mountBlockLoadingIndicator(
+        task.block,
+        task.tokenized.plainTextLength,
+      );
     }
     if (scene === 'webpage') {
       this.refreshStatusPill();
@@ -1752,6 +2034,16 @@ export class WebpageRenderer {
 
     const slotMap = new Map<number, PreparedBlockTask>();
     const renderedTransBySlot = new Map<number, string>();
+    const slotStreams = new Map<number, SlotStreamState>();
+    const maskBoundContainers = new WeakSet<Element>();
+
+    const cancelPendingSlotRafs = () => {
+      for (const st of slotStreams.values()) {
+        st.cancelScheduled?.();
+        st.cancelScheduled = null;
+        st.pendingPartialText = null;
+      }
+    };
 
     const requestItems = batchTasks.map((task, idx) => {
       const id = idx + 1;
@@ -1763,20 +2055,229 @@ export class WebpageRenderer {
       };
     });
 
+    const prevContext =
+      scene === 'webpage' && this.lastBatchTailContext
+        ? this.lastBatchTailContext
+        : undefined;
+    const context = this.getPageContext(scene, prevContext);
+    if (scene === 'webpage') {
+      const nextTail = buildBatchTailContext(batchTasks);
+      if (nextTail) {
+        this.lastBatchTailContext = nextTail;
+      }
+    }
+
     const payload: TranslateBatchRequest = {
       requestId: nextRequestId(scene),
       scene,
+      priority: resolvedPriority,
       providerId,
       fromLang: this.config.sourceLang,
       toLang: this.config.targetLang,
       items: requestItems,
-      context: this.getPageContext(scene),
+      context,
     };
 
     const staleMidFlightBlocks = new Set<HTMLElement>();
 
-    const applyOutputItem = (item: BatchItemOutput) => {
+    const scheduleNextFrame = (cb: () => void): (() => void) => {
+      const win = this.doc.defaultView;
+      const raf =
+        win?.requestAnimationFrame?.bind(win) ??
+        (typeof requestAnimationFrame === 'function'
+          ? requestAnimationFrame
+          : null);
+      const caf =
+        win?.cancelAnimationFrame?.bind(win) ??
+        (typeof cancelAnimationFrame === 'function'
+          ? cancelAnimationFrame
+          : null);
+      if (raf) {
+        const handle = raf(cb);
+        return () => {
+          caf?.(handle);
+        };
+      }
+      const timer = setTimeout(cb, 16);
+      return () => {
+        clearTimeout(timer);
+      };
+    };
+
+    const paintPartialSlot = (
+      slotId: number,
+      task: PreparedBlockTask,
+      slotState: SlotStreamState,
+      previewText: string,
+    ): void => {
+      if (
+        abortController.signal.aborted ||
+        renderedTransBySlot.has(slotId) ||
+        !task.block.isConnected
+      ) {
+        return;
+      }
+
+      if (
+        slotState.streamTextNode &&
+        slotState.streamContainer &&
+        slotState.streamContainer.isConnected
+      ) {
+        if (slotState.streamTextNode.nodeValue !== previewText) {
+          this.runInternalDomMutation(() => {
+            slotState.streamTextNode!.textContent = previewText;
+          });
+        }
+        return;
+      }
+
+      this.ensureStylesInjected();
+      const displayMode: DisplayMode = options.forceBilingual
+        ? 'bilingual'
+        : this.config.webpage.displayMode;
+      const theme = this.resolveEffectiveTheme();
+      const layout = this.computeLayoutMode(
+        task.block,
+        task.tokenized.plainTextLength,
+        displayMode,
+      );
+
+      this.runInternalDomMutation(() => {
+        if (displayMode === 'target-only') {
+          this.wrapOriginalContentForTargetOnly(task.block);
+        } else {
+          this.unwrapOriginalContent(task.block);
+        }
+
+        let container: HTMLSpanElement | null = null;
+        for (let i = 0; i < task.block.children.length; i++) {
+          const ch = task.block.children[i];
+          if (
+            ch instanceof HTMLSpanElement &&
+            ch.getAttribute('data-margin-injected') === 'true' &&
+            ch.classList.contains('margin-trans-block')
+          ) {
+            container = ch;
+            break;
+          }
+        }
+
+        const isNewContainer = container === null;
+        if (!container) {
+          container = this.doc.createElement('span');
+        }
+
+        container.className = 'margin-trans-root margin-trans-block';
+        container.removeAttribute('data-margin-loading');
+        container.removeAttribute('aria-busy');
+        container.removeAttribute('role');
+        container.removeAttribute('aria-label');
+        container.style.cssText = '';
+        container.setAttribute('data-margin-injected', 'true');
+        container.setAttribute('data-margin-streaming', '1');
+        container.setAttribute('data-margin-theme', theme);
+        container.setAttribute('data-margin-layout', layout);
+
+        const textNode = this.doc.createTextNode(previewText);
+        container.replaceChildren(textNode);
+
+        if (!maskBoundContainers.has(container)) {
+          maskBoundContainers.add(container);
+          container.addEventListener('click', (ev) => {
+            if (container!.getAttribute('data-margin-theme') !== 'mask') return;
+            const target = ev.target as Element | null;
+            if (target?.closest?.('a')) return;
+            const currentlyUnmasked =
+              container!.getAttribute('data-margin-item-unmasked') === 'true';
+            if (currentlyUnmasked) {
+              container!.removeAttribute('data-margin-item-unmasked');
+            } else {
+              container!.setAttribute('data-margin-item-unmasked', 'true');
+            }
+          });
+        }
+
+        this.ownedInjectedNodes.add(container);
+        if (isNewContainer) {
+          this.insertInjectedIntoBlock(task.block, container);
+        }
+        this.unclampForInjectedNode(task.block, container);
+        slotState.streamContainer = container;
+        slotState.streamTextNode = textNode;
+      });
+    };
+
+    const handlePartialOutputItem = (item: BatchItemOutput): void => {
+      if (p1Tracker) {
+        p1Tracker.hasReceivedAnyItem = true;
+      }
       if (abortController.signal.aborted) return;
+      if (renderedTransBySlot.has(item.id)) return;
+      const task = slotMap.get(item.id);
+      if (!task || !task.block.isConnected) return;
+      if (typeof item.trans !== 'string') return;
+
+      const previewText = stripPartialInlineMarkers(item.trans);
+      if (!previewText.trim()) return;
+
+      let slotState = slotStreams.get(item.id);
+      if (!slotState) {
+        slotState = {
+          lastPaintAt: 0,
+          pendingPartialText: null,
+          cancelScheduled: null,
+          streamContainer: null,
+          streamTextNode: null,
+        };
+        slotStreams.set(item.id, slotState);
+      }
+
+      const now = nowFrameMs();
+      if (slotState.lastPaintAt === 0 || now - slotState.lastPaintAt >= 16) {
+        slotState.cancelScheduled?.();
+        slotState.cancelScheduled = null;
+        slotState.pendingPartialText = null;
+        paintPartialSlot(item.id, task, slotState, previewText);
+        slotState.lastPaintAt = now;
+        return;
+      }
+
+      slotState.pendingPartialText = previewText;
+      if (!slotState.cancelScheduled) {
+        slotState.cancelScheduled = scheduleNextFrame(() => {
+          if (!slotState) return;
+          slotState.cancelScheduled = null;
+          const latest = slotState.pendingPartialText;
+          slotState.pendingPartialText = null;
+          if (
+            latest !== null &&
+            !abortController.signal.aborted &&
+            !renderedTransBySlot.has(item.id)
+          ) {
+            paintPartialSlot(item.id, task, slotState, latest);
+            slotState.lastPaintAt = nowFrameMs();
+          }
+        });
+      }
+    };
+
+    const applyOutputItem = (item: BatchItemOutput) => {
+      if (p1Tracker) {
+        p1Tracker.hasReceivedAnyItem = true;
+      }
+      if (abortController.signal.aborted) return;
+      if (item.partial) {
+        handlePartialOutputItem(item);
+        return;
+      }
+
+      const slotState = slotStreams.get(item.id);
+      if (slotState) {
+        slotState.cancelScheduled?.();
+        slotState.cancelScheduled = null;
+        slotState.pendingPartialText = null;
+      }
+
       const task = slotMap.get(item.id);
       if (!task) return;
       if (typeof item.trans !== 'string' || !item.trans.trim()) return;
@@ -1852,6 +2353,11 @@ export class WebpageRenderer {
       const response = await this.transport(
         payload,
         {
+          onDelta: () => {
+            if (p1Tracker) {
+              p1Tracker.hasReceivedAnyItem = true;
+            }
+          },
           onItemReady: (item) => {
             applyOutputItem(item);
           },
@@ -1863,6 +2369,7 @@ export class WebpageRenderer {
       if (abortController.signal.aborted) return;
 
       if (!response.ok) {
+        cancelPendingSlotRafs();
         const unrendered = batchTasks.filter(
           (_, idx) => !renderedTransBySlot.has(idx + 1),
         );
@@ -1889,7 +2396,11 @@ export class WebpageRenderer {
         );
       }
     } catch (err) {
+      cancelPendingSlotRafs();
       if (abortController.signal.aborted) {
+        if (p1Tracker?.abortedByFastScroll) {
+          return;
+        }
         this.runInternalDomMutation(() => {
           for (const task of batchTasks) {
             if (
@@ -1913,10 +2424,15 @@ export class WebpageRenderer {
       );
       this.mountBatchRetryButtons(unrendered, msg, options);
     } finally {
+      cancelPendingSlotRafs();
       this.activeControllers.delete(abortController);
+      if (p1Tracker) {
+        this.inFlightP1Batches.delete(p1Tracker);
+      }
       for (const task of batchTasks) {
         this.inFlightBlocks.delete(task.block);
         this.inFlightBlockSet.delete(task.block);
+        this.inFlightBlockPromises.delete(task.block);
       }
       if (scene === 'webpage') {
         this.refreshStatusPill();
@@ -1927,51 +2443,84 @@ export class WebpageRenderer {
     }
   }
 
-  private sortMissesByViewportPriority(
-    misses: PreparedBlockTask[],
-  ): PreparedBlockTask[] {
-    if (misses.length <= 3) return misses;
-    const win = this.doc.defaultView;
-    const vh = win?.innerHeight || 900;
+  private getViewportHeight(): number {
+    const win =
+      this.doc.defaultView ?? (typeof window !== 'undefined' ? window : null);
+    return win?.innerHeight || this.doc.documentElement?.clientHeight || 800;
+  }
 
-    const strictlyVisible: PreparedBlockTask[] = [];
-    const nearViewport: PreparedBlockTask[] = [];
-
-    for (const item of misses) {
-      try {
-        const rect = item.block.getBoundingClientRect();
-        if (rect.height > 0 && rect.bottom > 0 && rect.top < vh) {
-          strictlyVisible.push(item);
-        } else {
-          nearViewport.push(item);
-        }
-      } catch {
-        strictlyVisible.push(item);
+  private classifyBlockViewportState(block: HTMLElement): {
+    isStrictlyVisible: boolean;
+    isWithinLookahead: boolean;
+    shouldEvictQueued: boolean;
+    shouldEvictInFlightP1: boolean;
+  } {
+    const vh = this.getViewportHeight();
+    try {
+      const rect = block.getBoundingClientRect();
+      const isZeroLayoutRect =
+        rect.top === 0 &&
+        rect.bottom === 0 &&
+        rect.left === 0 &&
+        rect.right === 0 &&
+        rect.width === 0 &&
+        rect.height === 0;
+      if (isZeroLayoutRect) {
+        return {
+          isStrictlyVisible: true,
+          isWithinLookahead: true,
+          shouldEvictQueued: false,
+          shouldEvictInFlightP1: false,
+        };
       }
+      const isStrictlyVisible = rect.bottom > 0 && rect.top < vh;
+      const isWithinLookahead =
+        !isStrictlyVisible && rect.bottom >= -300 && rect.top <= vh + 2200;
+      const shouldEvictQueued = rect.bottom < -600 || rect.top > vh + 2600;
+      const shouldEvictInFlightP1 =
+        rect.bottom < -1200 || rect.top > vh + 3000;
+      return {
+        isStrictlyVisible,
+        isWithinLookahead,
+        shouldEvictQueued,
+        shouldEvictInFlightP1,
+      };
+    } catch {
+      return {
+        isStrictlyVisible: true,
+        isWithinLookahead: true,
+        shouldEvictQueued: false,
+        shouldEvictInFlightP1: false,
+      };
     }
-
-    return strictlyVisible.length > 0
-      ? [...strictlyVisible, ...nearViewport]
-      : misses;
   }
 
   /**
    * Translates an explicit list of paragraph blocks immediately (checking LRU cache first,
-   * then packing misses into progressive wave micro-batches).
+   * then packing misses into priority-tiered progressive micro-batches).
    */
   async translateBlocks(
     blocks: readonly HTMLElement[],
     scene: TranslationScene = 'webpage',
-    options: { forceBilingual?: boolean } = {},
+    options: { forceBilingual?: boolean; fullPage?: boolean } = {},
   ): Promise<void> {
     const misses: PreparedBlockTask[] = [];
+    const existingPromises = new Set<Promise<void>>();
 
     for (const block of blocks) {
       if (!block.isConnected) continue;
       if (scene === 'webpage') {
+        this.pendingViewportQueue.delete(block);
         this.syncStaleBlockBeforeRegister(block, false);
       }
-      if (this.hasMountedTranslation(block) || this.inFlightBlocks.has(block)) {
+      if (this.hasMountedTranslation(block)) {
+        continue;
+      }
+      if (this.inFlightBlocks.has(block)) {
+        const inFlightPromise = this.inFlightBlockPromises.get(block);
+        if (inFlightPromise) {
+          existingPromises.add(inFlightPromise);
+        }
         continue;
       }
 
@@ -1996,32 +2545,77 @@ export class WebpageRenderer {
       if (scene === 'webpage') {
         this.refreshStatusPill();
       }
+      if (existingPromises.size > 0) {
+        await Promise.all(existingPromises);
+      }
       return;
-    }
-
-    const prioritized =
-      scene === 'webpage' ? this.sortMissesByViewportPriority(misses) : misses;
-
-    for (const m of prioritized) {
-      this.mountBlockLoadingIndicator(m.block);
-    }
-
-    if (scene === 'webpage') {
-      this.sessionTotalBlocks += prioritized.length;
-      this.refreshStatusPill();
     }
 
     const { maxBatchCount, maxCharsPerBatch, useProgressiveWaves } =
       this.resolveBatchLimits(scene);
-    const batches = packIntoProgressiveBatches(
-      prioritized,
-      maxBatchCount,
-      maxCharsPerBatch,
-      scene === 'webpage' && useProgressiveWaves,
-    );
-    await Promise.all(
-      batches.map((batch) => this.executeBatch(batch, options)),
-    );
+
+    if (scene !== 'webpage') {
+      const hoverPriority: RequestPriority = scene === 'hover' ? -1 : 0;
+      for (const m of misses) {
+        this.mountBlockLoadingIndicator(
+          m.block,
+          m.tokenized.plainTextLength,
+        );
+      }
+      const batches = packIntoBatches(misses, maxBatchCount, maxCharsPerBatch);
+      await Promise.all([
+        ...existingPromises,
+        ...batches.map((batch) =>
+          this.executeBatch(batch, { ...options, priority: hoverPriority }),
+        ),
+      ]);
+      return;
+    }
+
+    const p0Misses: PreparedBlockTask[] = [];
+    const offscreenMisses: PreparedBlockTask[] = [];
+
+    for (const item of misses) {
+      const state = this.classifyBlockViewportState(item.block);
+      if (state.isStrictlyVisible) {
+        p0Misses.push(item);
+      } else {
+        offscreenMisses.push(item);
+      }
+    }
+
+    const allOrdered = [...p0Misses, ...offscreenMisses];
+    for (const m of allOrdered) {
+      this.mountBlockLoadingIndicator(m.block, m.tokenized.plainTextLength);
+    }
+
+    this.sessionTotalBlocks += allOrdered.length;
+    this.refreshStatusPill();
+
+    const p0Batches =
+      p0Misses.length > 0
+        ? packIntoProgressiveBatches(
+            p0Misses,
+            maxBatchCount,
+            maxCharsPerBatch,
+            useProgressiveWaves,
+          )
+        : [];
+    const offscreenPriority: RequestPriority = options.fullPage ? 2 : 1;
+    const offscreenBatches =
+      offscreenMisses.length > 0
+        ? packIntoBatches(offscreenMisses, maxBatchCount, maxCharsPerBatch)
+        : [];
+
+    await Promise.all([
+      ...existingPromises,
+      ...p0Batches.map((batch) =>
+        this.executeBatch(batch, { ...options, priority: 0 }),
+      ),
+      ...offscreenBatches.map((batch) =>
+        this.executeBatch(batch, { ...options, priority: offscreenPriority }),
+      ),
+    ]);
   }
 
   /**
@@ -2039,16 +2633,131 @@ export class WebpageRenderer {
     return this.hasMountedTranslation(block);
   }
 
+  private observeOffscreenBlock(block: HTMLElement): void {
+    const io = this.ensureIntersectionObserver();
+    if (io) {
+      this.observedBlocks.add(block);
+      io.observe(block);
+    } else {
+      this.observedBlocks.add(block);
+      this.fallbackOffscreenBlocks.add(block);
+    }
+  }
+
+  private flushViewportQueue(): void {
+    if (!this.active || this.pendingViewportQueue.size === 0) return;
+    const entries = Array.from(this.pendingViewportQueue.entries());
+    this.pendingViewportQueue.clear();
+
+    const p0Tasks: PreparedBlockTask[] = [];
+    const p1Tasks: PreparedBlockTask[] = [];
+    const evictedBlocks: HTMLElement[] = [];
+
+    for (const [block, meta] of entries) {
+      if (!block.isConnected) {
+        this.observedBlocks.delete(block);
+        continue;
+      }
+      this.syncStaleBlockBeforeRegister(block, false);
+      if (
+        this.hasMountedTranslation(block) ||
+        this.inFlightBlocks.has(block) ||
+        this.failedBlockTasks.has(block)
+      ) {
+        continue;
+      }
+
+      const vpState = this.classifyBlockViewportState(block);
+      if (vpState.shouldEvictQueued) {
+        evictedBlocks.push(block);
+        continue;
+      }
+
+      const prepared = this.prepareBlockTask(block, meta.scene);
+      if (!prepared) {
+        evictedBlocks.push(block);
+        continue;
+      }
+
+      const cached = this.cache.get(prepared.cacheKey);
+      if (cached) {
+        this.mountBlockTranslation(block, prepared.tokenized, cached.trans);
+        continue;
+      }
+
+      if (vpState.isStrictlyVisible) {
+        p0Tasks.push(prepared);
+      } else {
+        p1Tasks.push(prepared);
+      }
+    }
+
+    if (evictedBlocks.length > 0) {
+      this.runInternalDomMutation(() => {
+        for (const block of evictedBlocks) {
+          if (!this.hasMountedTranslation(block)) {
+            this.clearBlockInjectedElements(block);
+            this.restoreUnclampedForBlock(block);
+          }
+          this.observedBlocks.delete(block);
+          if (block.isConnected) {
+            this.observeOffscreenBlock(block);
+          }
+        }
+      });
+    }
+
+    if (p0Tasks.length === 0 && p1Tasks.length === 0) {
+      this.refreshStatusPill();
+      return;
+    }
+
+    const { maxBatchCount, maxCharsPerBatch, useProgressiveWaves } =
+      this.resolveBatchLimits('webpage');
+
+    for (const task of p0Tasks) {
+      this.mountBlockLoadingIndicator(
+        task.block,
+        task.tokenized.plainTextLength,
+      );
+    }
+    for (const task of p1Tasks) {
+      this.mountBlockLoadingIndicator(
+        task.block,
+        task.tokenized.plainTextLength,
+      );
+    }
+
+    this.sessionTotalBlocks += p0Tasks.length + p1Tasks.length;
+    this.refreshStatusPill();
+
+    const p0Batches =
+      p0Tasks.length > 0
+        ? packIntoProgressiveBatches(
+            p0Tasks,
+            maxBatchCount,
+            maxCharsPerBatch,
+            useProgressiveWaves,
+          )
+        : [];
+    const p1Batches =
+      p1Tasks.length > 0
+        ? packIntoBatches(p1Tasks, maxBatchCount, maxCharsPerBatch)
+        : [];
+
+    for (const batch of p0Batches) {
+      void this.executeBatch(batch, { priority: 0 });
+    }
+    for (const batch of p1Batches) {
+      void this.executeBatch(batch, { priority: 1 });
+    }
+  }
+
   private scheduleFlushViewportQueue(): void {
     if (this.flushTimer !== null) return;
     this.flushTimer = setTimeout(() => {
       this.flushTimer = null;
-      if (!this.active || this.pendingViewportQueue.size === 0) return;
-      const entries = Array.from(this.pendingViewportQueue.entries());
-      this.pendingViewportQueue.clear();
-      const blocks = entries.map(([blk]) => blk);
-      const scene = entries[0][1];
-      void this.translateBlocks(blocks, scene);
+      this.flushViewportQueue();
     }, this.flushDelayMs);
   }
 
@@ -2069,7 +2778,12 @@ export class WebpageRenderer {
             !this.inFlightBlocks.has(target) &&
             !this.failedBlockTasks.has(target)
           ) {
-            this.pendingViewportQueue.set(target, 'webpage');
+            const vpState = this.classifyBlockViewportState(target);
+            const tier: RequestPriority = vpState.isStrictlyVisible ? 0 : 1;
+            this.pendingViewportQueue.set(target, {
+              scene: 'webpage',
+              priority: tier,
+            });
             this.mountBlockLoadingIndicator(target);
             added = true;
           }
@@ -2088,17 +2802,117 @@ export class WebpageRenderer {
     return this.intersectionObserver;
   }
 
-  private isImmediatelyInOrNearViewport(block: HTMLElement): boolean {
+  private evictFarScrolledInFlightP1Batches(): void {
+    if (!this.active) return;
+
+    if (this.fallbackOffscreenBlocks.size > 0) {
+      const newlyReachable: HTMLElement[] = [];
+      for (const blk of Array.from(this.fallbackOffscreenBlocks)) {
+        if (!blk.isConnected) {
+          this.fallbackOffscreenBlocks.delete(blk);
+          this.observedBlocks.delete(blk);
+          continue;
+        }
+        const st = this.classifyBlockViewportState(blk);
+        if (st.isStrictlyVisible || st.isWithinLookahead) {
+          this.fallbackOffscreenBlocks.delete(blk);
+          this.observedBlocks.delete(blk);
+          newlyReachable.push(blk);
+        }
+      }
+      if (newlyReachable.length > 0) {
+        this.registerBlocksForViewport(newlyReachable);
+      }
+    }
+
+    if (this.inFlightP1Batches.size === 0) return;
+
+    let didEvictAny = false;
+    for (const tracker of Array.from(this.inFlightP1Batches)) {
+      if (tracker.hasReceivedAnyItem || tracker.controller.signal.aborted) {
+        continue;
+      }
+      const connectedTasks = tracker.tasks.filter((t) => t.block.isConnected);
+      if (connectedTasks.length === 0) continue;
+
+      const allFarAway = connectedTasks.every(
+        (t) => this.classifyBlockViewportState(t.block).shouldEvictInFlightP1,
+      );
+      if (!allFarAway) continue;
+
+      tracker.abortedByFastScroll = true;
+      this.inFlightP1Batches.delete(tracker);
+      this.sessionTotalBlocks = Math.max(
+        this.sessionDoneBlocks,
+        this.sessionTotalBlocks - tracker.tasks.length,
+      );
+
+      this.runInternalDomMutation(() => {
+        for (const task of tracker.tasks) {
+          this.inFlightBlocks.delete(task.block);
+          this.inFlightBlockSet.delete(task.block);
+          this.inFlightBlockPromises.delete(task.block);
+          this.observedBlocks.delete(task.block);
+          if (!this.hasMountedTranslation(task.block)) {
+            this.clearBlockInjectedElements(task.block);
+            this.restoreUnclampedForBlock(task.block);
+          }
+          if (task.block.isConnected && !this.hasMountedTranslation(task.block)) {
+            this.observeOffscreenBlock(task.block);
+          }
+        }
+      });
+
+      tracker.controller.abort();
+      didEvictAny = true;
+    }
+
+    if (didEvictAny) {
+      this.refreshStatusPill();
+    }
+  }
+
+  private ensureScrollEvictionListener(): void {
+    if (this.scrollCleanup) return;
     const win =
       this.doc.defaultView ?? (typeof window !== 'undefined' ? window : null);
-    const vh =
-      win?.innerHeight || this.doc.documentElement?.clientHeight || 800;
-    try {
-      const rect = block.getBoundingClientRect();
-      return rect.bottom >= -180 && rect.top <= vh + 260;
-    } catch {
-      return true;
-    }
+    if (!win) return;
+
+    const onScroll = () => {
+      if (!this.active) return;
+      const now = Date.now();
+      const elapsed =
+        this.lastScrollCheckAt === 0
+          ? Number.POSITIVE_INFINITY
+          : now - this.lastScrollCheckAt;
+
+      if (elapsed >= SCROLL_EVICTION_THROTTLE_MS && this.scrollThrottleTimer === null) {
+        this.lastScrollCheckAt = now;
+        this.evictFarScrolledInFlightP1Batches();
+        return;
+      }
+
+      if (this.scrollThrottleTimer !== null) return;
+      const waitMs = Math.max(
+        1,
+        SCROLL_EVICTION_THROTTLE_MS - Math.max(0, elapsed),
+      );
+      this.scrollThrottleTimer = setTimeout(() => {
+        this.scrollThrottleTimer = null;
+        this.lastScrollCheckAt = Date.now();
+        this.evictFarScrolledInFlightP1Batches();
+      }, waitMs);
+    };
+
+    win.addEventListener('scroll', onScroll, { passive: true });
+    this.scrollCleanup = () => {
+      win.removeEventListener('scroll', onScroll);
+      if (this.scrollThrottleTimer !== null) {
+        clearTimeout(this.scrollThrottleTimer);
+        this.scrollThrottleTimer = null;
+      }
+      this.lastScrollCheckAt = 0;
+    };
   }
 
   private syncStaleBlockBeforeRegister(
@@ -2112,6 +2926,7 @@ export class WebpageRenderer {
       if (!currentSource || currentSource !== prevSource) {
         this.removeBlockTranslation(block);
         this.observedBlocks.delete(block);
+        this.fallbackOffscreenBlocks.delete(block);
         this.intersectionObserver?.unobserve(block);
         this.failedBlockTasks.delete(block);
       }
@@ -2124,6 +2939,7 @@ export class WebpageRenderer {
     ) {
       this.removeBlockTranslation(block);
       this.observedBlocks.delete(block);
+      this.fallbackOffscreenBlocks.delete(block);
       this.intersectionObserver?.unobserve(block);
     }
 
@@ -2134,6 +2950,7 @@ export class WebpageRenderer {
       if (!currentSource || currentSource !== failedTask.tokenized.text.trim()) {
         this.failedBlockTasks.delete(block);
         this.observedBlocks.delete(block);
+        this.fallbackOffscreenBlocks.delete(block);
         this.intersectionObserver?.unobserve(block);
         this.runInternalDomMutation(() => {
           this.clearBlockInjectedElements(block);
@@ -2150,6 +2967,7 @@ export class WebpageRenderer {
       this.observedBlocks.has(block)
     ) {
       this.observedBlocks.delete(block);
+      this.fallbackOffscreenBlocks.delete(block);
       this.intersectionObserver?.unobserve(block);
     }
   }
@@ -2159,7 +2977,8 @@ export class WebpageRenderer {
     options: { fromSpaRescan?: boolean } = {},
   ): void {
     const missesForObserver: HTMLElement[] = [];
-    let queuedImmediate = false;
+    const candidateP0: PreparedBlockTask[] = [];
+    const candidateP1: PreparedBlockTask[] = [];
     const fromSpaRescan = Boolean(options.fromSpaRescan);
 
     for (const block of blocks) {
@@ -2181,32 +3000,97 @@ export class WebpageRenderer {
         continue;
       }
 
-      if (this.isImmediatelyInOrNearViewport(block)) {
+      const vpState = this.classifyBlockViewportState(block);
+      if (vpState.isStrictlyVisible) {
         this.observedBlocks.add(block);
-        this.pendingViewportQueue.set(block, 'webpage');
-        this.mountBlockLoadingIndicator(block);
-        queuedImmediate = true;
+        candidateP0.push(prepared);
+      } else if (vpState.isWithinLookahead) {
+        this.observedBlocks.add(block);
+        candidateP1.push(prepared);
       } else {
         missesForObserver.push(block);
       }
     }
 
-    if (queuedImmediate) {
+    const canFireHeroWave =
+      this.translatedBlockSet.size === 0 &&
+      this.inFlightBlockSet.size === 0 &&
+      this.pendingViewportQueue.size === 0 &&
+      candidateP0.length > 0;
+
+    let p0StartIdx = 0;
+    if (canFireHeroWave) {
+      const { maxBatchCount, maxCharsPerBatch } =
+        this.resolveBatchLimits('webpage');
+      const heroMaxBlocks = Math.min(
+        HERO_WAVE_MAX_BLOCKS,
+        Math.max(1, maxBatchCount),
+      );
+      const heroMaxChars = Math.min(
+        HERO_WAVE_MAX_CHARS,
+        Math.max(64, maxCharsPerBatch),
+      );
+      const heroWaveTasks: PreparedBlockTask[] = [];
+      let heroChars = 0;
+
+      while (
+        p0StartIdx < candidateP0.length &&
+        heroWaveTasks.length < heroMaxBlocks
+      ) {
+        const nextTask = candidateP0[p0StartIdx];
+        if (heroChars + nextTask.charCount > heroMaxChars) {
+          break;
+        }
+        heroWaveTasks.push(nextTask);
+        heroChars += nextTask.charCount;
+        p0StartIdx += 1;
+      }
+
+      if (heroWaveTasks.length > 0) {
+        for (const task of heroWaveTasks) {
+          this.mountBlockLoadingIndicator(
+            task.block,
+            task.tokenized.plainTextLength,
+          );
+        }
+        this.sessionTotalBlocks += heroWaveTasks.length;
+        this.refreshStatusPill();
+        void this.executeBatch(heroWaveTasks, { priority: 0 });
+      }
+    }
+
+    let queuedDeferred = false;
+    for (let i = p0StartIdx; i < candidateP0.length; i++) {
+      const task = candidateP0[i];
+      this.pendingViewportQueue.set(task.block, {
+        scene: 'webpage',
+        priority: 0,
+      });
+      this.mountBlockLoadingIndicator(
+        task.block,
+        task.tokenized.plainTextLength,
+      );
+      queuedDeferred = true;
+    }
+    for (const task of candidateP1) {
+      this.pendingViewportQueue.set(task.block, {
+        scene: 'webpage',
+        priority: 1,
+      });
+      this.mountBlockLoadingIndicator(
+        task.block,
+        task.tokenized.plainTextLength,
+      );
+      queuedDeferred = true;
+    }
+
+    if (queuedDeferred) {
       this.refreshStatusPill();
       this.scheduleFlushViewportQueue();
     }
 
-    if (missesForObserver.length === 0) return;
-
-    const io = this.ensureIntersectionObserver();
-    if (!io) {
-      void this.translateBlocks(missesForObserver, 'webpage');
-      return;
-    }
-
     for (const block of missesForObserver) {
-      this.observedBlocks.add(block);
-      io.observe(block);
+      this.observeOffscreenBlock(block);
     }
   }
 
@@ -2238,6 +3122,7 @@ export class WebpageRenderer {
   }
 
   private scanAndRegisterSpaRoots(roots: readonly ParentNode[]): void {
+    if (typeof Node === 'undefined' || typeof Element === 'undefined') return;
     const discovered = new Set<HTMLElement>();
     const staleCheckCandidates = new Set<HTMLElement>();
 
@@ -2407,7 +3292,7 @@ export class WebpageRenderer {
         const roots = Array.from(this.pendingSpaRoots);
         this.pendingSpaRoots.clear();
         this.scanAndRegisterSpaRoots(roots);
-      }, 80);
+      }, SPA_MUTATION_DEBOUNCE_MS);
     }
   }
 
@@ -2438,6 +3323,7 @@ export class WebpageRenderer {
     this.sessionTotalBlocks = 0;
     this.sessionDoneBlocks = 0;
     this.ensureStylesInjected();
+    this.ensureScrollEvictionListener();
     const blocks = extractParagraphBlocks(this.doc.body, {
       targetLang: this.config.targetLang,
     });
@@ -2455,11 +3341,20 @@ export class WebpageRenderer {
     this.sessionTotalBlocks = 0;
     this.sessionDoneBlocks = 0;
     this.ensureStylesInjected();
+    this.ensureScrollEvictionListener();
     this.ensureSpaMutationObserver();
     const blocks = extractParagraphBlocks(this.doc.body, {
       targetLang: this.config.targetLang,
     });
-    await this.translateBlocks(blocks, 'webpage');
+    await this.translateBlocks(blocks, 'webpage', { fullPage: true });
+  }
+
+  async translateFullPage(): Promise<void> {
+    return this.translateWholePage();
+  }
+
+  disable(): void {
+    this.restorePage();
   }
 
   /**
@@ -2477,6 +3372,7 @@ export class WebpageRenderer {
     }
 
     this.active = false;
+    this.lastBatchTailContext = '';
 
     if (this.flushTimer !== null) {
       clearTimeout(this.flushTimer);
@@ -2486,7 +3382,10 @@ export class WebpageRenderer {
       clearTimeout(this.spaMutationTimer);
       this.spaMutationTimer = null;
     }
+    this.scrollCleanup?.();
+    this.scrollCleanup = null;
     this.pendingViewportQueue.clear();
+    this.fallbackOffscreenBlocks.clear();
     this.pendingSpaRoots.clear();
 
     this.intersectionObserver?.disconnect();
@@ -2502,6 +3401,7 @@ export class WebpageRenderer {
       ctrl.abort();
     }
     this.activeControllers.clear();
+    this.inFlightP1Batches.clear();
     this.inFlightBlockSet.clear();
     this.translatedBlockSet.clear();
     this.failedBlockTasks.clear();

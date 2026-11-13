@@ -2,7 +2,9 @@ import { useEffect, useState } from 'preact/hooks';
 import type { AutoTranslateMode, MarginConfig } from '@shared/types';
 import {
   FieldRow,
+  Icon,
   SegmentedControl,
+  SettingGroup,
   StatusPill,
   ToggleSwitch,
   describeAutoTranslateMode,
@@ -77,6 +79,15 @@ export function SiteRulesTab({ draft, onMutate }: SiteRulesTabProps) {
     }
   }, [draft.urlRules.includeMatches]);
 
+  const countRules = (raw: string) =>
+    raw
+      .split('\n')
+      .map((s) => s.trim())
+      .filter(Boolean).length;
+  const excludeCount = countRules(rawExcludes);
+  const includeCount = countRules(rawIncludes);
+  const rulesLabel = (n: number) => (lang === 'en' ? `${n} rules` : `${n} 条`);
+
   return (
     <div>
       {/* Top Strategy Card: Auto-Translate Mode */}
@@ -97,23 +108,25 @@ export function SiteRulesTab({ draft, onMutate }: SiteRulesTabProps) {
           </StatusPill>
         </div>
 
-        <FieldRow
-          stacked
-          label={lang === 'en' ? 'Auto-Translate Strategy' : '自动翻译策略 (autoTranslateMode)'}
-        >
-          <SegmentedControl
-            ariaLabel={lang === 'en' ? 'Auto-Translate Strategy' : '自动翻译策略'}
-            dataTestId="rules-auto-translate-mode"
-            options={autoTranslateOptions}
-            value={currentAutoMode}
-            onChange={(nextMode) =>
-              onMutate((d) => {
-                d.webpage.autoTranslateMode = nextMode;
-                d.webpage.autoTranslateMatches = nextMode !== 'off';
-              })
-            }
-          />
-        </FieldRow>
+        <SettingGroup>
+          <FieldRow
+            stacked
+            label={lang === 'en' ? 'Auto-Translate Strategy' : '自动翻译策略 (autoTranslateMode)'}
+          >
+            <SegmentedControl
+              ariaLabel={lang === 'en' ? 'Auto-Translate Strategy' : '自动翻译策略'}
+              dataTestId="rules-auto-translate-mode"
+              options={autoTranslateOptions}
+              value={currentAutoMode}
+              onChange={(nextMode) =>
+                onMutate((d) => {
+                  d.webpage.autoTranslateMode = nextMode;
+                  d.webpage.autoTranslateMatches = nextMode !== 'off';
+                })
+              }
+            />
+          </FieldRow>
+        </SettingGroup>
 
         <div class="mp-editorial-note" data-testid="rules-strategy-explanation">
           {describeAutoTranslateMode(currentAutoMode, lang)}
@@ -135,62 +148,97 @@ export function SiteRulesTab({ draft, onMutate }: SiteRulesTabProps) {
           </div>
         </div>
 
-        <FieldRow
-          stacked
-          label={lang === 'en' ? 'Exclude URL Patterns (Never Auto-Translate)' : '不自动翻译的排除网址规则 (Exclude Matches / 此站不翻)'}
-          hint={lang === 'en' ? 'Example: https://linux.do/*' : '示例：https://linux.do/* 或 *://linux.do/*（一行一条）'}
-        >
-          <textarea
-            class="mp-textarea mp-textarea--mono"
-            data-testid="site-exclude-textarea"
-            placeholder="https://linux.do/*"
-            value={rawExcludes}
-            onInput={(e) => {
-              const raw = (e.currentTarget as HTMLTextAreaElement).value;
-              setRawExcludes(raw);
-              const lines = raw.split('\n');
-              onMutate((d) => {
-                d.urlRules.excludeMatches = lines;
-              });
-            }}
-          />
-        </FieldRow>
+        <div class="mp-rule-frames">
+          <div class="mp-code-frame">
+            <div class="mp-code-frame-head">
+              <span class="mp-frame-label">
+                <Icon name="x" size={12} />
+                <span>
+                  {lang === 'en'
+                    ? 'Exclude URL Patterns (Never Auto-Translate)'
+                    : '不自动翻译的排除网址规则 (Exclude Matches / 此站不翻)'}
+                </span>
+              </span>
+              <span class={excludeCount > 0 ? 'mp-pill mp-pill--danger' : 'mp-pill'}>
+                {rulesLabel(excludeCount)}
+              </span>
+            </div>
+            <textarea
+              class="mp-textarea mp-textarea--mono"
+              data-testid="site-exclude-textarea"
+              placeholder="https://linux.do/*"
+              value={rawExcludes}
+              onInput={(e) => {
+                const raw = (e.currentTarget as HTMLTextAreaElement).value;
+                setRawExcludes(raw);
+                const lines = raw.split('\n');
+                onMutate((d) => {
+                  d.urlRules.excludeMatches = lines;
+                });
+              }}
+            />
+            <div class="mp-code-frame-foot">
+              <span class="mp-frame-hint">
+                {lang === 'en' ? 'Example: https://linux.do/*' : '示例：https://linux.do/* 或 *://linux.do/*（一行一条）'}
+              </span>
+              <span class="mp-eyebrow">{lang === 'en' ? 'Highest priority' : '优先级最高'}</span>
+            </div>
+          </div>
 
-        <FieldRow
-          stacked
-          label={lang === 'en' ? 'Include URL Patterns (Always Auto-Translate Whitelist)' : '自动翻译必翻白名单规则 (Include Matches / 此站必翻)'}
-          hint={lang === 'en' ? 'Example: https://news.ycombinator.com/*' : '示例：https://news.ycombinator.com/* 或 *://x.com/*（一行一条）'}
-        >
-          <textarea
-            class="mp-textarea mp-textarea--mono"
-            data-testid="site-include-textarea"
-            placeholder="https://news.ycombinator.com/*"
-            value={rawIncludes}
-            onInput={(e) => {
-              const raw = (e.currentTarget as HTMLTextAreaElement).value;
-              setRawIncludes(raw);
-              const lines = raw.split('\n');
-              onMutate((d) => {
-                d.urlRules.includeMatches = lines;
-              });
-            }}
-          />
-        </FieldRow>
+          <div class="mp-code-frame">
+            <div class="mp-code-frame-head">
+              <span class="mp-frame-label">
+                <Icon name="check" size={12} />
+                <span>
+                  {lang === 'en'
+                    ? 'Include URL Patterns (Always Auto-Translate Whitelist)'
+                    : '自动翻译必翻白名单规则 (Include Matches / 此站必翻)'}
+                </span>
+              </span>
+              <span class={includeCount > 0 ? 'mp-pill mp-pill--ok' : 'mp-pill'}>
+                {rulesLabel(includeCount)}
+              </span>
+            </div>
+            <textarea
+              class="mp-textarea mp-textarea--mono"
+              data-testid="site-include-textarea"
+              placeholder="https://news.ycombinator.com/*"
+              value={rawIncludes}
+              onInput={(e) => {
+                const raw = (e.currentTarget as HTMLTextAreaElement).value;
+                setRawIncludes(raw);
+                const lines = raw.split('\n');
+                onMutate((d) => {
+                  d.urlRules.includeMatches = lines;
+                });
+              }}
+            />
+            <div class="mp-code-frame-foot">
+              <span class="mp-frame-hint">
+                {lang === 'en'
+                  ? 'Example: https://news.ycombinator.com/*'
+                  : '示例：https://news.ycombinator.com/* 或 *://x.com/*（一行一条）'}
+              </span>
+            </div>
+          </div>
+        </div>
 
-        <FieldRow
-          label={lang === 'en' ? 'Skip Localhost & Private LANs' : '自动跳过局域网与本机开发地址'}
-          hint="localhost, 127.0.0.1, 10.*, 192.168.*, *.local"
-        >
-          <ToggleSwitch
-            ariaLabel={lang === 'en' ? 'Skip Private Networks' : '自动跳过局域网与本机开发地址'}
-            checked={draft.urlRules.skipPrivateNetworks}
-            onChange={(next) =>
-              onMutate((d) => {
-                d.urlRules.skipPrivateNetworks = next;
-              })
-            }
-          />
-        </FieldRow>
+        <SettingGroup>
+          <FieldRow
+            label={lang === 'en' ? 'Skip Localhost & Private LANs' : '自动跳过局域网与本机开发地址'}
+            hint={<span class="mp-mono-hint">localhost, 127.0.0.1, 10.*, 192.168.*, *.local</span>}
+          >
+            <ToggleSwitch
+              ariaLabel={lang === 'en' ? 'Skip Private Networks' : '自动跳过局域网与本机开发地址'}
+              checked={draft.urlRules.skipPrivateNetworks}
+              onChange={(next) =>
+                onMutate((d) => {
+                  d.urlRules.skipPrivateNetworks = next;
+                })
+              }
+            />
+          </FieldRow>
+        </SettingGroup>
       </section>
     </div>
   );

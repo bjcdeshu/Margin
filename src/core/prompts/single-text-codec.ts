@@ -7,6 +7,8 @@ import type {
 } from '@shared/types';
 import {
   buildExpandedPromptVariables,
+  cleanPartialStreamingTrans,
+  extractStreamableVisibleText,
   interpolateTemplate,
   stripThinkingBlocks,
 } from './template';
@@ -114,14 +116,76 @@ export class SingleTextMtCodec implements PromptCodec {
     },
   ): CodecStreamParser {
     let buffer = '';
+    let nextEmitIndex = 0;
+    const lastEmittedPartialById = new Map<number, string>();
+
     return {
       push: (delta: string): BatchItemOutput[] => {
         buffer += delta;
-        return [];
+        if (items.length === 0) return [];
+
+        const visible = extractStreamableVisibleText(buffer);
+        if (!visible) return [];
+
+        const newlyReady: BatchItemOutput[] = [];
+
+        if (items.length === 1) {
+          const cleaned = cleanPartialStreamingTrans(visible);
+          if (
+            cleaned.replace(/\s+/g, '').length >= 2 &&
+            lastEmittedPartialById.get(items[0].id) !== cleaned
+          ) {
+            lastEmittedPartialById.set(items[0].id, cleaned);
+            newlyReady.push({
+              id: items[0].id,
+              trans: cleaned,
+              partial: true,
+            });
+          }
+          return newlyReady;
+        }
+
+        const parts = visible.split(/\r?\n\r?\n/);
+        const completedCount = Math.min(items.length - 1, parts.length - 1);
+        while (nextEmitIndex < completedCount) {
+          const trans = parts[nextEmitIndex].trim();
+          const inputItem = items[nextEmitIndex];
+          nextEmitIndex++;
+          if (trans !== '' || inputItem.text.trim() === '') {
+            newlyReady.push({ id: inputItem.id, trans });
+          }
+        }
+
+        if (nextEmitIndex < items.length) {
+          const currentInput = items[nextEmitIndex];
+          const rawTail =
+            parts.length > items.length
+              ? parts.slice(nextEmitIndex).join('\n\n')
+              : (parts[nextEmitIndex] ?? '');
+          const cleaned = cleanPartialStreamingTrans(rawTail);
+          if (
+            cleaned.replace(/\s+/g, '').length >= 2 &&
+            lastEmittedPartialById.get(currentInput.id) !== cleaned
+          ) {
+            lastEmittedPartialById.set(currentInput.id, cleaned);
+            newlyReady.push({
+              id: currentInput.id,
+              trans: cleaned,
+              partial: true,
+            });
+          }
+        }
+
+        return newlyReady;
       },
       finish: () => {
         const allItems = this.decode(buffer, items, options);
-        return { allItems, newlyReady: allItems };
+        const emittedIds = new Set(
+          items.slice(0, nextEmitIndex).map((it) => it.id),
+        );
+        const newlyReady = allItems.filter((it) => !emittedIds.has(it.id));
+        nextEmitIndex = items.length;
+        return { allItems, newlyReady };
       },
     };
   }

@@ -7,6 +7,7 @@ import type {
 } from '@shared/types';
 import { parse as parseYaml } from 'yaml';
 import {
+  cleanPartialStreamingTrans,
   expandAssistantPrompts,
   extractStreamableVisibleText,
   formatYamlItemRow,
@@ -19,7 +20,7 @@ import type {
   PromptCodec,
 } from './types';
 
-export { formatYamlItemRow };
+export { cleanPartialStreamingTrans, formatYamlItemRow };
 
 export function extractCleanYamlPayload(
   rawText: string,
@@ -620,7 +621,8 @@ export class YamlPromptCodec implements PromptCodec {
     },
   ): CodecStreamParser {
     let buffer = '';
-    const emittedTransById = new Map<number, string>();
+    const finalizedTransById = new Map<number, string>();
+    const lastEmittedPartialById = new Map<number, string>();
     const activeAssistant =
       options?.assistant ?? BUILTIN_ASSISTANTS['builtin-yaml'];
     const expectYamlTag =
@@ -650,37 +652,63 @@ export class YamlPromptCodec implements PromptCodec {
           transFields,
           sourceFields,
         );
+        if (rawItems.length === 0) return [];
 
-        // An item is guaranteed complete mid-stream once a subsequent `- id:` item has started OR `</yaml>` arrived!
+        const newlyReady: BatchItemOutput[] = [];
+
+        // 1. Finalized items: guaranteed complete once a subsequent `- id:` item has started OR `</yaml>` arrived!
         const completeCount = yamlClosed
           ? rawItems.length
           : Math.max(0, rawItems.length - 1);
-        if (completeCount === 0) return [];
-
-        const aligned = alignParsedItemsStrictlyById(
-          rawItems.slice(0, completeCount),
-          items,
-        );
-        const newlyReady: BatchItemOutput[] = [];
-        for (const out of aligned) {
-          if (
-            out.trans.trim() !== '' &&
-            emittedTransById.get(out.id) !== out.trans
-          ) {
-            emittedTransById.set(out.id, out.trans);
-            newlyReady.push(out);
+        if (completeCount > 0) {
+          const aligned = alignParsedItemsStrictlyById(
+            rawItems.slice(0, completeCount),
+            items,
+          );
+          for (const out of aligned) {
+            if (
+              out.trans.trim() !== '' &&
+              finalizedTransById.get(out.id) !== out.trans
+            ) {
+              finalizedTransById.set(out.id, out.trans);
+              newlyReady.push(out);
+            }
           }
         }
+
+        // 2. Intra-item live token preview (`partial: true`) for the currently active last item!
+        if (!yamlClosed && rawItems.length > 0) {
+          const activeRaw = rawItems[rawItems.length - 1];
+          const alignedActive = alignParsedItemsStrictlyById([activeRaw], items);
+          const activeOut = alignedActive[0];
+          if (activeOut && !finalizedTransById.has(activeOut.id)) {
+            const cleanedPartial = cleanPartialStreamingTrans(activeOut.trans);
+            const nonWsCount = cleanedPartial.replace(/\s+/g, '').length;
+            if (
+              nonWsCount >= 2 &&
+              lastEmittedPartialById.get(activeOut.id) !== cleanedPartial
+            ) {
+              lastEmittedPartialById.set(activeOut.id, cleanedPartial);
+              newlyReady.push({
+                id: activeOut.id,
+                trans: cleanedPartial,
+                ...(activeOut.thinking ? { thinking: activeOut.thinking } : {}),
+                partial: true,
+              });
+            }
+          }
+        }
+
         return newlyReady;
       },
 
       finish: () => {
         const allItems = this.decode(buffer, items, options);
         const newlyReady = allItems.filter(
-          (item) => emittedTransById.get(item.id) !== item.trans,
+          (item) => finalizedTransById.get(item.id) !== item.trans,
         );
         for (const item of newlyReady) {
-          emittedTransById.set(item.id, item.trans);
+          finalizedTransById.set(item.id, item.trans);
         }
         return { allItems, newlyReady };
       },

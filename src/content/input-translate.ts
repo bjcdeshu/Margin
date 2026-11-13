@@ -26,7 +26,7 @@ const CJK_CHAR_RE = /[\u3040-\u30FF\u3400-\u4DBF\u4E00-\u9FFF\uAC00-\uD7AF\uF900
 const KANA_CHAR_RE = /[\u3040-\u30FF]/u;
 const HANGUL_CHAR_RE = /[\uAC00-\uD7AF]/u;
 
-const INPUT_PILL_CSS = /* css */ `
+export const INPUT_PILL_CSS = /* css */ `
 ${SHADOW_HOST_RESET_CSS}
 
 .pill {
@@ -35,16 +35,30 @@ ${SHADOW_HOST_RESET_CSS}
   display: inline-flex;
   align-items: center;
   gap: 8px;
-  padding: 5px 10px;
-  background: var(--paper);
-  color: var(--ink);
-  border: 1px solid var(--rule-strong);
-  border-radius: 5px;
-  box-shadow: 0 4px 14px rgba(21, 20, 17, 0.12);
+  padding: 5px 11px;
+  background: rgba(251, 250, 246, 0.96);
+  backdrop-filter: blur(12px) saturate(1.1);
+  -webkit-backdrop-filter: blur(12px) saturate(1.1);
+  color: #1c1914;
+  border: 1px solid rgba(28, 25, 20, 0.08);
+  border-radius: 999px;
+  box-shadow:
+    0 1px 2px rgba(28, 25, 20, 0.05),
+    0 8px 20px -4px rgba(28, 25, 20, 0.12);
   font-size: 12px;
   line-height: 16px;
+  font-variant-numeric: tabular-nums;
   user-select: none;
   pointer-events: auto;
+}
+
+:host([data-display-mode="night"]) .pill {
+  background: rgba(23, 21, 18, 0.95);
+  color: #f0ebe1;
+  border-color: rgba(244, 239, 228, 0.10);
+  box-shadow:
+    0 1px 2px rgba(0, 0, 0, 0.32),
+    0 10px 24px -4px rgba(0, 0, 0, 0.48);
 }
 
 .pill[hidden] {
@@ -52,20 +66,54 @@ ${SHADOW_HOST_RESET_CSS}
 }
 
 .pill[data-error="true"] {
-  border-color: rgba(180, 65, 46, 0.45);
+  border-color: rgba(180, 65, 46, 0.38);
+}
+
+:host([data-display-mode="night"]) .pill[data-error="true"] {
+  border-color: rgba(226, 122, 104, 0.42);
 }
 
 .dot {
   width: 6px;
   height: 6px;
   border-radius: 999px;
-  background: var(--accent);
+  background: #8c5a21;
+  box-shadow: 0 0 0 3px rgba(140, 90, 33, 0.16);
+  animation: input-pill-pulse 1.5s ease-in-out infinite;
   flex-shrink: 0;
 }
 
+:host([data-display-mode="night"]) .dot {
+  background: #c99455;
+  box-shadow: 0 0 0 3px rgba(201, 148, 85, 0.18);
+}
+
+.pill[data-error="true"] .dot {
+  background: #b4412e;
+  box-shadow: none;
+  animation: none;
+}
+
+:host([data-display-mode="night"]) .pill[data-error="true"] .dot {
+  background: #e27a68;
+  box-shadow: none;
+}
+
+@keyframes input-pill-pulse {
+  0%, 100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 0.48;
+    transform: scale(0.86);
+  }
+}
+
 .label {
-  color: var(--ink-soft);
+  color: inherit;
   font-weight: 500;
+  letter-spacing: 0.01em;
   white-space: nowrap;
 }
 
@@ -74,20 +122,69 @@ ${SHADOW_HOST_RESET_CSS}
   box-sizing: border-box;
   display: inline-flex;
   align-items: center;
-  padding: 1px 5px;
+  padding: 1px 6px;
   font-size: 11px;
   line-height: 14px;
-  color: var(--muted);
-  background: var(--paper-soft);
-  border: 1px solid var(--rule);
-  border-radius: 4px;
+  font-weight: 500;
+  color: rgba(28, 25, 20, 0.62);
+  background: rgba(28, 25, 20, 0.04);
+  border: 1px solid rgba(28, 25, 20, 0.10);
+  border-radius: 999px;
   cursor: pointer;
+  transition: background-color 0.12s ease, color 0.12s ease, border-color 0.12s ease;
+}
+
+:host([data-display-mode="night"]) .cancel-btn {
+  color: rgba(240, 235, 225, 0.66);
+  background: rgba(244, 239, 228, 0.06);
+  border-color: rgba(244, 239, 228, 0.12);
 }
 
 .cancel-btn:hover {
-  color: var(--ink);
-  background: var(--state-hover-surface);
-  border-color: var(--control-border);
+  color: #1c1914;
+  background: rgba(28, 25, 20, 0.08);
+  border-color: rgba(28, 25, 20, 0.18);
+}
+
+:host([data-display-mode="night"]) .cancel-btn:hover {
+  color: #f0ebe1;
+  background: rgba(244, 239, 228, 0.12);
+  border-color: rgba(244, 239, 228, 0.22);
+}
+
+@media (prefers-color-scheme: dark) {
+  :host([data-display-mode="auto"]) .pill {
+    background: rgba(23, 21, 18, 0.95);
+    color: #f0ebe1;
+    border-color: rgba(244, 239, 228, 0.10);
+    box-shadow:
+      0 1px 2px rgba(0, 0, 0, 0.32),
+      0 10px 24px -4px rgba(0, 0, 0, 0.48);
+  }
+  :host([data-display-mode="auto"]) .dot {
+    background: #c99455;
+    box-shadow: 0 0 0 3px rgba(201, 148, 85, 0.18);
+  }
+  :host([data-display-mode="auto"]) .pill[data-error="true"] .dot {
+    background: #e27a68;
+    box-shadow: none;
+  }
+  :host([data-display-mode="auto"]) .cancel-btn {
+    color: rgba(240, 235, 225, 0.66);
+    background: rgba(244, 239, 228, 0.06);
+    border-color: rgba(244, 239, 228, 0.12);
+  }
+  :host([data-display-mode="auto"]) .cancel-btn:hover {
+    color: #f0ebe1;
+    background: rgba(244, 239, 228, 0.12);
+    border-color: rgba(244, 239, 228, 0.22);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .dot {
+    animation: none !important;
+  }
 }
 `;
 
@@ -744,6 +841,7 @@ export class InputQuickTranslator {
       providerId,
       fromLang: 'auto',
       toLang,
+      priority: -1,
       items: [{ id: 1, text: sourceText, hasRichTags: false }],
       context: extractPageContext(this.doc, this.getUrl?.()),
     };

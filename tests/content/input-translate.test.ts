@@ -6,6 +6,7 @@ import type {
   TranslateBatchResponse,
 } from '@shared/types';
 import {
+  INPUT_PILL_CSS,
   InputQuickTranslator,
   computeCjkRatio,
   deepActiveElement,
@@ -366,6 +367,7 @@ describe('input-translate: Triple-Space, Alt+I, CJK direction, ShadowRoot, Escap
 
     expect(await translator.translateActiveElement()).toBe(true);
     expect(capturedRequests).toHaveLength(1);
+    expect(capturedRequests[0]?.priority).toBe(-1);
     expect(capturedRequests[0]?.context?.domain).toBe('github.com');
     expect(capturedRequests[0]?.context?.title).toBe(
       'Pull Request #42 · openai/openai-node',
@@ -376,6 +378,12 @@ describe('input-translate: Triple-Space, Alt+I, CJK direction, ShadowRoot, Escap
     expect(capturedRequests[0]?.context?.styleGuide).toContain(
       'Software engineering',
     );
+
+    expect(INPUT_PILL_CSS).toContain('all: initial !important');
+    expect(INPUT_PILL_CSS).toContain('#8c5a21');
+    expect(INPUT_PILL_CSS).toContain('#c99455');
+    expect(INPUT_PILL_CSS).toContain('tabular-nums');
+    expect(INPUT_PILL_CSS).not.toMatch(/\d(?:\.\d+)?rem\b/);
 
     translator.destroy();
   });

@@ -6,7 +6,10 @@ import {
 import {
   executeBatchWithProvider,
   executeVisionWithProvider,
+  type ExecuteBatchResult,
   type ProviderRuntimeEnv,
+  resolveDeepLXEndpoints,
+  resolveEndpointForProvider,
 } from '@core/providers';
 import { BRAND } from '@shared/brand';
 import { resolveProviderIdForScene } from '@shared/constants';
@@ -56,6 +59,66 @@ export interface BackgroundRouterEnv
   extends ProviderRuntimeEnv,
     DnrFetchDependencies {
   translationCache?: TranslationLruCache;
+}
+
+export interface SingleflightTranslationResult {
+  trans: string;
+  thinking?: string;
+  fallbackPlain?: boolean;
+}
+
+export const inFlightTranslations = new Map<
+  string,
+  Promise<SingleflightTranslationResult>
+>();
+
+type SingleflightStreamListener = (update: {
+  trans: string;
+  thinking?: string;
+  fallbackPlain?: boolean;
+  partial?: boolean;
+}) => void;
+
+const inFlightStreamListeners = new Map<
+  string,
+  Set<SingleflightStreamListener>
+>();
+
+const WARMUP_ORIGIN_THROTTLE_MS = 45_000;
+const lastWarmupByOrigin = new Map<string, number>();
+
+export function resetRouterTransientStateForTests(): void {
+  inFlightTranslations.clear();
+  inFlightStreamListeners.clear();
+  lastWarmupByOrigin.clear();
+}
+
+function raceWithAbort<T>(
+  promise: Promise<T>,
+  signal?: AbortSignal,
+): Promise<T> {
+  if (!signal) return promise;
+  if (signal.aborted) {
+    return Promise.reject(
+      new DOMException('The operation was aborted.', 'AbortError'),
+    );
+  }
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => {
+      reject(new DOMException('The operation was aborted.', 'AbortError'));
+    };
+    signal.addEventListener('abort', onAbort, { once: true });
+    promise.then(
+      (val) => {
+        signal.removeEventListener('abort', onAbort);
+        resolve(val);
+      },
+      (err: unknown) => {
+        signal.removeEventListener('abort', onAbort);
+        reject(err);
+      },
+    );
+  });
 }
 
 function filterContextForProvider(
@@ -192,56 +255,118 @@ export async function handleTranslateBatch(
   const cache = env.translationCache ?? backgroundTranslationCache;
   const useCache = shouldUseTranslationCache(request.scene);
 
-  const cachedOutputs = new Map<number, BatchItemOutput>();
-  const uncachedItems: BatchItemInput[] = [];
-  const cacheKeysByItemId = new Map<number, string>();
+  const finalizedEmittedIds = new Set<number>();
+  const lastPartialEmittedById = new Map<number, string>();
+  const emitItemReady = (item: BatchItemOutput): void => {
+    if (!streamCallbacks?.onItemReady || env.signal?.aborted) return;
+    if (item.partial) {
+      if (finalizedEmittedIds.has(item.id)) return;
+      if (lastPartialEmittedById.get(item.id) === item.trans) return;
+      lastPartialEmittedById.set(item.id, item.trans);
+      streamCallbacks.onItemReady(item);
+      return;
+    }
+    if (finalizedEmittedIds.has(item.id)) return;
+    finalizedEmittedIds.add(item.id);
+    streamCallbacks.onItemReady(item);
+  };
 
-  if (useCache && request.items.length > 0) {
-    const requestedKeys: string[] = [];
-    for (const item of request.items) {
-      const matchedGlossarySig = computeMatchedGlossarySignature(
-        [item.text],
-        effectiveGlossary,
-        domainOrUrl,
-      );
-      const key = makeTranslationCacheKey({
+  if (!useCache || request.items.length === 0) {
+    const directResult = await executeBatchWithProvider({
+      scene: request.scene,
+      priority: request.priority ?? env.priority,
+      provider,
+      assistant,
+      fromLang: request.fromLang,
+      toLang: request.toLang,
+      items: request.items,
+      context: effectiveContext,
+      glossary: configForRun.glossary,
+      stream: streamCallbacks?.stream ?? false,
+      onDelta: streamCallbacks?.onDelta,
+      onItemReady: streamCallbacks?.onItemReady ? emitItemReady : undefined,
+      fetchImpl: env.fetchImpl,
+      pool: env.pool,
+      retryBaseDelayMs: env.retryBaseDelayMs,
+      requestTimeoutMs: env.requestTimeoutMs,
+      streamIdleTimeoutMs: env.streamIdleTimeoutMs,
+      signal: env.signal,
+    });
+
+    await appendDiagnosticSnapshot(directResult.diagnostic);
+
+    if (!directResult.ok) {
+      return {
+        ok: false,
+        requestId: request.requestId,
         providerId: provider.id,
         model: provider.model,
-        assistantId: assistant?.id,
-        codecId,
-        scene: request.scene,
-        fromLang: request.fromLang,
-        toLang: request.toLang,
-        matchedGlossarySig,
-        promptFingerprint,
-        styleGuide: effectiveStyleGuide,
-        sourceText: item.text,
-      });
-      cacheKeysByItemId.set(item.id, key);
-      requestedKeys.push(key);
+        items: [],
+        diagnostic: directResult.diagnostic,
+        error: directResult.error,
+      };
     }
 
-    const hitsMap = await cache.getMany(requestedKeys);
-    for (const item of request.items) {
-      const key = cacheKeysByItemId.get(item.id);
-      const hit = key !== undefined ? hitsMap.get(key) : undefined;
-      if (hit !== undefined) {
-        const outItem: BatchItemOutput = { id: item.id, trans: hit };
-        cachedOutputs.set(item.id, outItem);
-        streamCallbacks?.onItemReady?.(outItem);
-      } else {
-        uncachedItems.push(item);
-      }
-    }
-  } else {
-    uncachedItems.push(...request.items);
+    return {
+      ok: true,
+      requestId: request.requestId,
+      providerId: provider.id,
+      model: provider.model,
+      items: directResult.items.filter((it) => !it.partial),
+      diagnostic: directResult.diagnostic,
+    };
   }
 
-  if (uncachedItems.length === 0 && request.items.length > 0) {
-    const orderedCached = request.items
-      .map((it) => cachedOutputs.get(it.id))
-      .filter((it): it is BatchItemOutput => it !== undefined);
-    const diagnostic = buildDiagnosticSnapshot({
+  const resolvedOutputs = new Map<number, BatchItemOutput>();
+  const cacheKeysByItemId = new Map<number, string>();
+  const requestedKeys: string[] = [];
+
+  for (const item of request.items) {
+    const matchedGlossarySig = computeMatchedGlossarySignature(
+      [item.text],
+      effectiveGlossary,
+      domainOrUrl,
+    );
+    const key = makeTranslationCacheKey({
+      providerId: provider.id,
+      model: provider.model,
+      assistantId: assistant?.id,
+      codecId,
+      scene: request.scene,
+      fromLang: request.fromLang,
+      toLang: request.toLang,
+      matchedGlossarySig,
+      promptFingerprint,
+      styleGuide: effectiveStyleGuide,
+      sourceText: item.text,
+    });
+    cacheKeysByItemId.set(item.id, key);
+    requestedKeys.push(key);
+  }
+
+  // 1. L1 + IndexedDB cache lookup
+  const hitsMap = await cache.getMany(requestedKeys);
+  const missGroupsByKey = new Map<string, BatchItemInput[]>();
+
+  for (const item of request.items) {
+    const key = cacheKeysByItemId.get(item.id)!;
+    const hit = hitsMap.get(key);
+    if (hit !== undefined) {
+      const outItem: BatchItemOutput = { id: item.id, trans: hit };
+      resolvedOutputs.set(item.id, outItem);
+      emitItemReady(outItem);
+    } else {
+      let group = missGroupsByKey.get(key);
+      if (!group) {
+        group = [];
+        missGroupsByKey.set(key, group);
+      }
+      group.push(item);
+    }
+  }
+
+  const buildSyntheticSuccessDiagnostic = () =>
+    buildDiagnosticSnapshot({
       scene: request.scene,
       codec: codecId,
       provider: {
@@ -264,99 +389,322 @@ export async function handleTranslateBatch(
       knownSecrets: provider.apiKeys,
     });
 
+  if (missGroupsByKey.size === 0) {
+    const orderedCached = request.items
+      .map((it) => resolvedOutputs.get(it.id))
+      .filter((it): it is BatchItemOutput => it !== undefined);
     return {
       ok: true,
       requestId: request.requestId,
       providerId: provider.id,
       model: provider.model,
       items: orderedCached,
-      diagnostic,
+      diagnostic: buildSyntheticSuccessDiagnostic(),
     };
   }
 
-  const result = await executeBatchWithProvider({
-    scene: request.scene,
-    provider,
-    assistant,
-    fromLang: request.fromLang,
-    toLang: request.toLang,
-    items: uncachedItems,
-    context: effectiveContext,
-    glossary: configForRun.glossary,
-    stream: streamCallbacks?.stream ?? false,
-    onDelta: streamCallbacks?.onDelta,
-    onItemReady: streamCallbacks?.onItemReady,
-    fetchImpl: env.fetchImpl,
-    pool: env.pool,
-    retryBaseDelayMs: env.retryBaseDelayMs,
-    requestTimeoutMs: env.requestTimeoutMs,
-    streamIdleTimeoutMs: env.streamIdleTimeoutMs,
-    signal: env.signal,
-  });
+  // 2. Partition cache misses into Cross-Request Singleflight subscribers vs Intra-Batch deduplicated representatives
+  interface OwnedFlightEntry {
+    key: string;
+    representative: BatchItemInput;
+    dupItems: BatchItemInput[];
+    resolve: (value: SingleflightTranslationResult) => void;
+    reject: (reason?: unknown) => void;
+  }
 
-  await appendDiagnosticSnapshot(result.diagnostic);
+  interface SubscribedFlightEntry {
+    key: string;
+    dupItems: BatchItemInput[];
+    promise: Promise<SingleflightTranslationResult>;
+    unsubscribeStream?: () => void;
+  }
 
-  if (result.ok && useCache) {
-    const uncachedById = new Map(uncachedItems.map((it) => [it.id, it]));
-    const writeBatch: TranslationPersistenceWriteItem[] = [];
-    for (const outItem of result.items) {
-      const srcItem = uncachedById.get(outItem.id);
-      if (srcItem && outItem.trans.trim() !== '') {
-        const key =
-          cacheKeysByItemId.get(outItem.id) ??
-          makeTranslationCacheKey({
-            providerId: provider.id,
-            model: provider.model,
-            assistantId: assistant?.id,
-            codecId,
-            scene: request.scene,
-            fromLang: request.fromLang,
-            toLang: request.toLang,
-            matchedGlossarySig: computeMatchedGlossarySignature(
-              [srcItem.text],
-              effectiveGlossary,
-              domainOrUrl,
-            ),
-            promptFingerprint,
-            styleGuide: effectiveStyleGuide,
-            sourceText: srcItem.text,
-          });
-        writeBatch.push({
-          key,
-          value: outItem.trans,
-          meta: {
-            providerId: provider.id,
-            model: provider.model,
-            fromLang: request.fromLang,
-            toLang: request.toLang,
-            scene: request.scene,
-          },
-        });
-      }
+  const registerOwnedGroups = (
+    groups: ReadonlyArray< readonly [string, BatchItemInput[]] >,
+  ): OwnedFlightEntry[] => {
+    const entries: OwnedFlightEntry[] = [];
+    for (const [key, dupItems] of groups) {
+      let resolveFn!: (value: SingleflightTranslationResult) => void;
+      let rejectFn!: (reason?: unknown) => void;
+      const promise = new Promise<SingleflightTranslationResult>((res, rej) => {
+        resolveFn = res;
+        rejectFn = rej;
+      });
+      // Prevent unhandled rejection warnings when 0 external requests subscribe to this key
+      promise.catch(() => undefined);
+
+      inFlightTranslations.set(key, promise);
+      inFlightStreamListeners.set(key, new Set());
+      entries.push({
+        key,
+        representative: dupItems[0],
+        dupItems,
+        resolve: resolveFn,
+        reject: rejectFn,
+      });
     }
-    if (writeBatch.length > 0) {
-      await cache.setMany(writeBatch);
+    return entries;
+  };
+
+  const executeOwnedEntries = async (
+    ownedEntries: readonly OwnedFlightEntry[],
+  ): Promise<ExecuteBatchResult> => {
+    const entryByRepId = new Map<number, OwnedFlightEntry>(
+      ownedEntries.map((e) => [e.representative.id, e]),
+    );
+    const reps = ownedEntries.map((e) => e.representative);
+
+    try {
+      const execResult = await executeBatchWithProvider({
+        scene: request.scene,
+        priority: request.priority ?? env.priority,
+        provider,
+        assistant,
+        fromLang: request.fromLang,
+        toLang: request.toLang,
+        items: reps,
+        context: effectiveContext,
+        glossary: configForRun.glossary,
+        stream: streamCallbacks?.stream ?? false,
+        onDelta: streamCallbacks?.onDelta,
+        onItemReady: (repItem) => {
+          const entry = entryByRepId.get(repItem.id);
+          if (!entry) return;
+
+          // Fan out partial & final streaming events to ALL matching duplicate item IDs in this batch
+          for (const dup of entry.dupItems) {
+            emitItemReady({
+              ...repItem,
+              id: dup.id,
+            });
+          }
+
+          // Fan out to any cross-request singleflight stream subscribers
+          const listeners = inFlightStreamListeners.get(entry.key);
+          if (listeners && listeners.size > 0) {
+            for (const listener of listeners) {
+              listener({
+                trans: repItem.trans,
+                thinking: repItem.thinking,
+                fallbackPlain: repItem.fallbackPlain,
+                partial: repItem.partial,
+              });
+            }
+          }
+        },
+        fetchImpl: env.fetchImpl,
+        pool: env.pool,
+        retryBaseDelayMs: env.retryBaseDelayMs,
+        requestTimeoutMs: env.requestTimeoutMs,
+        streamIdleTimeoutMs: env.streamIdleTimeoutMs,
+        signal: env.signal,
+      });
+
+      await appendDiagnosticSnapshot(execResult.diagnostic);
+
+      if (!execResult.ok) {
+        const upstreamErr = new Error(
+          execResult.error?.message || 'Upstream batch translation failed.',
+        );
+        for (const entry of ownedEntries) {
+          inFlightTranslations.delete(entry.key);
+          inFlightStreamListeners.delete(entry.key);
+          entry.reject(upstreamErr);
+        }
+        return execResult;
+      }
+
+      // Strictly persist ONLY finalized (`!partial`) and non-empty translations!
+      const finalizedRepMap = new Map<number, BatchItemOutput>();
+      const writeBatch: TranslationPersistenceWriteItem[] = [];
+
+      for (const outItem of execResult.items) {
+        if (outItem.partial) continue;
+        finalizedRepMap.set(outItem.id, outItem);
+        const entry = entryByRepId.get(outItem.id);
+        if (entry && outItem.trans.trim() !== '') {
+          writeBatch.push({
+            key: entry.key,
+            value: outItem.trans,
+            meta: {
+              providerId: provider.id,
+              model: provider.model,
+              fromLang: request.fromLang,
+              toLang: request.toLang,
+              scene: request.scene,
+            },
+          });
+        }
+      }
+
+      if (writeBatch.length > 0) {
+        await cache.setMany(writeBatch);
+      }
+
+      for (const entry of ownedEntries) {
+        inFlightTranslations.delete(entry.key);
+        inFlightStreamListeners.delete(entry.key);
+        const repOut = finalizedRepMap.get(entry.representative.id);
+        if (repOut) {
+          const sfValue: SingleflightTranslationResult = {
+            trans: repOut.trans,
+            ...(repOut.thinking ? { thinking: repOut.thinking } : {}),
+            ...(repOut.fallbackPlain
+              ? { fallbackPlain: repOut.fallbackPlain }
+              : {}),
+          };
+          for (const dup of entry.dupItems) {
+            const dupOut: BatchItemOutput = {
+              id: dup.id,
+              ...sfValue,
+            };
+            resolvedOutputs.set(dup.id, dupOut);
+            emitItemReady(dupOut);
+          }
+          entry.resolve(sfValue);
+        } else {
+          entry.reject(new Error('Translation omitted by provider.'));
+        }
+      }
+
+      return execResult;
+    } catch (err) {
+      for (const entry of ownedEntries) {
+        inFlightTranslations.delete(entry.key);
+        inFlightStreamListeners.delete(entry.key);
+        entry.reject(err);
+      }
+      throw err;
+    }
+  };
+
+  const subscribedFlights: SubscribedFlightEntry[] = [];
+  const initialOwnedGroups: Array<readonly [string, BatchItemInput[]]> = [];
+
+  for (const [key, dupItems] of missGroupsByKey.entries()) {
+    const existingPromise = inFlightTranslations.get(key);
+    if (existingPromise) {
+      let unsubscribeStream: (() => void) | undefined;
+      const listenerSet = inFlightStreamListeners.get(key);
+      if (listenerSet && streamCallbacks?.onItemReady) {
+        const streamListener: SingleflightStreamListener = (upd) => {
+          for (const dup of dupItems) {
+            emitItemReady({
+              id: dup.id,
+              trans: upd.trans,
+              ...(upd.thinking ? { thinking: upd.thinking } : {}),
+              ...(upd.fallbackPlain
+                ? { fallbackPlain: upd.fallbackPlain }
+                : {}),
+              ...(upd.partial ? { partial: true } : {}),
+            });
+          }
+        };
+        listenerSet.add(streamListener);
+        unsubscribeStream = () => {
+          listenerSet.delete(streamListener);
+        };
+      }
+      subscribedFlights.push({
+        key,
+        dupItems,
+        promise: existingPromise,
+        unsubscribeStream,
+      });
+    } else {
+      initialOwnedGroups.push([key, dupItems]);
     }
   }
 
-  if (!result.ok) {
+  const ownedEntries = registerOwnedGroups(initialOwnedGroups);
+  let lastExecResult: ExecuteBatchResult | null = null;
+
+  const ownedRunPromise =
+    ownedEntries.length > 0
+      ? executeOwnedEntries(ownedEntries)
+      : Promise.resolve(null);
+
+  const orphanedGroups: Array<readonly [string, BatchItemInput[]]> = [];
+  const subscribePromise = (async () => {
+    for (const sub of subscribedFlights) {
+      try {
+        const sfVal = await raceWithAbort(sub.promise, env.signal);
+        for (const dup of sub.dupItems) {
+          const dupOut: BatchItemOutput = {
+            id: dup.id,
+            trans: sfVal.trans,
+            ...(sfVal.thinking ? { thinking: sfVal.thinking } : {}),
+            ...(sfVal.fallbackPlain
+              ? { fallbackPlain: sfVal.fallbackPlain }
+              : {}),
+          };
+          resolvedOutputs.set(dup.id, dupOut);
+          emitItemReady(dupOut);
+        }
+      } catch (err) {
+        if (env.signal?.aborted) {
+          throw err;
+        }
+        // Peer request cancelled or failed while this request is still alive: check cache or rescue
+        const lateCached = cache.get(sub.key);
+        if (lateCached !== undefined) {
+          for (const dup of sub.dupItems) {
+            const dupOut: BatchItemOutput = { id: dup.id, trans: lateCached };
+            resolvedOutputs.set(dup.id, dupOut);
+            emitItemReady(dupOut);
+          }
+        } else {
+          orphanedGroups.push([sub.key, sub.dupItems]);
+        }
+      } finally {
+        sub.unsubscribeStream?.();
+      }
+    }
+  })();
+
+  try {
+    const [ownedOut] = await Promise.all([ownedRunPromise, subscribePromise]);
+    lastExecResult = ownedOut;
+  } finally {
+    for (const sub of subscribedFlights) {
+      sub.unsubscribeStream?.();
+    }
+  }
+
+  if (lastExecResult && !lastExecResult.ok) {
     return {
       ok: false,
       requestId: request.requestId,
       providerId: provider.id,
       model: provider.model,
       items: [],
-      diagnostic: result.diagnostic,
-      error: result.error,
+      diagnostic: lastExecResult.diagnostic,
+      error: lastExecResult.error,
     };
   }
 
-  // Merge cached + freshly translated outputs preserving original `request.items` slot order
-  const freshById = new Map(result.items.map((it) => [it.id, it]));
+  if (orphanedGroups.length > 0 && !env.signal?.aborted) {
+    const rescueEntries = registerOwnedGroups(orphanedGroups);
+    const rescueResult = await executeOwnedEntries(rescueEntries);
+    lastExecResult = rescueResult;
+    if (!rescueResult.ok && resolvedOutputs.size === 0) {
+      return {
+        ok: false,
+        requestId: request.requestId,
+        providerId: provider.id,
+        model: provider.model,
+        items: [],
+        diagnostic: rescueResult.diagnostic,
+        error: rescueResult.error,
+      };
+    }
+  }
+
+  // Merge cached + singleflight-coalesced + freshly translated outputs preserving original `request.items` slot order
   const mergedItems: BatchItemOutput[] = [];
   for (const reqItem of request.items) {
-    const hit = freshById.get(reqItem.id) ?? cachedOutputs.get(reqItem.id);
-    if (hit) {
+    const hit = resolvedOutputs.get(reqItem.id);
+    if (hit && !hit.partial) {
       mergedItems.push(hit);
     }
   }
@@ -367,7 +715,7 @@ export async function handleTranslateBatch(
     providerId: provider.id,
     model: provider.model,
     items: mergedItems,
-    diagnostic: result.diagnostic,
+    diagnostic: lastExecResult?.diagnostic ?? buildSyntheticSuccessDiagnostic(),
   };
 }
 
@@ -564,6 +912,64 @@ export async function handleRuntimeRpcRequest(
       }
       return { ok: true };
     }
+
+    case 'margin:warmup': {
+      const cache = env.translationCache ?? backgroundTranslationCache;
+      void cache.getStats().catch(() => {});
+
+      try {
+        const config = await getMarginConfig();
+        const targetScene = request.payload?.scene ?? 'webpage';
+        const provId = resolveProviderIdForScene(
+          targetScene,
+          config.routing,
+          config.providers,
+          request.payload?.providerId,
+        );
+        const prov = config.providers[provId];
+        if (
+          prov &&
+          prov.enabled &&
+          (prov.protocol === 'openai-chat' ||
+            prov.protocol === 'anthropic-messages' ||
+            prov.protocol === 'deeplx')
+        ) {
+          const endpoint =
+            prov.protocol === 'deeplx'
+              ? resolveDeepLXEndpoints(prov)[0]
+              : resolveEndpointForProvider(prov);
+          const origin = new URL(endpoint).origin;
+          const now = Date.now();
+          const lastWarmupAt = lastWarmupByOrigin.get(origin) ?? 0;
+          if (now - lastWarmupAt >= WARMUP_ORIGIN_THROTTLE_MS) {
+            lastWarmupByOrigin.set(origin, now);
+            const fetchFn =
+              env.fetchImpl ??
+              (typeof globalThis.fetch === 'function'
+                ? globalThis.fetch.bind(globalThis)
+                : undefined);
+            if (fetchFn) {
+              const timeoutSignal =
+                typeof AbortSignal !== 'undefined' &&
+                typeof AbortSignal.timeout === 'function'
+                  ? AbortSignal.timeout(2000)
+                  : undefined;
+              void Promise.resolve(
+                fetchFn(origin, {
+                  method: 'HEAD',
+                  mode: 'no-cors',
+                  ...(timeoutSignal ? { signal: timeoutSignal } : {}),
+                }),
+              ).catch(() => {});
+            }
+          }
+        }
+      } catch {
+        // Warmup is strictly best-effort and never fails
+      }
+
+      return { ok: true };
+    }
   }
 }
 
@@ -576,7 +982,8 @@ export function isRuntimeRpcRequest(msg: unknown): msg is RuntimeRpcRequest {
     t === 'margin:fetch-image-data-url' ||
     t === 'margin:test-provider' ||
     t === 'margin:get-translation-cache-stats' ||
-    t === 'margin:clear-translation-cache'
+    t === 'margin:clear-translation-cache' ||
+    t === 'margin:warmup'
   );
 }
 

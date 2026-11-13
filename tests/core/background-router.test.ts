@@ -6,7 +6,9 @@ import {
   dispatchShortcutCommand,
   handleContextMenuClicked,
   handleRuntimeRpcRequest,
+  inFlightTranslations,
   parseVisionTranslationOutput,
+  resetRouterTransientStateForTests,
 } from '../../src/background';
 import {
   buildDiagnosticSnapshot,
@@ -86,6 +88,7 @@ describe('MV3 Background Router, Vision BBox Parser, DNR Anti-403, Stream Port &
   beforeEach(() => {
     resetMemoryStorageForTests();
     backgroundTranslationCache.clear();
+    resetRouterTransientStateForTests();
   });
 
   afterEach(() => {
@@ -538,6 +541,11 @@ describe('MV3 Background Router, Vision BBox Parser, DNR Anti-403, Stream Port &
       {
         type: 'item-ready',
         requestId: 'stream-1',
+        item: { id: 2, trans: '第二段最终译文', partial: true },
+      },
+      {
+        type: 'item-ready',
+        requestId: 'stream-1',
         item: { id: 2, trans: '第二段最终译文' },
       },
     ]);
@@ -688,5 +696,417 @@ describe('MV3 Background Router, Vision BBox Parser, DNR Anti-403, Stream Port &
       { tabId: 11, msg: { type: 'margin:cmd:clear-page-cache' } },
       { tabId: 22, msg: { type: 'margin:cmd:clear-page-cache' } },
     ]);
+  });
+
+  it('coalesces concurrent duplicate margin:translate-batch RPCs via cross-request singleflight (1 upstream fetch)', async () => {
+    const config = createDefaultMarginConfig();
+    config.providers['sf-oapi'] = {
+      id: 'sf-oapi',
+      name: 'Singleflight OAPI',
+      preset: 'openai',
+      protocol: 'openai-chat',
+      enabled: true,
+      baseUrl: 'https://gateway.example.com/v1',
+      apiKeys: ['sk-SF_FAKE'],
+      model: 'gpt-4.1-mini',
+      models: ['gpt-4.1-mini'],
+      assistantId: 'builtin-yaml',
+      enableContext: false,
+      enableRichHtml: true,
+      stream: 'off',
+      rateLimitRps: 50,
+      maxConcurrency: 4,
+      temperaturePolicy: { mode: 'omit' },
+      thinkingPolicy: { mode: 'provider-default' },
+    };
+    config.routing.webpage = 'sf-oapi';
+    await saveMarginConfig(config);
+
+    let releaseFetch!: () => void;
+    const fetchGate = new Promise<void>((resolve) => {
+      releaseFetch = resolve;
+    });
+    const fetchSpy = vi.fn(async () => {
+      await fetchGate;
+      return jsonResponse({
+        choices: [
+          {
+            message: {
+              content: '<yaml>\n- id: 1\n  trans: 合并译文\n</yaml>',
+            },
+          },
+        ],
+      });
+    });
+
+    const pool = new ProviderExecutionPool();
+    const p1 = handleRuntimeRpcRequest(
+      {
+        type: 'margin:translate-batch',
+        payload: {
+          requestId: 'sf-req-1',
+          scene: 'webpage',
+          fromLang: 'en',
+          toLang: 'zh-CN',
+          items: [{ id: 10, text: 'Coalesced tweet text' }],
+        },
+      },
+      { fetchImpl: fetchSpy as unknown as typeof fetch, pool },
+    ) as Promise<TranslateBatchResponse>;
+
+    const p2 = handleRuntimeRpcRequest(
+      {
+        type: 'margin:translate-batch',
+        payload: {
+          requestId: 'sf-req-2',
+          scene: 'webpage',
+          fromLang: 'en',
+          toLang: 'zh-CN',
+          items: [{ id: 20, text: 'Coalesced tweet text' }],
+        },
+      },
+      { fetchImpl: fetchSpy as unknown as typeof fetch, pool },
+    ) as Promise<TranslateBatchResponse>;
+
+    // Allow async config/cache lookup to reach singleflight map
+    await new Promise((r) => setTimeout(r, 15));
+    expect(inFlightTranslations.size).toBe(1);
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+
+    releaseFetch();
+    const [r1, r2] = await Promise.all([p1, p2]);
+
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    expect(inFlightTranslations.size).toBe(0);
+    expect(r1.ok).toBe(true);
+    expect(r2.ok).toBe(true);
+    expect(r1.items).toEqual([{ id: 10, trans: '合并译文' }]);
+    expect(r2.items).toEqual([{ id: 20, trans: '合并译文' }]);
+  });
+
+  it('deduplicates repeated source texts within a single batch and fans out partial + final events to all duplicate IDs', async () => {
+    const config = createDefaultMarginConfig();
+    config.providers['dedup-oapi'] = {
+      id: 'dedup-oapi',
+      name: 'Dedup OAPI',
+      preset: 'openai',
+      protocol: 'openai-chat',
+      enabled: true,
+      baseUrl: 'https://gateway.example.com/v1',
+      apiKeys: ['sk-DEDUP_FAKE'],
+      model: 'gpt-4.1-mini',
+      models: ['gpt-4.1-mini'],
+      assistantId: 'builtin-yaml',
+      enableContext: false,
+      enableRichHtml: true,
+      stream: 'on',
+      rateLimitRps: 50,
+      maxConcurrency: 4,
+      temperaturePolicy: { mode: 'omit' },
+      thinkingPolicy: { mode: 'provider-default' },
+    };
+    config.routing.webpage = 'dedup-oapi';
+    await saveMarginConfig(config);
+
+    let capturedUserPrompt = '';
+    const sseFetch = vi.fn(async (_url: RequestInfo | URL, init?: RequestInit) => {
+      const parsed = JSON.parse(String(init?.body ?? '{}')) as {
+        messages?: Array<{ role: string; content: string }>;
+      };
+      capturedUserPrompt =
+        parsed.messages?.find((m) => m.role === 'user')?.content ?? '';
+
+      const enc = new TextEncoder();
+      const rs = new ReadableStream<Uint8Array>({
+        start(ctrl) {
+          ctrl.enqueue(
+            enc.encode(
+              'data: {"choices":[{"delta":{"content":"<yaml>\\n- id: 1\\n  trans: 显示"}}]}\n\n',
+            ),
+          );
+          ctrl.enqueue(
+            enc.encode(
+              'data: {"choices":[{"delta":{"content":"线索\\n- id: 2\\n  trans: 独特推文\\n</yaml>"}}]}\n\n',
+            ),
+          );
+          ctrl.enqueue(enc.encode('data: [DONE]\n\n'));
+          ctrl.close();
+        },
+      });
+      return new Response(rs, { status: 200 });
+    });
+
+    const postedMessages: TranslateStreamPortMessage[] = [];
+    const messageListeners: Array<(msg: unknown) => void> = [];
+    let resolveDone!: (msg: TranslateStreamPortMessage) => void;
+    const donePromise = new Promise<TranslateStreamPortMessage>((resolve) => {
+      resolveDone = resolve;
+    });
+
+    const fakePort = {
+      name: BRAND.streamPortName,
+      postMessage: (msg: TranslateStreamPortMessage) => {
+        postedMessages.push(msg);
+        if (msg.type === 'done' || msg.type === 'error') {
+          resolveDone(msg);
+        }
+      },
+      disconnect: vi.fn(),
+      onMessage: {
+        addListener: (fn: (msg: unknown) => void) => messageListeners.push(fn),
+      },
+      onDisconnect: {
+        addListener: vi.fn(),
+      },
+    };
+
+    attachStreamTranslationPort(
+      fakePort as unknown as chrome.runtime.Port,
+      {
+        fetchImpl: sseFetch as unknown as typeof fetch,
+        pool: new ProviderExecutionPool(),
+      },
+    );
+
+    messageListeners[0]({
+      type: 'start',
+      payload: {
+        requestId: 'dedup-stream-1',
+        scene: 'webpage',
+        fromLang: 'en',
+        toLang: 'zh-CN',
+        items: [
+          { id: 1, text: 'Show thread' },
+          { id: 2, text: 'Unique tweet' },
+          { id: 3, text: 'Show thread' },
+        ],
+      },
+    } satisfies TranslateStreamPortMessage);
+
+    const doneMsg = await donePromise;
+    expect(sseFetch).toHaveBeenCalledTimes(1);
+    // Only 2 unique items sent to the LLM (`- id: 1` and `- id: 2`, NO `- id: 3`!)
+    expect(capturedUserPrompt).toContain('Show thread');
+    expect(capturedUserPrompt).toContain('Unique tweet');
+    expect(capturedUserPrompt).not.toContain('- id: 3');
+
+    const itemReadyMsgs = postedMessages.filter((m) => m.type === 'item-ready');
+    // Both ID 1 and ID 3 receive partial: true preview AND finalized output
+    expect(itemReadyMsgs).toEqual(
+      expect.arrayContaining([
+        {
+          type: 'item-ready',
+          requestId: 'dedup-stream-1',
+          item: { id: 1, trans: '显示', partial: true },
+        },
+        {
+          type: 'item-ready',
+          requestId: 'dedup-stream-1',
+          item: { id: 3, trans: '显示', partial: true },
+        },
+        {
+          type: 'item-ready',
+          requestId: 'dedup-stream-1',
+          item: { id: 1, trans: '显示线索' },
+        },
+        {
+          type: 'item-ready',
+          requestId: 'dedup-stream-1',
+          item: { id: 3, trans: '显示线索' },
+        },
+        {
+          type: 'item-ready',
+          requestId: 'dedup-stream-1',
+          item: { id: 2, trans: '独特推文' },
+        },
+      ]),
+    );
+
+    expect(doneMsg.type).toBe('done');
+    if (doneMsg.type === 'done') {
+      expect(doneMsg.response.items).toEqual([
+        { id: 1, trans: '显示线索' },
+        { id: 2, trans: '独特推文' },
+        { id: 3, trans: '显示线索' },
+      ]);
+    }
+  });
+
+  it('never writes mid-stream partial: true previews to backgroundTranslationCache and caches only finalized outputs', async () => {
+    const config = createDefaultMarginConfig();
+    config.providers['partial-guard'] = {
+      id: 'partial-guard',
+      name: 'Partial Guard OAPI',
+      preset: 'openai',
+      protocol: 'openai-chat',
+      enabled: true,
+      baseUrl: 'https://gateway.example.com/v1',
+      apiKeys: ['sk-GUARD_FAKE'],
+      model: 'gpt-4.1-mini',
+      models: ['gpt-4.1-mini'],
+      assistantId: 'builtin-yaml',
+      enableContext: false,
+      enableRichHtml: true,
+      stream: 'on',
+      rateLimitRps: 50,
+      maxConcurrency: 4,
+      temperaturePolicy: { mode: 'omit' },
+      thinkingPolicy: { mode: 'provider-default' },
+    };
+    config.routing.webpage = 'partial-guard';
+    await saveMarginConfig(config);
+
+    let streamCtrl!: ReadableStreamDefaultController<Uint8Array>;
+    const sseFetch = vi.fn(async () => {
+      const rs = new ReadableStream<Uint8Array>({
+        start(ctrl) {
+          streamCtrl = ctrl;
+        },
+      });
+      return new Response(rs, { status: 200 });
+    });
+
+    const postedMessages: TranslateStreamPortMessage[] = [];
+    const messageListeners: Array<(msg: unknown) => void> = [];
+    let resolveFirstPartial!: () => void;
+    const firstPartialSeen = new Promise<void>((r) => {
+      resolveFirstPartial = r;
+    });
+    let resolveDone!: () => void;
+    const doneSeen = new Promise<void>((r) => {
+      resolveDone = r;
+    });
+
+    const fakePort = {
+      name: BRAND.streamPortName,
+      postMessage: (msg: TranslateStreamPortMessage) => {
+        postedMessages.push(msg);
+        if (msg.type === 'item-ready' && msg.item.partial) {
+          resolveFirstPartial();
+        }
+        if (msg.type === 'done' || msg.type === 'error') {
+          resolveDone();
+        }
+      },
+      disconnect: vi.fn(),
+      onMessage: {
+        addListener: (fn: (msg: unknown) => void) => messageListeners.push(fn),
+      },
+      onDisconnect: {
+        addListener: vi.fn(),
+      },
+    };
+
+    attachStreamTranslationPort(
+      fakePort as unknown as chrome.runtime.Port,
+      {
+        fetchImpl: sseFetch as unknown as typeof fetch,
+        pool: new ProviderExecutionPool(),
+      },
+    );
+
+    messageListeners[0]({
+      type: 'start',
+      payload: {
+        requestId: 'guard-stream-1',
+        scene: 'webpage',
+        fromLang: 'en',
+        toLang: 'zh-CN',
+        items: [{ id: 1, text: 'Cache safety check' }],
+      },
+    } satisfies TranslateStreamPortMessage);
+
+    await new Promise((r) => setTimeout(r, 15));
+    const enc = new TextEncoder();
+    streamCtrl.enqueue(
+      enc.encode(
+        'data: {"choices":[{"delta":{"content":"<yaml>\\n- id: 1\\n  trans: 半成品"}}]}\n\n',
+      ),
+    );
+    await firstPartialSeen;
+
+    // Mid-stream: partial: true emitted to UI port, but cache MUST remain completely empty!
+    expect(backgroundTranslationCache.size).toBe(0);
+    expect((await backgroundTranslationCache.getStats()).memoryEntries).toBe(0);
+
+    // Complete the stream
+    streamCtrl.enqueue(
+      enc.encode(
+        'data: {"choices":[{"delta":{"content":"最终译文\\n</yaml>"}}]}\n\n',
+      ),
+    );
+    streamCtrl.enqueue(enc.encode('data: [DONE]\n\n'));
+    streamCtrl.close();
+    await doneSeen;
+
+    // Post-stream: only the finalized translation is persisted in cache
+    expect(backgroundTranslationCache.size).toBe(1);
+    const cachedFollowup = (await handleRuntimeRpcRequest(
+      {
+        type: 'margin:translate-batch',
+        payload: {
+          requestId: 'guard-followup-1',
+          scene: 'webpage',
+          fromLang: 'en',
+          toLang: 'zh-CN',
+          items: [{ id: 99, text: 'Cache safety check' }],
+        },
+      },
+      { fetchImpl: sseFetch as unknown as typeof fetch },
+    )) as TranslateBatchResponse;
+    expect(sseFetch).toHaveBeenCalledTimes(1);
+    expect(cachedFollowup.items).toEqual([{ id: 99, trans: '半成品最终译文' }]);
+  });
+
+  it('handles margin:warmup RPC immediately without blocking and throttles per-origin HEAD preconnects', async () => {
+    const config = createDefaultMarginConfig();
+    config.providers['warmup-oapi'] = {
+      ...config.providers['google-free'],
+      id: 'warmup-oapi',
+      name: 'Warmup OAPI',
+      preset: 'openai',
+      protocol: 'openai-chat',
+      enabled: true,
+      baseUrl: 'https://warm.example.com/v1/chat/completions',
+      apiKeys: ['sk-WARM'],
+      model: 'gpt-4.1-mini',
+      models: ['gpt-4.1-mini'],
+    };
+    config.routing.webpage = 'warmup-oapi';
+    await saveMarginConfig(config);
+
+    // Even if upstream HEAD never resolves, margin:warmup MUST return { ok: true } immediately!
+    const pendingWarmupFetch = vi.fn(
+      () =>
+        new Promise<Response>(() => {
+          // intentionally never resolves
+        }),
+    );
+
+    const t0 = Date.now();
+    const res1 = await handleRuntimeRpcRequest(
+      { type: 'margin:warmup', payload: { scene: 'webpage' } },
+      { fetchImpl: pendingWarmupFetch as unknown as typeof fetch },
+    );
+    const elapsedMs = Date.now() - t0;
+
+    expect(res1).toEqual({ ok: true });
+    expect(elapsedMs).toBeLessThan(200);
+    expect(pendingWarmupFetch).toHaveBeenCalledTimes(1);
+    expect(pendingWarmupFetch).toHaveBeenCalledWith(
+      'https://warm.example.com',
+      expect.objectContaining({
+        method: 'HEAD',
+        mode: 'no-cors',
+      }),
+    );
+
+    // Immediate second warmup for same origin is throttled (45s cooldown)
+    const res2 = await handleRuntimeRpcRequest(
+      { type: 'margin:warmup', payload: { scene: 'webpage' } },
+      { fetchImpl: pendingWarmupFetch as unknown as typeof fetch },
+    );
+    expect(res2).toEqual({ ok: true });
+    expect(pendingWarmupFetch).toHaveBeenCalledTimes(1);
   });
 });

@@ -16,11 +16,13 @@ import {
 } from '../../src/content/index';
 import {
   LruTranslationCache,
+  VIEWPORT_ROOT_MARGIN,
   WEBPAGE_INJECTED_CSS,
   WebpageRenderer,
   isRedundantIdenticalTranslation,
   packIntoBatches,
   packIntoProgressiveBatches,
+  stripPartialInlineMarkers,
 } from '../../src/content/renderer';
 import { initMarginImageTranslator } from '../../src/media/image-entry';
 import { createSubtitleIsolatedController } from '../../src/youtube/isolated-entry';
@@ -1486,5 +1488,589 @@ describe('renderer & content orchestrator: themes, reversible target-only, retry
     expect(document.querySelector('.margin-trans-root')).toBeNull();
 
     controller.destroy();
+  });
+
+  it('mounts proportional warm-paper shimmer, streams 60fps partial: true tokens via single Text node with rAF coalescing (never caching partials), and reconstructs rich <mN> DOM on finalize', async () => {
+    expect(WEBPAGE_INJECTED_CSS).toContain('.margin-shimmer-line');
+    expect(WEBPAGE_INJECTED_CSS).toContain('prefers-reduced-motion: reduce');
+    expect(WEBPAGE_INJECTED_CSS).not.toContain('.margin-trans-spinner');
+    expect(stripPartialInlineMarkers('你好<m0>世界</m0>！')).toBe('你好世界！');
+
+    const config = createDefaultMarginConfig();
+    config.providers['google-free'].stream = 'on';
+
+    document.body.innerHTML = `
+      <main>
+        <div id="clamped-wrap" style="max-height: 44px; overflow: hidden;">
+          <p id="short-block">Concise tweet headline for single-line shimmer.</p>
+        </div>
+        <p id="long-rich-block">
+          Longer editorial paragraph exceeding eighty characters with <a href="https://margin.dev/docs" id="orig-doc-link">complete streaming documentation</a> for live preview testing.
+        </p>
+      </main>
+    `;
+
+    const clampedWrap = document.getElementById('clamped-wrap')!;
+    const shortBlock = document.getElementById('short-block')!;
+    const longBlock = document.getElementById('long-rich-block')!;
+
+    const rafCallbacks: FrameRequestCallback[] = [];
+    const rafSpy = vi
+      .spyOn(window, 'requestAnimationFrame')
+      .mockImplementation((cb: FrameRequestCallback) => {
+        rafCallbacks.push(cb);
+        return rafCallbacks.length;
+      });
+    const cafSpy = vi
+      .spyOn(window, 'cancelAnimationFrame')
+      .mockImplementation(() => {});
+
+    let fakePerfNow = 1000;
+    const perfSpy = vi
+      .spyOn(performance, 'now')
+      .mockImplementation(() => fakePerfNow);
+
+    let emitStreamItem!: (item: {
+      id: number;
+      trans: string;
+      partial?: boolean;
+    }) => void;
+    let resolveTransport!: (res: TranslateBatchResponse) => void;
+    const cache = new LruTranslationCache(100);
+
+    try {
+      const renderer = new WebpageRenderer({
+        config,
+        cache,
+        getUrl: () => 'https://x.com/home',
+        transport: (_req, callbacks) => {
+          emitStreamItem = (item) => callbacks.onItemReady?.(item);
+          return new Promise<TranslateBatchResponse>((resolve) => {
+            resolveTransport = resolve;
+          });
+        },
+      });
+
+      renderer.enablePageTranslation();
+
+      // 1. Hero Wave 0 mounts proportional warm-paper shimmer (1 line 58% vs 2 lines 88% + 54%, zero "正在翻译…" text)
+      const shortLoading = shortBlock.querySelector(
+        '.margin-trans-loading',
+      ) as HTMLElement;
+      const longLoading = longBlock.querySelector(
+        '.margin-trans-loading',
+      ) as HTMLElement;
+      expect(shortLoading).not.toBeNull();
+      expect(longLoading).not.toBeNull();
+      expect(shortLoading.getAttribute('data-margin-loading')).toBe('1');
+      expect(shortLoading.getAttribute('aria-busy')).toBe('true');
+      expect(shortLoading.textContent).toBe('');
+      const shortLines = shortLoading.querySelectorAll<HTMLElement>(
+        '.margin-shimmer-line',
+      );
+      const longLines = longLoading.querySelectorAll<HTMLElement>(
+        '.margin-shimmer-line',
+      );
+      expect(shortLines).toHaveLength(1);
+      expect(shortLines[0]?.style.width).toBe('58%');
+      expect(longLines).toHaveLength(2);
+      expect(longLines[0]?.style.width).toBe('88%');
+      expect(longLines[1]?.style.width).toBe('54%');
+
+      const pillHost = document.querySelector('[data-margin-host="page-status"]')!;
+      const pillEl = pillHost.shadowRoot!.querySelector(
+        '[data-testid="margin-status-pill"]',
+      )!;
+      expect(pillEl.getAttribute('data-quiet')).toBeNull();
+
+      // 2. Leading-edge (0ms) first partial update strips <m0> tags, unclamps ancestor, and mounts a single Text node
+      emitStreamItem({
+        id: 2,
+        trans: '较长编辑段落，附带<m0>完整流式',
+        partial: true,
+      });
+
+      const streamSpan = longBlock.querySelector(
+        '.margin-trans-root',
+      ) as HTMLElement;
+      expect(streamSpan).not.toBeNull();
+      expect(streamSpan.hasAttribute('data-margin-loading')).toBe(false);
+      expect(streamSpan.getAttribute('data-margin-streaming')).toBe('1');
+      expect(streamSpan.textContent).toBe('较长编辑段落，附带完整流式');
+      expect(streamSpan.querySelectorAll('a')).toHaveLength(0);
+      expect(streamSpan.childNodes).toHaveLength(1);
+      const liveTextNode = streamSpan.firstChild!;
+      expect(liveTextNode.nodeType).toBe(Node.TEXT_NODE);
+
+      emitStreamItem({ id: 1, trans: '精炼推文首词', partial: true });
+      expect(clampedWrap.getAttribute('data-margin-unclamped')).toBe('true');
+
+      // CRITICAL: Partials MUST NEVER enter LRU cache or increment translatedBlocks!
+      expect(cache.size).toBe(0);
+      expect(renderer.getPageState().translatedBlocks).toBe(0);
+
+      // 3. Burst partial updates within < 16ms coalesce into a single rAF and mutate the SAME Text node in-place!
+      fakePerfNow += 4;
+      emitStreamItem({
+        id: 2,
+        trans: '较长编辑段落，附带<m0>完整流式文档',
+        partial: true,
+      });
+      fakePerfNow += 4;
+      emitStreamItem({
+        id: 2,
+        trans: '较长编辑段落，附带<m0>完整流式文档</m0>预览',
+        partial: true,
+      });
+
+      expect(rafCallbacks).toHaveLength(1);
+      // Still showing previous frame before rAF fires
+      expect(streamSpan.textContent).toBe('较长编辑段落，附带完整流式');
+
+      fakePerfNow += 10;
+      const flushFrame = rafCallbacks.shift()!;
+      flushFrame(fakePerfNow);
+
+      expect(streamSpan.textContent).toBe('较长编辑段落，附带完整流式文档预览');
+      expect(streamSpan.firstChild).toBe(liveTextNode);
+      expect(cache.size).toBe(0);
+      expect(renderer.getPageState().translatedBlocks).toBe(0);
+
+      // 4. Finalized items (!partial) cancel pending rAF, reconstruct rich <m0> -> <a href>, cache, and quiet status pill!
+      fakePerfNow += 2;
+      emitStreamItem({
+        id: 2,
+        trans: '较长编辑段落，附带<m0>未刷新的尾帧',
+        partial: true,
+      });
+      expect(rafCallbacks).toHaveLength(1);
+
+      resolveTransport({
+        ok: true,
+        requestId: 'stream-final',
+        providerId: 'google-free',
+        model: 'gtx',
+        items: [
+          { id: 1, trans: '用于单行微光测试的精炼推文标题。' },
+          {
+            id: 2,
+            trans: '超过八十字符的较长编辑段落，附带<m0>完整流式文档</m0>供实时预览测试。',
+          },
+        ],
+        diagnostic: makeMockDiagnostic(),
+      });
+
+      await vi.waitFor(() => {
+        expect(renderer.getPageState().translatedBlocks).toBe(2);
+      });
+
+      const finalSpan = longBlock.querySelector(
+        '.margin-trans-root',
+      ) as HTMLElement;
+      expect(finalSpan.hasAttribute('data-margin-streaming')).toBe(false);
+      const richLink = finalSpan.querySelector('a') as HTMLAnchorElement;
+      expect(richLink).not.toBeNull();
+      expect(richLink.href).toBe('https://margin.dev/docs');
+      expect(richLink.textContent).toBe('完整流式文档');
+      expect(cache.size).toBe(2);
+      expect(pillEl.getAttribute('data-quiet')).toBe('true');
+
+      renderer.destroy();
+    } finally {
+      rafSpy.mockRestore();
+      cafSpy.mockRestore();
+      perfSpy.mockRestore();
+    }
+  });
+
+  it('schedules 4-tier priorities (VIP -1, Hero Wave 0 P0, 2200px P1 lookahead, Alt+W P2) and evicts/aborts fast-scrolled off-screen P1 blocks', async () => {
+    vi.useFakeTimers();
+    expect(VIEWPORT_ROOT_MARGIN).toBe('300px 0px 2200px 0px');
+
+    const origInnerHeight = window.innerHeight;
+    Object.defineProperty(window, 'innerHeight', {
+      configurable: true,
+      value: 800,
+    });
+
+    const rectTopById: Record<string, number> = {
+      'blk-1': 80,
+      'blk-2': 240,
+      'blk-3': 420,
+      'blk-4': 1400, // P1 lookahead (<= 800 + 2200)
+      'blk-5': 1900, // P1 lookahead -> will scroll far away before 16ms flush!
+      'blk-6': 4500, // Far off-screen (> 3000px) -> observed only
+    };
+
+    document.body.innerHTML = `
+      <main>
+        <p id="blk-1">First hero viewport paragraph visible immediately at top.</p>
+        <p id="blk-2">Second hero viewport paragraph visible right below first.</p>
+        <p id="blk-3">Third visible paragraph queued for 16ms P0 flush.</p>
+        <p id="blk-4">Fourth lookahead paragraph promoted to P0 on scroll.</p>
+        <p id="blk-5">Fifth lookahead paragraph evicted before flush on fast jump.</p>
+        <p id="blk-6">Sixth deep off-screen paragraph translated as P2 on Alt+W.</p>
+      </main>
+    `;
+
+    for (const id of Object.keys(rectTopById)) {
+      const el = document.getElementById(id)!;
+      vi.spyOn(el, 'getBoundingClientRect').mockImplementation(() => {
+        const top = rectTopById[id];
+        return {
+          top,
+          bottom: top + 60,
+          left: 0,
+          right: 600,
+          width: 600,
+          height: 60,
+          x: 0,
+          y: top,
+          toJSON: () => ({}),
+        } as DOMRect;
+      });
+    }
+
+    const dispatched: Array<{
+      priority: number | undefined;
+      texts: string[];
+      signal: AbortSignal;
+    }> = [];
+    let holdP1Batch = false;
+
+    try {
+      const config = createDefaultMarginConfig();
+      const renderer = new WebpageRenderer({
+        config,
+        flushDelayMs: 16,
+        getUrl: () => 'https://example.com/feed',
+        transport: (req, _cb, signal) => {
+          dispatched.push({
+            priority: req.priority,
+            texts: req.items.map((i) => i.text),
+            signal,
+          });
+          if (holdP1Batch && req.priority === 1) {
+            return new Promise<TranslateBatchResponse>((_resolve, reject) => {
+              signal.addEventListener('abort', () => {
+                reject(new DOMException('Aborted', 'AbortError'));
+              });
+            });
+          }
+          return Promise.resolve({
+            ok: true,
+            requestId: req.requestId,
+            providerId: 'google-free',
+            model: 'gtx',
+            items: req.items.map((it) => ({
+              id: it.id,
+              trans: `译：${it.text.slice(0, 16)}`,
+            })),
+            diagnostic: makeMockDiagnostic(),
+          });
+        },
+      });
+
+      // 1. Enable page translation -> Hero Wave 0 dispatches first 2 visible P0 blocks at 0ms synchronously!
+      renderer.enablePageTranslation();
+      expect(dispatched).toHaveLength(1);
+      expect(dispatched[0]?.priority).toBe(0);
+      expect(dispatched[0]?.texts).toEqual([
+        'First hero viewport paragraph visible immediately at top.',
+        'Second hero viewport paragraph visible right below first.',
+      ]);
+
+      // Before 16ms flush fires: user scrolls so blk-4 enters [0, 800] (promoted P1 -> P0)
+      // and blk-5 jumps to top=3600 (> vh + 2600 -> evicted from queue, shimmer cleaned up!)
+      rectTopById['blk-4'] = 320;
+      rectTopById['blk-5'] = 3600;
+
+      await vi.advanceTimersByTimeAsync(20);
+
+      expect(dispatched).toHaveLength(2);
+      expect(dispatched[1]?.priority).toBe(0);
+      expect(dispatched[1]?.texts).toEqual([
+        'Third visible paragraph queued for 16ms P0 flush.',
+        'Fourth lookahead paragraph promoted to P0 on scroll.',
+      ]);
+      // blk-5 was evicted cleanly with zero loading shimmer left behind!
+      expect(
+        document.getElementById('blk-5')!.querySelector('.margin-trans-loading'),
+      ).toBeNull();
+
+      // 2. Test in-flight P1 fast-scroll abort (120ms throttled scroll listener):
+      // Mount a new lookahead block blk-7 at top=1500 (P1), hold its P1 request in-flight without items, then scroll far away!
+      holdP1Batch = true;
+      const blk7 = document.createElement('p');
+      blk7.id = 'blk-7';
+      blk7.textContent = 'Seventh lookahead paragraph aborted mid-flight when user jumps far.';
+      rectTopById['blk-7'] = 1500;
+      vi.spyOn(blk7, 'getBoundingClientRect').mockImplementation(() => {
+        const top = rectTopById['blk-7'];
+        return {
+          top,
+          bottom: top + 60,
+          left: 0,
+          right: 600,
+          width: 600,
+          height: 60,
+          x: 0,
+          y: top,
+          toJSON: () => ({}),
+        } as DOMRect;
+      });
+      document.querySelector('main')!.appendChild(blk7);
+      renderer.rescanSubtree(document.body);
+      await vi.advanceTimersByTimeAsync(30);
+
+      const p1Call = dispatched.find((d) => d.priority === 1);
+      expect(p1Call).toBeDefined();
+      expect(p1Call!.signal.aborted).toBe(false);
+      expect(blk7.querySelector('.margin-trans-loading')).not.toBeNull();
+
+      // Fast scroll pushes blk-7 to top=4200 (> 800 + 3000) -> aborts in-flight P1 batch & cleans up shimmer without retry error!
+      rectTopById['blk-7'] = 4200;
+      window.dispatchEvent(new Event('scroll'));
+      await vi.advanceTimersByTimeAsync(130);
+
+      expect(p1Call!.signal.aborted).toBe(true);
+      expect(blk7.querySelector('.margin-trans-loading')).toBeNull();
+      expect(blk7.querySelector('.margin-inline-retry')).toBeNull();
+
+      // 3. Alt+W (`translateWholePage`) dispatches off-screen blocks (`blk-5`, `blk-6`, `blk-7`) with P2 (`priority: 2`)
+      holdP1Batch = false;
+      await renderer.translateWholePage();
+      const p2Call = dispatched.find((d) => d.priority === 2);
+      expect(p2Call).toBeDefined();
+      expect(p2Call!.texts).toContain(
+        'Sixth deep off-screen paragraph translated as P2 on Alt+W.',
+      );
+
+      // 4. Hover single-paragraph toggle dispatches VIP (`priority: -1`)
+      const hoverPara = document.createElement('p');
+      hoverPara.textContent = 'Hovered paragraph receives VIP priority minus one.';
+      document.querySelector('main')!.appendChild(hoverPara);
+      await renderer.toggleSingleBlock(hoverPara, 'hover');
+      expect(dispatched[dispatched.length - 1]?.priority).toBe(-1);
+
+      renderer.destroy();
+    } finally {
+      Object.defineProperty(window, 'innerHeight', {
+        configurable: true,
+        value: origInnerHeight,
+      });
+    }
+  });
+
+  it('populates X /status/ threadContext and forwards sliding prevContext (<= 220 chars) across sequential webpage batches', async () => {
+    vi.useFakeTimers();
+    const config = createDefaultMarginConfig();
+    config.providers['openai-compatible'] = {
+      ...config.providers['google-free'],
+      id: 'openai-compatible',
+      name: 'OpenAI Test',
+      preset: 'openai',
+      protocol: 'openai-chat',
+      enableContext: true,
+      maxBatchCount: 2,
+      maxCharsPerBatch: 1200,
+    };
+    config.routing.webpage = 'openai-compatible';
+
+    document.body.innerHTML = `
+      <main>
+        <article>
+          <div id="focal-root" data-testid="tweetText">We open-sourced our deterministic speculative router today with zero head-of-line blocking.</div>
+        </article>
+        <article>
+          <div id="reply-1" data-testid="tweetText">Does it preempt background lookahead requests when the user hovers a paragraph?</div>
+        </article>
+        <article>
+          <div id="reply-2" data-testid="tweetText">Yes, VIP priority minus one jumps directly to the front of ProviderExecutionPool.</div>
+        </article>
+      </main>
+    `;
+
+    const seenRequests: TranslateBatchRequest[] = [];
+    const renderer = new WebpageRenderer({
+      config,
+      flushDelayMs: 16,
+      getUrl: () => 'https://x.com/karpathy/status/123456',
+      transport: async (req) => {
+        seenRequests.push(req);
+        return {
+          ok: true,
+          requestId: req.requestId,
+          providerId: 'openai-compatible',
+          model: 'gpt-4o-mini',
+          items: req.items.map((it) => ({
+            id: it.id,
+            trans: `上下文译文：${it.text.slice(0, 20)}`,
+          })),
+          diagnostic: makeMockDiagnostic(),
+        };
+      },
+    });
+
+    renderer.enablePageTranslation();
+    await vi.advanceTimersByTimeAsync(25);
+
+    expect(seenRequests.length).toBeGreaterThanOrEqual(2);
+    // Batch 1 (Hero Wave 0): has threadContext from focal tweet, no prevContext yet
+    expect(seenRequests[0]?.context?.threadContext).toBe(
+      'We open-sourced our deterministic speculative router today with zero head-of-line blocking.',
+    );
+    expect(seenRequests[0]?.context?.prevContext).toBeUndefined();
+
+    // Batch 2 (16ms flush): carries both threadContext AND sliding prevContext from Batch 1!
+    expect(seenRequests[1]?.context?.threadContext).toBe(
+      'We open-sourced our deterministic speculative router today with zero head-of-line blocking.',
+    );
+    expect(seenRequests[1]?.context?.prevContext).toContain(
+      'Does it preempt background lookahead requests',
+    );
+    expect(seenRequests[1]!.context!.prevContext!.length).toBeLessThanOrEqual(
+      220,
+    );
+
+    // Disabling / resetting page clears sliding prevContext cleanly
+    renderer.disable();
+    renderer.clearCache();
+    renderer.enablePageTranslation();
+    expect(seenRequests[seenRequests.length - 1]?.context?.prevContext).toBeUndefined();
+
+    renderer.destroy();
+  });
+
+  it('fires requestRuntimeWarmup({ scene: "webpage" }) on translatable URLs and triggers 0ms leading-edge hydration on the very first >= 18-char X tweet (with 60ms throttle)', async () => {
+    const config = createDefaultMarginConfig();
+    config.webpage.autoTranslateMode = 'foreign';
+
+    // 1. Excluded URL (`https://linux.do/*`) and unsupported browser URL (`chrome://extensions`) MUST NOT call warmup
+    let forbiddenWarmupCalls = 0;
+    const excludedCtrl = new MarginContentController({
+      config,
+      getUrl: () => 'https://linux.do/t/topic/999',
+      warmup: async () => {
+        forbiddenWarmupCalls += 1;
+        return { ok: true };
+      },
+    });
+    excludedCtrl.mount();
+    excludedCtrl.destroy();
+
+    const chromeCtrl = new MarginContentController({
+      config,
+      getUrl: () => 'chrome://extensions',
+      warmup: async () => {
+        forbiddenWarmupCalls += 1;
+        return { ok: true };
+      },
+    });
+    chromeCtrl.mount();
+    chromeCtrl.destroy();
+    expect(forbiddenWarmupCalls).toBe(0);
+
+    // 2. Translatable SPA (`https://x.com/home`) warms runtime at mount() and triggers at 0ms leading edge on first painted tweet!
+    const warmupPayloads: Array<{ scene?: string }> = [];
+    const batchRequests: TranslateBatchRequest[] = [];
+
+    document.body.innerHTML = `<main id="x-shell"></main>`;
+
+    const controller = new MarginContentController({
+      config,
+      getUrl: () => 'https://x.com/home',
+      warmup: async (payload) => {
+        warmupPayloads.push(payload ?? {});
+        return { ok: true, warmedProviderId: 'google-free' };
+      },
+      transport: async (req) => {
+        batchRequests.push(req);
+        return {
+          ok: true,
+          requestId: req.requestId,
+          providerId: 'google-free',
+          model: 'gtx',
+          items: req.items.map((it) => ({
+            id: it.id,
+            trans: `首推极速译文：${it.text}`,
+          })),
+          diagnostic: makeMockDiagnostic(),
+        };
+      },
+    });
+
+    controller.mount();
+    expect(warmupPayloads).toEqual([{ scene: 'webpage' }]);
+    expect(controller.renderer.isActive).toBe(false);
+
+    // Mount a single compact tweet (19 letters: >= 18 tweet threshold, < 24 general prose threshold!)
+    const shell = document.getElementById('x-shell')!;
+    const firstTweet = document.createElement('div');
+    firstTweet.setAttribute('data-testid', 'tweetText');
+    firstTweet.textContent = 'Shipping streaming UI!';
+    const t0 = performance.now();
+    shell.appendChild(firstTweet);
+
+    // Yield microtasks first (MutationObserver + Hero Wave 0 fire with zero debounce timer);
+    // fall back to a single 0ms macrotask turn if the DOM env queues records on macrotask,
+    // and assert well below the legacy 220ms debounce even under parallel CI CPU contention.
+    await Promise.resolve();
+    await Promise.resolve();
+    if (!controller.renderer.isActive) {
+      await new Promise((r) => setTimeout(r, 0));
+    }
+
+    const triggerElapsedMs = performance.now() - t0;
+    expect(triggerElapsedMs).toBeLessThan(180);
+    expect(controller.renderer.isActive).toBe(true);
+    expect(batchRequests).toHaveLength(1);
+    expect(batchRequests[0]?.priority).toBe(0);
+    expect(batchRequests[0]?.items[0]?.text).toBe('Shipping streaming UI!');
+
+    controller.destroy();
+
+    // 3. Verify 60ms subsequent hydration throttle when 1st mutation is numeric skeleton noise
+    document.body.innerHTML = `<main id="feed-shell"></main>`;
+    const skeletonShell = document.getElementById('feed-shell')!;
+    let fakeNow = 10_000;
+    const throttledCtrl = new MarginContentController({
+      config,
+      now: () => fakeNow,
+      getUrl: () => 'https://news.ycombinator.com/',
+      warmup: async () => ({ ok: true }),
+      transport: async (req) => ({
+        ok: true,
+        requestId: req.requestId,
+        providerId: 'google-free',
+        model: 'gtx',
+        items: req.items.map((it) => ({ id: it.id, trans: `译：${it.text}` })),
+        diagnostic: makeMockDiagnostic(),
+      }),
+    });
+    throttledCtrl.mount();
+
+    // First mutation at t=10_000ms: numeric skeleton (0ms leading-edge check runs, still awaiting-content)
+    const numSpan = document.createElement('span');
+    numSpan.textContent = '12345';
+    skeletonShell.appendChild(numSpan);
+    await new Promise((r) => setTimeout(r, 0));
+    expect(throttledCtrl.renderer.isActive).toBe(false);
+
+    // 10ms later (t=10_010ms): English prose arrives (>= 24 chars) -> throttled for remaining 50ms!
+    fakeNow += 10;
+    const articleP = document.createElement('p');
+    articleP.textContent = 'Compact foreign prose sentence triggers hydration check.';
+    skeletonShell.appendChild(articleP);
+    await new Promise((r) => setTimeout(r, 0));
+    // Immediately after MutationObserver delivery, still false because 10ms < 60ms throttle!
+    expect(throttledCtrl.renderer.isActive).toBe(false);
+
+    // Wait past the 50ms remaining throttle window -> activates cleanly!
+    fakeNow += 55;
+    await new Promise((r) => setTimeout(r, 65));
+    expect(throttledCtrl.renderer.isActive).toBe(true);
+
+    throttledCtrl.destroy();
   });
 });

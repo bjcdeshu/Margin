@@ -1,6 +1,38 @@
-import type { ProviderConfig } from '@shared/types';
+import type {
+  ProviderConfig,
+  RequestPriority,
+  TranslationScene,
+} from '@shared/types';
 
 export const DEFAULT_KEY_COOLDOWN_MS = 30_000;
+
+export function resolveRequestPriority(
+  scene: TranslationScene | 'service-test',
+  explicitPriority?: RequestPriority,
+): RequestPriority {
+  if (
+    explicitPriority === -1 ||
+    explicitPriority === 0 ||
+    explicitPriority === 1 ||
+    explicitPriority === 2
+  ) {
+    return explicitPriority;
+  }
+  switch (scene) {
+    case 'selection':
+    case 'input':
+    case 'hover':
+      return -1;
+    case 'pdf':
+      return 1;
+    case 'subtitle':
+    case 'webpage':
+    case 'image':
+    case 'service-test':
+    default:
+      return 0;
+  }
+}
 
 export function normalizeApiKeys(rawKeys: readonly string[] | undefined): string[] {
   if (!Array.isArray(rawKeys)) return [];
@@ -45,13 +77,20 @@ export function abortableSleep(
   });
 }
 
+interface QueuedSlotWaiter {
+  priority: number;
+  seq: number;
+  grant: () => void;
+}
+
 interface ProviderBucketState {
   keyCursor: number;
   endpointCursor: number;
   keyCooldownUntil: Map<string, number>;
   endpointCooldownUntil: Map<string, number>;
   activeCount: number;
-  waitQueue: Array<() => void>;
+  waitSeq: number;
+  waitQueue: QueuedSlotWaiter[];
   requestTimestamps: number[];
 }
 
@@ -86,6 +125,7 @@ export class ProviderExecutionPool {
         keyCooldownUntil: new Map(),
         endpointCooldownUntil: new Map(),
         activeCount: 0,
+        waitSeq: 0,
         waitQueue: [],
         requestTimestamps: [],
       };
@@ -201,6 +241,7 @@ export class ProviderExecutionPool {
     bucket: ProviderBucketState,
     maxConcurrency: number,
     signal?: AbortSignal,
+    priority = 0,
   ): Promise<void> {
     if (signal?.aborted) {
       throw createAbortError();
@@ -217,22 +258,40 @@ export class ProviderExecutionPool {
 
     return new Promise<void>((resolve, reject) => {
       let granted = false;
-      const grant = () => {
-        if (granted) return;
-        granted = true;
-        signal?.removeEventListener('abort', onAbort);
-        bucket.activeCount++;
-        resolve();
+      const waiter: QueuedSlotWaiter = {
+        priority,
+        seq: bucket.waitSeq++,
+        grant: () => {
+          if (granted) return;
+          granted = true;
+          signal?.removeEventListener('abort', onAbort);
+          bucket.activeCount++;
+          resolve();
+        },
       };
       const onAbort = () => {
         if (granted) return;
-        const idx = bucket.waitQueue.indexOf(grant);
+        const idx = bucket.waitQueue.indexOf(waiter);
         if (idx !== -1) {
           bucket.waitQueue.splice(idx, 1);
         }
         reject(createAbortError());
       };
-      bucket.waitQueue.push(grant);
+
+      // Insert in ascending priority order (`-1` VIP > `0` P0 > `1` P1 > `2` P2; strict FIFO tie-breaker)
+      let insertIdx = bucket.waitQueue.length;
+      for (let i = 0; i < bucket.waitQueue.length; i++) {
+        if (bucket.waitQueue[i].priority > priority) {
+          insertIdx = i;
+          break;
+        }
+      }
+      if (insertIdx === bucket.waitQueue.length) {
+        bucket.waitQueue.push(waiter);
+      } else {
+        bucket.waitQueue.splice(insertIdx, 0, waiter);
+      }
+
       signal?.addEventListener('abort', onAbort, { once: true });
     });
   }
@@ -241,7 +300,7 @@ export class ProviderExecutionPool {
     bucket.activeCount = Math.max(0, bucket.activeCount - 1);
     const next = bucket.waitQueue.shift();
     if (next) {
-      next();
+      next.grant();
     }
   }
 
@@ -283,15 +342,25 @@ export class ProviderExecutionPool {
     provider: Pick<ProviderConfig, 'id' | 'maxConcurrency' | 'rateLimitRps'>,
     signal: AbortSignal | undefined,
     task: () => Promise<T>,
+    priority: RequestPriority | number = 0,
   ): Promise<T> {
     const bucket = this.getBucket(provider.id);
-    await this.acquireConcurrencySlot(bucket, provider.maxConcurrency, signal);
+    await this.acquireConcurrencySlot(
+      bucket,
+      provider.maxConcurrency,
+      signal,
+      priority,
+    );
     try {
       await this.enforceSlidingWindowRps(bucket, provider.rateLimitRps, signal);
       return await task();
     } finally {
       this.releaseConcurrencySlot(bucket);
     }
+  }
+
+  getPendingCount(providerId: string): number {
+    return this.buckets.get(providerId)?.waitQueue.length ?? 0;
   }
 
   reset(): void {

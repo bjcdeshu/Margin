@@ -1,4 +1,5 @@
-import type { ProviderConfig } from '@shared/types';
+import { isOpenAiLightReasoningModel } from '@shared/temperature';
+import type { ProviderConfig, TranslationScene } from '@shared/types';
 import { readSseStream } from './sse';
 import {
   DEFAULT_AI_CONNECT_TIMEOUT_MS,
@@ -29,10 +30,21 @@ function extractOpenAiContentString(content: unknown): string {
 function applyOpenAiThinkingPolicy(
   body: Record<string, unknown>,
   provider: Pick<ProviderConfig, 'preset' | 'model' | 'thinkingPolicy'>,
+  scene?: TranslationScene | 'service-test',
+  omitReasoningEffort = false,
 ): void {
   const { thinkingPolicy, preset, model } = provider;
   if (thinkingPolicy.mode === 'provider-default') {
-    // Never inject hardcoded `thinking: disabled` by default (fixes Harley #129 on glm5.3-fs)
+    // Scene-aware light reasoning: use `reasoning_effort: 'low'` on realtime feed/hover/subtitle
+    // scenes for OpenAI reasoning models so first token arrives without 1–2s medium reasoning delay.
+    // Never inject `thinking: disabled` on non-OpenAI models (preserves Harley #129 fix on glm5.3-fs).
+    if (
+      !omitReasoningEffort &&
+      (scene === 'webpage' || scene === 'hover' || scene === 'subtitle') &&
+      isOpenAiLightReasoningModel(model)
+    ) {
+      body.reasoning_effort = 'low';
+    }
     return;
   }
 
@@ -46,7 +58,9 @@ function applyOpenAiThinkingPolicy(
     if (isZhipuModel) {
       body.thinking = { type: 'disabled' };
     } else if (isOpenAiReasoning) {
-      body.reasoning_effort = 'low';
+      if (!omitReasoningEffort) {
+        body.reasoning_effort = 'low';
+      }
     } else if (isQwenModel) {
       body.enable_thinking = false;
     } else {
@@ -59,7 +73,9 @@ function applyOpenAiThinkingPolicy(
     if (isZhipuModel) {
       body.thinking = { type: 'enabled' };
     } else if (isOpenAiReasoning) {
-      body.reasoning_effort = 'medium';
+      if (!omitReasoningEffort) {
+        body.reasoning_effort = 'medium';
+      }
     } else if (isQwenModel) {
       body.enable_thinking = true;
       if (thinkingPolicy.budgetTokens) {
@@ -78,18 +94,22 @@ function applyOpenAiThinkingPolicy(
 
 export function buildOpenAiChatRequestBody(params: {
   provider: ProviderConfig;
+  scene?: TranslationScene | 'service-test';
   systemPrompt: string;
   userPrompt: string;
   imageDataUrl?: string;
   effectiveTemperature?: number;
+  omitReasoningEffort?: boolean;
   stream: boolean;
 }): Record<string, unknown> {
   const {
     provider,
+    scene,
     systemPrompt,
     userPrompt,
     imageDataUrl,
     effectiveTemperature,
+    omitReasoningEffort = false,
     stream,
   } = params;
 
@@ -137,7 +157,7 @@ export function buildOpenAiChatRequestBody(params: {
     body.stream = true;
   }
 
-  applyOpenAiThinkingPolicy(body, provider);
+  applyOpenAiThinkingPolicy(body, provider, scene, omitReasoningEffort);
   return body;
 }
 
@@ -146,12 +166,14 @@ export async function executeOpenAiChatCall(
 ): Promise<{ content: string; httpStatus: number }> {
   const {
     provider,
+    scene,
     endpoint,
     apiKey,
     systemPrompt,
     userPrompt,
     imageDataUrl,
     effectiveTemperature,
+    omitReasoningEffort,
     stream,
     onDelta,
     fetchImpl,
@@ -169,10 +191,12 @@ export async function executeOpenAiChatCall(
 
   const body = buildOpenAiChatRequestBody({
     provider,
+    scene,
     systemPrompt,
     userPrompt,
     imageDataUrl,
     effectiveTemperature,
+    omitReasoningEffort,
     stream,
   });
 

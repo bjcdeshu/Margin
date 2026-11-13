@@ -3,6 +3,7 @@ import type {
   AnyTabMessage,
   FetchImageDataUrlRequest,
   FetchImageDataUrlResponse,
+  RequestPriority,
   RuntimeRpcRequest,
   TabCommandDispatchResult,
   TabPageState,
@@ -12,7 +13,10 @@ import type {
   TranslateImageResponse,
   TranslateStreamPortMessage,
   TranslationCacheStatsResponse,
+  TranslationScene,
 } from './types';
+
+export type { RequestPriority };
 
 export function isExtensionContextValid(hadRuntimeIdAtMount = false): boolean {
   try {
@@ -80,6 +84,23 @@ export function requestClearTranslationCache(): Promise<{ ok: boolean; error?: s
   return sendRuntimeMessage<{ ok: boolean; error?: string }>({
     type: 'margin:clear-translation-cache',
   });
+}
+
+export async function requestRuntimeWarmup(payload?: {
+  providerId?: string;
+  scene?: TranslationScene;
+}): Promise<{ ok: boolean }> {
+  try {
+    if (typeof globalThis.chrome === 'undefined' || !chrome.runtime?.sendMessage) {
+      return { ok: false };
+    }
+    return await sendRuntimeMessage<{ ok: boolean }>({
+      type: 'margin:warmup',
+      ...(payload ? { payload } : {}),
+    });
+  } catch {
+    return { ok: false };
+  }
 }
 
 export interface StreamBatchCallbacks {

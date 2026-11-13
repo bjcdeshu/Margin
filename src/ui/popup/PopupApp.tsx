@@ -26,8 +26,9 @@ import {
   type SiteAutoRuleState,
 } from '@shared/url-match';
 import {
+  EditorialBadge,
+  Icon,
   SegmentedControl,
-  StatusPill,
   createSaveTracker,
   formatLanguageOption,
   labelForDisplayMode,
@@ -64,11 +65,11 @@ function nextUiColorMode(current: UiColorMode): UiColorMode {
 function formatThemeCycleLabel(mode: UiColorMode, lang: 'zh-CN' | 'en'): string {
   switch (mode) {
     case 'paper':
-      return lang === 'en' ? '☀ Paper' : '☀ 纸白';
+      return lang === 'en' ? 'Paper' : '纸白';
     case 'night':
-      return lang === 'en' ? '☾ Night' : '☾ 夜读';
+      return lang === 'en' ? 'Night' : '夜读';
     case 'system':
-      return lang === 'en' ? '◐ Auto' : '◐ 自动';
+      return lang === 'en' ? 'Auto' : '自动';
   }
 }
 
@@ -539,45 +540,45 @@ export function PopupApp({
   const bannerError = pageState.lastError || (commandNotice?.isError ? commandNotice.text : null);
   const bannerInfo = !bannerError ? commandNotice?.text : null;
 
+  const translating = pageState.inFlightBlocks > 0;
+  const themeIcon =
+    config.uiColorMode === 'night' ? 'moon' : config.uiColorMode === 'system' ? 'auto' : 'sun';
+
   return (
     <div class="mp-popup-sheet" data-hydrated={hydrated ? 'true' : 'false'}>
-      {/* Header: Serif wordmark + Live state badge + 1-button Theme Cycler + Settings */}
+      {/* Header: editorial wordmark + live state badge + theme cycler + Studio gear */}
       <header class="mp-popup-header">
         <div class="mp-popup-header-brand">
-          <span class="mp-wordmark" style={{ fontSize: '20px' }}>
-            {BRAND.name}
-          </span>
+          <span class="mp-wordmark">{BRAND.name}</span>
           {saveState.status === 'saved' ? (
-            <StatusPill tone="ok" dataTestId="popup-save-pill">
+            <EditorialBadge tone="ok" dataTestId="popup-save-pill">
               {lang === 'en' ? 'Saved' : '已保存'}
-            </StatusPill>
+            </EditorialBadge>
           ) : pageState.lastError ? (
-            <StatusPill tone="danger" dataTestId="popup-page-badge">
+            <EditorialBadge tone="danger" dataTestId="popup-page-badge">
               {lang === 'en' ? 'Error' : '翻译异常'}
-            </StatusPill>
-          ) : pageState.inFlightBlocks > 0 ? (
-            <StatusPill tone="accent" dataTestId="popup-page-badge">
+            </EditorialBadge>
+          ) : translating ? (
+            <EditorialBadge tone="accent" pulse dataTestId="popup-page-badge">
               {lang === 'en'
                 ? `Translating · ${pageState.translatedBlocks}`
                 : `翻译中 · ${pageState.translatedBlocks}`}
-            </StatusPill>
+            </EditorialBadge>
           ) : pageState.active ? (
-            <StatusPill tone="ok" dataTestId="popup-page-badge">
+            <EditorialBadge tone="ok" dataTestId="popup-page-badge">
               {lang === 'en'
                 ? `Active · ${pageState.translatedBlocks}`
                 : `双语已开启${pageState.translatedBlocks > 0 ? ` · ${pageState.translatedBlocks}` : ''}`}
-            </StatusPill>
+            </EditorialBadge>
           ) : (
-            <span class="mp-muted" style={{ fontSize: '11px' }}>
-              v{BRAND.version}
-            </span>
+            <span class="mp-popup-version">v{BRAND.version}</span>
           )}
         </div>
 
         <div class="mp-popup-header-actions">
           <button
             type="button"
-            class="mp-btn mp-btn--sm"
+            class="mp-popup-theme-btn"
             data-testid="popup-theme-cycle"
             aria-label={lang === 'en' ? 'Switch Color Theme' : '切换界面外观主题'}
             title={
@@ -591,26 +592,27 @@ export function PopupApp({
               })
             }
           >
-            {formatThemeCycleLabel(config.uiColorMode, lang)}
+            <Icon name={themeIcon} />
+            <span>{formatThemeCycleLabel(config.uiColorMode, lang)}</span>
           </button>
           <button
             type="button"
-            class="mp-btn mp-btn--sm"
+            class="mp-icon-btn"
             data-testid="popup-open-settings"
             aria-label={lang === 'en' ? 'Open Settings' : '打开设置'}
             title={
               lang === 'en'
                 ? 'Open Margin Studio (options.html)'
-                : '打开详细设置 (options.html)'
+                : '打开 Margin Studio 详细设置'
             }
             onClick={() => openOptionsTarget()}
           >
-            ⚙
+            <Icon name="gear" size={15} />
           </button>
         </div>
       </header>
 
-      {/* Tier 1: Primary Page Action Hero */}
+      {/* Tier 1: Primary page action */}
       <section class="mp-popup-hero">
         <div class="mp-popup-hero-row">
           <button
@@ -624,21 +626,24 @@ export function PopupApp({
             }
             onClick={() => void dispatchTabAction('margin:cmd:toggle-page')}
           >
-            <span>
-              {pageState.active
-                ? lang === 'en'
-                  ? 'Restore Original'
-                  : '还原网页原文'
-                : lang === 'en'
-                  ? 'Translate Current Page'
-                  : '翻译当前页面'}
+            <span class="mp-popup-hero-label">
+              <Icon name={pageState.active ? 'restore' : 'languages'} size={15} />
+              <span>
+                {pageState.active
+                  ? lang === 'en'
+                    ? 'Restore Original'
+                    : '还原网页原文'
+                  : lang === 'en'
+                    ? 'Translate Page'
+                    : '翻译当前页面'}
+              </span>
             </span>
             <kbd class="mp-popup-kbd">Alt+A</kbd>
           </button>
 
           <button
             type="button"
-            class="mp-btn"
+            class="mp-btn mp-popup-secondary-btn"
             data-testid="popup-whole-page"
             disabled={isUnsupportedTab}
             title={
@@ -650,7 +655,8 @@ export function PopupApp({
               void dispatchTabAction('margin:cmd:translate-whole-page')
             }
           >
-            {lang === 'en' ? 'Full' : '全文'}
+            <span>{lang === 'en' ? 'Full' : '全文'}</span>
+            <kbd class="mp-popup-kbd">Alt+W</kbd>
           </button>
         </div>
 
@@ -673,19 +679,19 @@ export function PopupApp({
         ) : null}
       </section>
 
-      {/* Tier 2: Core Reading Controls Card */}
+      {/* Tier 2: Reading controls — one grouped surface, hairline rows */}
       <section
         class="mp-popup-card"
         aria-label={lang === 'en' ? 'Reading Preferences' : '阅读与排版偏好'}
       >
         <div class="mp-popup-control-row">
           <label class="mp-popup-control-label" htmlFor="popup-target-lang">
+            <Icon name="globe" />
             {lang === 'en' ? 'Target Language' : '目标语言'}
           </label>
           <select
             id="popup-target-lang"
             class="mp-select"
-            style={{ padding: '4px 8px', fontSize: '12px', maxWidth: '198px' }}
             value={config.targetLang}
             onChange={(e) => {
               const val = (e.currentTarget as HTMLSelectElement).value;
@@ -704,6 +710,7 @@ export function PopupApp({
 
         <div class="mp-popup-control-row">
           <span class="mp-popup-control-label">
+            <Icon name="columns" />
             {lang === 'en' ? 'Display' : '显示模式'}
           </span>
           <SegmentedControl
@@ -718,27 +725,15 @@ export function PopupApp({
           />
         </div>
 
-        <div style={{ display: 'flex', flexDirection: 'column', gap: '5px' }}>
-          <div class="mp-popup-control-row">
-            <span class="mp-popup-control-label">
-              {lang === 'en' ? 'Style' : '译文样式'}
-            </span>
-            {config.webpage.theme === 'mask' ? (
-              <button
-                type="button"
-                class="mp-btn mp-btn--ghost mp-btn--sm"
-                data-testid="popup-toggle-mask"
-                onClick={() => void dispatchTabAction('margin:cmd:toggle-mask')}
-              >
-                {lang === 'en' ? 'Reveal Mask (Alt+M)' : '显隐遮罩 (Alt+M)'}
-              </button>
-            ) : null}
-          </div>
+        <div class="mp-popup-control-row">
+          <span class="mp-popup-control-label">
+            <Icon name="type" />
+            {lang === 'en' ? 'Style' : '译文样式'}
+          </span>
           <SegmentedControl
             ariaLabel={lang === 'en' ? 'Translation Theme' : '译文样式'}
             options={themeOptions}
             value={config.webpage.theme}
-            fullWidth
             onChange={(theme) =>
               void persistUserPatch((d) => {
                 d.webpage.theme = theme;
@@ -746,9 +741,24 @@ export function PopupApp({
             }
           />
         </div>
+
+        {config.webpage.theme === 'mask' ? (
+          <div class="mp-popup-control-row mp-popup-control-row--sub">
+            <button
+              type="button"
+              class="mp-btn mp-btn--ghost mp-btn--sm"
+              data-testid="popup-toggle-mask"
+              onClick={() => void dispatchTabAction('margin:cmd:toggle-mask')}
+            >
+              <Icon name="eye" size={13} />
+              <span>{lang === 'en' ? 'Reveal Mask' : '显隐遮罩'}</span>
+              <kbd class="mp-kbd">Alt+M</kbd>
+            </button>
+          </div>
+        ) : null}
       </section>
 
-      {/* Tier 3: Active Channel + Quick Feature Toggles + Site Rule Footer */}
+      {/* Tier 3: Active channel + quick capabilities + per-site rule */}
       <footer class="mp-popup-footer">
         <button
           type="button"
@@ -762,9 +772,11 @@ export function PopupApp({
           }
         >
           <span class="mp-popup-control-label">
+            <Icon name="route" />
             {lang === 'en' ? 'Channel' : '主力渠道'}
           </span>
           <span class="mp-popup-channel-value">
+            <span class="mp-popup-channel-live" aria-hidden="true" />
             <span class="mp-popup-channel-summary">{webpageSummary}</span>
             <span class="mp-popup-channel-arrow" aria-hidden="true">
               {lang === 'en' ? 'Config ↗' : '配置 ↗'}
@@ -808,7 +820,7 @@ export function PopupApp({
 
           <button
             type="button"
-            class="mp-btn mp-btn--sm"
+            class="mp-popup-toggle-pill mp-popup-toggle-pill--launch"
             data-testid="popup-open-pdf"
             onClick={handleOpenPdfReader}
             title={
@@ -825,10 +837,17 @@ export function PopupApp({
           {tabDomain ? (
             <>
               <div class="mp-popup-site-meta">
-                <span class="mp-popup-site-host" title={tabDomain.hostname}>
-                  {tabDomain.hostname}
+                <span class="mp-popup-site-domain">
+                  <Icon name="globe" size={13} />
+                  <span class="mp-popup-site-host" title={tabDomain.hostname}>
+                    {tabDomain.hostname}
+                  </span>
                 </span>
-                <span class="mp-muted" data-testid="popup-site-rule-status">
+                <span
+                  class="mp-popup-site-status"
+                  data-rule={siteAutoRule}
+                  data-testid="popup-site-rule-status"
+                >
                   {siteAutoRule === 'follow'
                     ? `${lang === 'en' ? 'Global' : '跟随全局'} ${followModeBadge}`
                     : siteAutoRule === 'always'
@@ -885,7 +904,8 @@ export function PopupApp({
               </div>
             </>
           ) : (
-            <span class="mp-muted">
+            <span class="mp-popup-site-empty">
+              <Icon name="lock" size={13} />
               {lang === 'en'
                 ? 'Browser internal page — script injection unavailable'
                 : '当前浏览器内部页面不支持注入脚本'}

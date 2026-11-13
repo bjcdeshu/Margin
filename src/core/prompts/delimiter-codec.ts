@@ -6,6 +6,7 @@ import type {
   TranslationScene,
 } from '@shared/types';
 import {
+  cleanPartialStreamingTrans,
   expandAssistantPrompts,
   extractStreamableVisibleText,
   stripThinkingBlocks,
@@ -51,6 +52,30 @@ function cleanOuterDelimiterArtifacts(
   const leadingRe = new RegExp(`^(?:\\s*${escaped}\\s*)+`);
   const trailingRe = new RegExp(`(?:\\s*${escaped}\\s*)+$`);
   return text.replace(leadingRe, '').replace(trailingRe, '').trim();
+}
+
+export function cleanPartialDelimiterTrans(
+  rawSegment: string,
+  coreToken = '%%',
+): string {
+  if (!rawSegment) return '';
+  const token = coreToken.trim() || '%%';
+  const escaped = escapeRegExp(token);
+
+  let s = rawSegment.replace(new RegExp(`^(?:\\s*${escaped}\\s*)+`), '');
+  s = s.replace(new RegExp(`(?:\\s*${escaped}\\s*)+$`), '');
+
+  // Strip any trailing half-typed prefix of `coreToken` (e.g. trailing `%` when delimiter is `%%`)
+  for (let len = token.length - 1; len >= 1; len--) {
+    const pfx = escapeRegExp(token.slice(0, len));
+    const partialRe = new RegExp(`\\s*${pfx}$`);
+    if (partialRe.test(s)) {
+      s = s.replace(partialRe, '');
+      break;
+    }
+  }
+
+  return cleanPartialStreamingTrans(s);
 }
 
 export function splitDelimiterSegments(
@@ -169,19 +194,40 @@ export class DelimiterPromptCodec implements PromptCodec {
   ): CodecStreamParser {
     let buffer = '';
     let nextEmitIndex = 0;
-    const { lineSplitRegex, inlineFallbackRegex } = resolveSeparatorToken(
-      options?.assistant,
-    );
+    const lastEmittedPartialById = new Map<number, string>();
+    const { joinSeparator, lineSplitRegex, inlineFallbackRegex } =
+      resolveSeparatorToken(options?.assistant);
+    const coreToken = joinSeparator.trim() || '%%';
 
     return {
       push: (delta: string): BatchItemOutput[] => {
         buffer += delta;
-        if (items.length <= 1 || nextEmitIndex >= items.length - 1) {
+        if (items.length === 0) {
           return [];
         }
 
         const visible = extractStreamableVisibleText(buffer);
         if (!visible) return [];
+
+        const newlyReady: BatchItemOutput[] = [];
+
+        if (items.length === 1) {
+          const inputItem = items[0];
+          const cleanedPartial = cleanPartialDelimiterTrans(visible, coreToken);
+          const nonWsCount = cleanedPartial.replace(/\s+/g, '').length;
+          if (
+            nonWsCount >= 2 &&
+            lastEmittedPartialById.get(inputItem.id) !== cleanedPartial
+          ) {
+            lastEmittedPartialById.set(inputItem.id, cleanedPartial);
+            newlyReady.push({
+              id: inputItem.id,
+              trans: cleanedPartial,
+              partial: true,
+            });
+          }
+          return newlyReady;
+        }
 
         lineSplitRegex.lastIndex = 0;
         let parts = visible.split(lineSplitRegex);
@@ -190,13 +236,8 @@ export class DelimiterPromptCodec implements PromptCodec {
           parts = visible.split(inlineFallbackRegex);
         }
 
-        // Every segment strictly BEFORE the last segment has already seen its closing `%%` delimiter!
+        // 1. Every segment strictly BEFORE the last segment has already seen its closing `%%` delimiter!
         const completedCount = Math.min(items.length - 1, parts.length - 1);
-        if (completedCount <= nextEmitIndex) {
-          return [];
-        }
-
-        const newlyReady: BatchItemOutput[] = [];
         while (nextEmitIndex < completedCount) {
           const trans = parts[nextEmitIndex].trim();
           const inputItem = items[nextEmitIndex];
@@ -208,6 +249,32 @@ export class DelimiterPromptCodec implements PromptCodec {
             });
           }
         }
+
+        // 2. Intra-item live token preview (`partial: true`) for the active trailing segment!
+        if (nextEmitIndex < items.length) {
+          const currentInputItem = items[nextEmitIndex];
+          const rawTrailing =
+            parts.length > items.length
+              ? parts.slice(nextEmitIndex).join('\n\n')
+              : (parts[nextEmitIndex] ?? '');
+          const cleanedPartial = cleanPartialDelimiterTrans(
+            rawTrailing,
+            coreToken,
+          );
+          const nonWsCount = cleanedPartial.replace(/\s+/g, '').length;
+          if (
+            nonWsCount >= 2 &&
+            lastEmittedPartialById.get(currentInputItem.id) !== cleanedPartial
+          ) {
+            lastEmittedPartialById.set(currentInputItem.id, cleanedPartial);
+            newlyReady.push({
+              id: currentInputItem.id,
+              trans: cleanedPartial,
+              partial: true,
+            });
+          }
+        }
+
         return newlyReady;
       },
 

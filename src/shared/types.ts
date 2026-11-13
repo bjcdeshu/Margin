@@ -24,6 +24,15 @@ export type TranslationScene =
   | 'pdf'
   | 'image';
 
+/**
+ * 4-tier preemptive request priority:
+ * - `-1`: VIP interactive (`selection` / `input` / `hover`)
+ * - `0`: `P0` strictly visible on-screen viewport
+ * - `1`: `P1` directional viewport lookahead
+ * - `2`: `P2` background / whole-page
+ */
+export type RequestPriority = -1 | 0 | 1 | 2;
+
 export type TranslationTheme = 'none' | 'mask' | 'opacity' | 'weakening';
 
 export type DisplayMode = 'bilingual' | 'target-only';
@@ -55,6 +64,7 @@ export type TemperatureTrace =
 
 export interface ModelCapabilityEntry {
   supportsTemperature?: boolean;
+  supportsReasoningEffort?: boolean;
   learnedFromStatus?: number;
   updatedAt: number;
 }
@@ -215,6 +225,8 @@ export interface PageContextPayload {
   title?: string;
   summary?: string;
   styleGuide?: string;
+  prevContext?: string;
+  threadContext?: string;
 }
 
 export interface BatchItemInput {
@@ -228,6 +240,7 @@ export interface BatchItemOutput {
   trans: string;
   thinking?: string;
   fallbackPlain?: boolean;
+  partial?: boolean;
 }
 
 export type DiagnosticKind =
@@ -272,6 +285,7 @@ export interface DiagnosticSnapshot {
 export interface TranslateBatchRequest {
   requestId: string;
   scene: TranslationScene | 'service-test';
+  priority?: RequestPriority;
   providerId?: string;
   fromLang: string;
   toLang: string;
@@ -438,7 +452,11 @@ export type RuntimeRpcRequest =
   | { type: 'margin:fetch-image-data-url'; payload: FetchImageDataUrlRequest }
   | { type: 'margin:test-provider'; payload: { providerId: string } }
   | { type: 'margin:get-translation-cache-stats' }
-  | { type: 'margin:clear-translation-cache' };
+  | { type: 'margin:clear-translation-cache' }
+  | {
+      type: 'margin:warmup';
+      payload?: { providerId?: string; scene?: TranslationScene };
+    };
 
 export type RuntimeRpcResponse =
   | TranslateBatchResponse

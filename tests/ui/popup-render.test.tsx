@@ -89,6 +89,7 @@ describe('Quiet Paper Popup Sheet (PopupApp — 3-Tier Editorial Hierarchy)', ()
 
       // Tier 1 Hero + Tier 2 Reading Controls + Tier 3 Channel/Quick/Site bar
       expect(container.textContent).toContain('Margin');
+      expect(container.querySelector('.mp-popup-version')?.textContent).toBe('v2.3.0');
       const heroBtn = container.querySelector(
         '[data-testid="popup-toggle-page"]',
       ) as HTMLButtonElement;

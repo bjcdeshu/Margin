@@ -433,7 +433,185 @@ describe('selection-popover: Shadow isolation, trigger modes, <a> link safety, w
     await new Promise((r) => setTimeout(r, 15));
     expect(collectBtn.hidden).toBe(true);
     expect(editorRow.hidden).toBe(true);
+    expect(capturedRequests[0]?.priority).toBe(-1);
 
     popover.destroy();
+  });
+
+  it('renders proportional shimmer skeleton, streams partial: true tokens live via chrome.runtime.connect with VIP priority (-1), and falls back cleanly when stream port is absent', async () => {
+    const config = createDefaultMarginConfig();
+    config.selection.enabled = true;
+    config.selection.triggerMode = 'instant';
+
+    // Part A: Shimmer skeleton (1 line < 80 chars, 2 lines >= 80 chars) + partial: true live Text node streaming
+    let emitItem!: (item: { id: number; trans: string; partial?: boolean }) => void;
+    let finishTransport!: (res: TranslateBatchResponse) => void;
+
+    const streamingPopover = new SelectionPopover({
+      config,
+      transport: (req, callbacks) => {
+        expect(req.priority).toBe(-1);
+        emitItem = (item) => callbacks.onItemReady?.(item);
+        return new Promise<TranslateBatchResponse>((resolve) => {
+          finishTransport = resolve;
+        });
+      },
+    });
+    streamingPopover.mount();
+
+    streamingPopover.presentForSelection('Short phrase for shimmer check', {
+      x: 80,
+      y: 90,
+    });
+
+    const shadow = streamingPopover.getShadowRoot()!;
+    const bodyEl = shadow.querySelector('.mp-sel-body') as HTMLElement;
+    expect(bodyEl).not.toBeNull();
+    expect(bodyEl.getAttribute('data-status')).toBe('loading');
+    expect(bodyEl.getAttribute('aria-busy')).toBe('true');
+    expect(bodyEl.querySelectorAll('.sel-shimmer-line')).toHaveLength(1);
+
+    // Emit partial token with raw <m0> marker -> stripped immediately & mounts single Text node
+    emitItem({ id: 1, trans: '实时<m0>流式片段', partial: true });
+    expect(bodyEl.getAttribute('data-status')).toBe('streaming');
+    expect(bodyEl.textContent).toBe('实时流式片段');
+    expect(bodyEl.childNodes).toHaveLength(1);
+    const streamTextNode = bodyEl.firstChild!;
+    expect(streamTextNode.nodeType).toBe(Node.TEXT_NODE);
+
+    // Finalize -> reuses Text node cleanly and marks data-status="ready"
+    finishTransport({
+      ok: true,
+      requestId: 'sel-1',
+      providerId: 'google-free',
+      model: 'gtx',
+      items: [{ id: 1, trans: '实时流式片段已收敛。' }],
+      diagnostic: mockSelectionDiag(),
+    });
+    await new Promise((r) => setTimeout(r, 10));
+    expect(bodyEl.getAttribute('data-status')).toBe('ready');
+    expect(bodyEl.hasAttribute('aria-busy')).toBe(false);
+    expect(bodyEl.textContent).toBe('实时流式片段已收敛。');
+    expect(bodyEl.firstChild).toBe(streamTextNode);
+
+    // Long selection (>= 80 chars) mounts 2 proportional shimmer lines
+    streamingPopover.presentForSelection(
+      'Longer academic selection sentence exceeding eighty characters to verify two-line proportional shimmer skeleton.',
+      { x: 80, y: 90 },
+    );
+    expect(bodyEl.getAttribute('data-status')).toBe('loading');
+    expect(bodyEl.querySelectorAll('.sel-shimmer-line')).toHaveLength(2);
+    streamingPopover.destroy();
+
+    // Part B: Default transport uses streamBatchTranslation when chrome.runtime.connect exists, and requestBatchTranslation otherwise
+    const origChrome = (globalThis as Record<string, unknown>).chrome;
+    try {
+      const portMessageListeners = new Set<(msg: unknown) => void>();
+      let portStartPayload = null as TranslateBatchRequest | null;
+
+      (globalThis as Record<string, unknown>).chrome = {
+        runtime: {
+          id: 'margin-test-ext-id',
+          connect: () => ({
+            onMessage: {
+              addListener: (fn: (msg: unknown) => void) =>
+                portMessageListeners.add(fn),
+              removeListener: (fn: (msg: unknown) => void) =>
+                portMessageListeners.delete(fn),
+            },
+            onDisconnect: {
+              addListener: () => {},
+              removeListener: () => {},
+            },
+            postMessage: (msg: {
+              type: string;
+              payload: TranslateBatchRequest;
+            }) => {
+              if (msg.type === 'start') {
+                portStartPayload = msg.payload;
+                queueMicrotask(() => {
+                  for (const fn of portMessageListeners) {
+                    fn({
+                      type: 'item-ready',
+                      requestId: msg.payload.requestId,
+                      item: { id: 1, trans: '端口流式首词', partial: true },
+                    });
+                  }
+                });
+              }
+            },
+            disconnect: () => {},
+          }),
+        },
+      };
+
+      const portPopover = new SelectionPopover({ config });
+      portPopover.mount();
+      portPopover.presentForSelection('Port streamed selection', { x: 40, y: 40 });
+      await new Promise((r) => setTimeout(r, 10));
+
+      expect(portStartPayload).not.toBeNull();
+      expect(portStartPayload!.priority).toBe(-1);
+      const portBody = portPopover
+        .getShadowRoot()!
+        .querySelector('.mp-sel-body') as HTMLElement;
+      expect(portBody.getAttribute('data-status')).toBe('streaming');
+      expect(portBody.textContent).toBe('端口流式首词');
+
+      for (const fn of portMessageListeners) {
+        fn({
+          type: 'done',
+          response: {
+            ok: true,
+            requestId: portStartPayload!.requestId,
+            providerId: 'google-free',
+            model: 'gtx',
+            items: [{ id: 1, trans: '端口流式完整译文' }],
+            diagnostic: mockSelectionDiag(),
+          },
+        });
+      }
+      await new Promise((r) => setTimeout(r, 10));
+      expect(portBody.getAttribute('data-status')).toBe('ready');
+      expect(portBody.textContent).toBe('端口流式完整译文');
+      portPopover.destroy();
+
+      // Remove chrome.runtime.connect -> falls back cleanly to requestBatchTranslation (sendMessage)
+      let fallbackBatchReq = null as TranslateBatchRequest | null;
+      (globalThis as Record<string, unknown>).chrome = {
+        runtime: {
+          id: 'margin-test-ext-id',
+          sendMessage: async (msg: {
+            type: string;
+            payload: TranslateBatchRequest;
+          }): Promise<TranslateBatchResponse> => {
+            fallbackBatchReq = msg.payload;
+            return {
+              ok: true,
+              requestId: msg.payload.requestId,
+              providerId: 'google-free',
+              model: 'gtx',
+              items: [{ id: 1, trans: '回退单次请求译文' }],
+              diagnostic: mockSelectionDiag(),
+            };
+          },
+        },
+      };
+
+      const fallbackPopover = new SelectionPopover({ config });
+      fallbackPopover.mount();
+      fallbackPopover.presentForSelection('Fallback RPC selection', {
+        x: 40,
+        y: 40,
+      });
+      await new Promise((r) => setTimeout(r, 10));
+
+      expect(fallbackBatchReq).not.toBeNull();
+      expect(fallbackBatchReq!.priority).toBe(-1);
+      expect(fallbackPopover.currentTranslation).toBe('回退单次请求译文');
+      fallbackPopover.destroy();
+    } finally {
+      (globalThis as Record<string, unknown>).chrome = origChrome;
+    }
   });
 });

@@ -13,7 +13,10 @@ import type {
   TranslateBatchResponse,
 } from '@shared/types';
 import { extractPageContext, isContentEditableNode } from './dom-walker';
-import { syncFullscreenFloatingVisibility } from './renderer';
+import {
+  stripPartialInlineMarkers,
+  syncFullscreenFloatingVisibility,
+} from './renderer';
 
 const MAX_SELECTION_CHARS = 4500;
 export const MAX_GLOSSARY_TERM_CHARS = 80;
@@ -37,22 +40,39 @@ ${SHADOW_HOST_RESET_CSS}
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  background: var(--paper);
-  color: var(--action-solid);
-  border: 1px solid var(--rule-strong);
-  border-radius: 5px;
-  box-shadow: 0 4px 12px rgba(21, 20, 17, 0.14);
+  background: #fbfaf6;
+  color: #8c5a21;
+  border: 1px solid rgba(28, 25, 20, 0.12);
+  border-radius: 7px;
+  box-shadow:
+    0 4px 14px rgba(28, 25, 20, 0.12),
+    0 1px 2px rgba(28, 25, 20, 0.05);
   font-size: 13px;
   font-weight: 700;
   line-height: 16px;
   cursor: pointer;
   pointer-events: auto;
   user-select: none;
+  transition: background-color 140ms ease, border-color 140ms ease, transform 140ms ease;
+}
+
+:host([data-display-mode="night"]) .trigger-icon {
+  background: #171512;
+  color: #c99455;
+  border-color: rgba(244, 239, 228, 0.14);
+  box-shadow:
+    0 6px 18px rgba(0, 0, 0, 0.44),
+    0 1px 2px rgba(0, 0, 0, 0.24);
 }
 
 .trigger-icon:hover {
-  background: var(--paper-soft);
-  color: var(--action-solid-hover);
+  background: #f4f1ea;
+  border-color: rgba(140, 90, 33, 0.34);
+}
+
+:host([data-display-mode="night"]) .trigger-icon:hover {
+  background: #201d19;
+  border-color: rgba(201, 148, 85, 0.38);
 }
 
 .trigger-dot {
@@ -73,38 +93,64 @@ ${SHADOW_HOST_RESET_CSS}
   width: 10px;
   height: 10px;
   border-radius: 999px;
-  background: var(--accent);
-  border: 1.5px solid var(--paper);
-  box-shadow: 0 2px 8px rgba(21, 20, 17, 0.22);
+  background: #8c5a21;
+  border: 1.5px solid #fbfaf6;
+  box-shadow: 0 2px 8px rgba(28, 25, 20, 0.22);
+}
+
+:host([data-display-mode="night"]) .trigger-dot-core {
+  background: #c99455;
+  border-color: #171512;
 }
 
 .card {
   position: fixed;
-  width: 356px;
+  width: 364px;
   max-width: calc(100vw - 24px);
-  background: var(--paper);
-  color: var(--ink);
-  border: 1px solid var(--rule);
-  border-radius: 8px;
-  box-shadow: 0 10px 30px rgba(21, 20, 17, 0.16);
+  background: #fbfaf6;
+  color: #1c1914;
+  border: 1px solid rgba(28, 25, 20, 0.08);
+  border-radius: 10px;
+  box-shadow:
+    0 12px 32px rgba(28, 25, 20, 0.13),
+    0 2px 6px rgba(28, 25, 20, 0.05);
+  font-variant-numeric: tabular-nums;
   pointer-events: auto;
   overflow: hidden;
 }
 
+:host([data-display-mode="night"]) .card {
+  background: #171512;
+  color: #ede8df;
+  border-color: rgba(244, 239, 228, 0.10);
+  box-shadow:
+    0 14px 36px rgba(0, 0, 0, 0.48),
+    0 2px 6px rgba(0, 0, 0, 0.28);
+}
+
 .card[data-pinned="true"] {
-  border-color: var(--rule-strong);
+  border-color: rgba(140, 90, 33, 0.36);
+}
+
+:host([data-display-mode="night"]) .card[data-pinned="true"] {
+  border-color: rgba(201, 148, 85, 0.40);
 }
 
 .card-header {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  height: 34px;
-  padding: 0px 10px;
-  background: var(--paper-soft);
-  border-bottom: 1px solid var(--rule);
+  height: 36px;
+  padding: 0px 11px;
+  background: rgba(28, 25, 20, 0.025);
+  border-bottom: 1px solid rgba(28, 25, 20, 0.08);
   cursor: grab;
   user-select: none;
+}
+
+:host([data-display-mode="night"]) .card-header {
+  background: rgba(244, 239, 228, 0.03);
+  border-bottom-color: rgba(244, 239, 228, 0.08);
 }
 
 .card[data-dragging="true"] .card-header {
@@ -117,21 +163,40 @@ ${SHADOW_HOST_RESET_CSS}
   gap: 6px;
 }
 
+.brand-mark {
+  width: 6px;
+  height: 6px;
+  border-radius: 999px;
+  background: #8c5a21;
+  flex-shrink: 0;
+}
+
+:host([data-display-mode="night"]) .brand-mark {
+  background: #c99455;
+}
+
 .brand-title {
   font-size: 12px;
   font-weight: 600;
+  letter-spacing: 0.1px;
   line-height: 16px;
-  color: var(--ink);
+  color: inherit;
 }
 
 .lang-pill {
-  padding: 1px 5px;
+  padding: 1px 6px;
   font-size: 11px;
-  line-height: 14px;
+  line-height: 15px;
+  font-variant-numeric: tabular-nums;
   color: var(--muted);
-  background: var(--paper);
-  border: 1px solid var(--rule);
-  border-radius: 4px;
+  background: rgba(28, 25, 20, 0.035);
+  border: 1px solid rgba(28, 25, 20, 0.08);
+  border-radius: 5px;
+}
+
+:host([data-display-mode="night"]) .lang-pill {
+  background: rgba(244, 239, 228, 0.045);
+  border-color: rgba(244, 239, 228, 0.09);
 }
 
 .actions {
@@ -148,26 +213,40 @@ ${SHADOW_HOST_RESET_CSS}
   display: inline-flex;
   align-items: center;
   justify-content: center;
+  gap: 4px;
   font-size: 11px;
+  font-weight: 500;
   line-height: 14px;
   color: var(--muted);
   border: 1px solid transparent;
-  border-radius: 4px;
+  border-radius: 5px;
   cursor: pointer;
   user-select: none;
+  transition: color 140ms ease, background-color 140ms ease, border-color 140ms ease;
 }
 
 .icon-btn:hover {
   color: var(--ink);
-  background: var(--state-hover-surface);
-  border-color: var(--rule);
+  background: rgba(28, 25, 20, 0.05);
+  border-color: rgba(28, 25, 20, 0.08);
+}
+
+:host([data-display-mode="night"]) .icon-btn:hover {
+  background: rgba(244, 239, 228, 0.07);
+  border-color: rgba(244, 239, 228, 0.10);
 }
 
 .icon-btn[aria-pressed="true"] {
-  color: var(--action-solid);
-  background: var(--paper-warm);
-  border-color: var(--rule-strong);
+  color: #8c5a21;
+  background: rgba(140, 90, 33, 0.10);
+  border-color: rgba(140, 90, 33, 0.26);
   font-weight: 600;
+}
+
+:host([data-display-mode="night"]) .icon-btn[aria-pressed="true"] {
+  color: #c99455;
+  background: rgba(201, 148, 85, 0.14);
+  border-color: rgba(201, 148, 85, 0.30);
 }
 
 .icon-btn:focus-visible {
@@ -175,19 +254,49 @@ ${SHADOW_HOST_RESET_CSS}
   outline-offset: 1px;
 }
 
-.card-body {
-  max-height: 240px;
+.card-body,
+.mp-sel-body {
+  max-height: 248px;
   overflow-y: auto;
-  padding: 10px 12px;
+  padding: 12px 14px;
   font-size: 14px;
-  line-height: 21px;
-  color: var(--ink);
+  line-height: 22px;
+  font-variant-numeric: tabular-nums;
+  color: inherit;
   white-space: pre-wrap;
   word-break: break-word;
 }
 
 .card-body[data-status="loading"] {
-  color: var(--muted);
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  padding: 14px;
+}
+
+.sel-shimmer-line {
+  display: block;
+  height: 13px;
+  border-radius: 5px;
+  background-color: color-mix(in srgb, currentColor 8%, transparent);
+  background-image: linear-gradient(
+    90deg,
+    transparent 0%,
+    rgba(185, 131, 61, 0.16) 50%,
+    transparent 100%
+  );
+  background-size: 220% 100%;
+  background-position: 120% 0px;
+  animation: sel-shimmer-sweep 1.5s cubic-bezier(0.4, 0, 0.2, 1) infinite;
+}
+
+@keyframes sel-shimmer-sweep {
+  0% {
+    background-position: 120% 0px;
+  }
+  100% {
+    background-position: -120% 0px;
+  }
 }
 
 .card-body[data-status="error"] {
@@ -195,18 +304,33 @@ ${SHADOW_HOST_RESET_CSS}
   font-size: 13px;
 }
 
-.icon-btn[data-saved="true"] {
-  color: var(--action-solid);
+:host([data-display-mode="night"]) .card-body[data-status="error"] {
+  color: #e27a68;
+}
+
+.icon-btn[data-saved="true"],
+.icon-btn[data-copied="true"] {
+  color: #8c5a21;
   font-weight: 600;
 }
 
+:host([data-display-mode="night"]) .icon-btn[data-saved="true"],
+:host([data-display-mode="night"]) .icon-btn[data-copied="true"] {
+  color: #c99455;
+}
+
 .glossary-editor {
-  padding: 8px 10px 10px;
-  background: var(--paper-soft);
-  border-top: 1px solid var(--rule);
+  padding: 10px 12px 12px;
+  background: rgba(28, 25, 20, 0.025);
+  border-top: 1px solid rgba(28, 25, 20, 0.08);
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 8px;
+}
+
+:host([data-display-mode="night"]) .glossary-editor {
+  background: rgba(244, 239, 228, 0.03);
+  border-top-color: rgba(244, 239, 228, 0.08);
 }
 
 .glossary-editor[hidden] {
@@ -223,7 +347,7 @@ ${SHADOW_HOST_RESET_CSS}
 .glossary-source-wrap {
   display: inline-flex;
   align-items: center;
-  gap: 5px;
+  gap: 6px;
   min-width: 0px;
   overflow: hidden;
 }
@@ -239,7 +363,7 @@ ${SHADOW_HOST_RESET_CSS}
   font-size: 12px;
   font-weight: 600;
   line-height: 16px;
-  color: var(--ink);
+  color: inherit;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -249,37 +373,48 @@ ${SHADOW_HOST_RESET_CSS}
   all: unset;
   box-sizing: border-box;
   height: 22px;
-  padding: 0px 7px;
+  padding: 0px 8px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
   font-size: 11px;
   line-height: 14px;
   color: var(--muted);
-  background: var(--paper);
-  border: 1px solid var(--rule);
+  background: #fbfaf6;
+  border: 1px solid rgba(28, 25, 20, 0.09);
   border-radius: 999px;
   cursor: pointer;
   user-select: none;
   flex-shrink: 0;
 }
 
+:host([data-display-mode="night"]) .glossary-pill-btn {
+  background: #1e1b17;
+  border-color: rgba(244, 239, 228, 0.11);
+}
+
 .glossary-pill-btn:hover {
   color: var(--ink);
-  border-color: var(--rule-strong);
+  border-color: rgba(140, 90, 33, 0.30);
 }
 
 .glossary-pill-btn[aria-pressed="true"] {
-  color: var(--action-solid);
-  background: var(--paper-warm);
-  border-color: var(--control-border);
+  color: #8c5a21;
+  background: rgba(140, 90, 33, 0.10);
+  border-color: rgba(140, 90, 33, 0.32);
   font-weight: 600;
+}
+
+:host([data-display-mode="night"]) .glossary-pill-btn[aria-pressed="true"] {
+  color: #c99455;
+  background: rgba(201, 148, 85, 0.15);
+  border-color: rgba(201, 148, 85, 0.35);
 }
 
 .glossary-controls-row {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: 7px;
 }
 
 .glossary-target-input {
@@ -288,13 +423,18 @@ ${SHADOW_HOST_RESET_CSS}
   flex: 1 1 auto;
   min-width: 0px;
   height: 28px;
-  padding: 0px 8px;
+  padding: 0px 9px;
   font-size: 12px;
   line-height: 18px;
-  color: var(--ink);
-  background: var(--paper);
-  border: 1px solid var(--rule-strong);
-  border-radius: 4px;
+  color: inherit;
+  background: #ffffff;
+  border: 1px solid rgba(28, 25, 20, 0.12);
+  border-radius: 6px;
+}
+
+:host([data-display-mode="night"]) .glossary-target-input {
+  background: #12100e;
+  border-color: rgba(244, 239, 228, 0.12);
 }
 
 .glossary-target-input::placeholder {
@@ -302,42 +442,73 @@ ${SHADOW_HOST_RESET_CSS}
 }
 
 .glossary-target-input:focus {
-  border-color: var(--control-border);
-  outline: 1px solid var(--focus-ring);
+  border-color: #8c5a21;
+  outline: 1px solid rgba(140, 90, 33, 0.25);
+}
+
+:host([data-display-mode="night"]) .glossary-target-input:focus {
+  border-color: #c99455;
+  outline-color: rgba(201, 148, 85, 0.28);
 }
 
 .glossary-save-btn {
   all: unset;
   box-sizing: border-box;
   height: 28px;
-  padding: 0px 10px;
+  padding: 0px 11px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
   font-size: 12px;
   font-weight: 600;
   line-height: 16px;
-  color: var(--action-solid-ink);
-  background: var(--action-solid);
-  border-radius: 4px;
+  color: #fffdf9;
+  background: #8c5a21;
+  border-radius: 6px;
   cursor: pointer;
   user-select: none;
   flex-shrink: 0;
+  transition: background-color 140ms ease;
+}
+
+:host([data-display-mode="night"]) .glossary-save-btn {
+  color: #171512;
+  background: #c99455;
 }
 
 .glossary-save-btn:hover {
-  background: var(--action-solid-hover);
+  background: #734818;
+}
+
+:host([data-display-mode="night"]) .glossary-save-btn:hover {
+  background: #d6a468;
 }
 
 .glossary-status {
   font-size: 11px;
   line-height: 15px;
-  color: var(--action-solid);
+  color: #8c5a21;
   font-weight: 500;
+}
+
+:host([data-display-mode="night"]) .glossary-status {
+  color: #c99455;
 }
 
 .glossary-status[hidden] {
   display: none !important;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .trigger-icon,
+  .icon-btn,
+  .glossary-save-btn {
+    transition: none !important;
+  }
+  .sel-shimmer-line {
+    animation: none !important;
+    background-image: none !important;
+  }
 }
 `;
 
@@ -352,12 +523,11 @@ function defaultSelectionTransport(
   payload: TranslateBatchRequest,
   callbacks: StreamBatchCallbacks,
   signal: AbortSignal,
-  preferStream: boolean,
+  _preferStream: boolean,
 ): Promise<TranslateBatchResponse> {
   if (
-    preferStream &&
     typeof globalThis.chrome !== 'undefined' &&
-    Boolean(globalThis.chrome?.runtime?.connect)
+    typeof globalThis.chrome?.runtime?.connect === 'function'
   ) {
     return streamBatchTranslation(payload, callbacks, signal);
   }
@@ -730,13 +900,16 @@ export class SelectionPopover {
 
     const brandGroup = this.doc.createElement('div');
     brandGroup.className = 'brand-group';
+    const brandMark = this.doc.createElement('span');
+    brandMark.className = 'brand-mark';
+    brandMark.setAttribute('aria-hidden', 'true');
     const brandTitle = this.doc.createElement('span');
     brandTitle.className = 'brand-title';
     brandTitle.textContent = 'Margin';
     const langPill = this.doc.createElement('span');
     langPill.className = 'lang-pill';
     langPill.textContent = `→ ${this.config.targetLang}`;
-    brandGroup.append(brandTitle, langPill);
+    brandGroup.append(brandMark, brandTitle, langPill);
 
     const actions = this.doc.createElement('div');
     actions.className = 'actions';
@@ -806,7 +979,7 @@ export class SelectionPopover {
     });
 
     const body = this.doc.createElement('div');
-    body.className = 'card-body';
+    body.className = 'card-body mp-sel-body';
     body.setAttribute('data-part', 'card-body');
 
     const glossaryEditor = this.doc.createElement('div');
@@ -1034,7 +1207,19 @@ export class SelectionPopover {
     this.translatedText = '';
     this.resetGlossaryQuickCollectForSelection();
     this.bodyEl.setAttribute('data-status', 'loading');
-    this.bodyEl.textContent = 'Translating…';
+    this.bodyEl.setAttribute('aria-busy', 'true');
+    const shimmerLine1 = this.doc.createElement('span');
+    shimmerLine1.className = 'sel-shimmer-line';
+    const isLongSelection = this.selectedSourceText.trim().length >= 80;
+    shimmerLine1.style.width = isLongSelection ? '88%' : '62%';
+    if (isLongSelection) {
+      const shimmerLine2 = this.doc.createElement('span');
+      shimmerLine2.className = 'sel-shimmer-line';
+      shimmerLine2.style.width = '56%';
+      this.bodyEl.replaceChildren(shimmerLine1, shimmerLine2);
+    } else {
+      this.bodyEl.replaceChildren(shimmerLine1);
+    }
     syncFullscreenFloatingVisibility(this.doc);
 
     const providerId = resolveProviderIdForScene(
@@ -1052,8 +1237,91 @@ export class SelectionPopover {
       providerId,
       fromLang: this.config.sourceLang,
       toLang: this.config.targetLang,
+      priority: -1,
       items: [{ id: 1, text: this.selectedSourceText, hasRichTags: false }],
       context: extractPageContext(this.doc, this.getUrl?.()),
+    };
+
+    const perfNow = () =>
+      typeof performance !== 'undefined' && typeof performance.now === 'function'
+        ? performance.now()
+        : Date.now();
+    const win = this.doc.defaultView;
+    const raf =
+      typeof win?.requestAnimationFrame === 'function'
+        ? win.requestAnimationFrame.bind(win)
+        : typeof globalThis.requestAnimationFrame === 'function'
+          ? globalThis.requestAnimationFrame.bind(globalThis)
+          : null;
+    const caf =
+      typeof win?.cancelAnimationFrame === 'function'
+        ? win.cancelAnimationFrame.bind(win)
+        : typeof globalThis.cancelAnimationFrame === 'function'
+          ? globalThis.cancelAnimationFrame.bind(globalThis)
+          : null;
+
+    let partialTextNode: Text | null = null;
+    let pendingPartialText: string | null = null;
+    let partialFrameId: number | ReturnType<typeof setTimeout> | null = null;
+    let partialUsingTimeout = false;
+    let lastPartialPaintAt = 0;
+
+    const cancelPendingPartial = () => {
+      if (partialFrameId !== null) {
+        if (partialUsingTimeout) {
+          clearTimeout(partialFrameId as ReturnType<typeof setTimeout>);
+        } else if (caf) {
+          caf(partialFrameId as number);
+        }
+        partialFrameId = null;
+      }
+      pendingPartialText = null;
+    };
+
+    controller.signal.addEventListener('abort', cancelPendingPartial, {
+      once: true,
+    });
+
+    const syncGlossaryDraftIfUntouched = (text: string) => {
+      if (
+        this.glossaryEditorOpen &&
+        !this.glossaryTargetTouched &&
+        this.glossaryTargetInput
+      ) {
+        this.glossaryTargetInput.value = text;
+        this.syncKeepOriginalPillState();
+      }
+    };
+
+    const paintPartialPreview = (text: string) => {
+      if (controller.signal.aborted || !this.bodyEl) return;
+      this.translatedText = text;
+      this.bodyEl.setAttribute('data-status', 'streaming');
+      this.bodyEl.setAttribute('aria-busy', 'true');
+      if (!partialTextNode || partialTextNode.parentNode !== this.bodyEl) {
+        partialTextNode = this.doc.createTextNode(text);
+        this.bodyEl.replaceChildren(partialTextNode);
+      } else {
+        partialTextNode.textContent = text;
+      }
+      lastPartialPaintAt = perfNow();
+      syncGlossaryDraftIfUntouched(text);
+    };
+
+    const commitFinalBody = (rawText: string) => {
+      cancelPendingPartial();
+      if (controller.signal.aborted || !this.bodyEl) return;
+      const finalText = stripPartialInlineMarkers(rawText).trim();
+      if (!finalText) return;
+      this.translatedText = finalText;
+      this.bodyEl.setAttribute('data-status', 'ready');
+      this.bodyEl.removeAttribute('aria-busy');
+      if (partialTextNode && partialTextNode.parentNode === this.bodyEl) {
+        partialTextNode.textContent = finalText;
+      } else {
+        this.bodyEl.textContent = finalText;
+      }
+      syncGlossaryDraftIfUntouched(finalText);
     };
 
     try {
@@ -1061,52 +1329,68 @@ export class SelectionPopover {
         payload,
         {
           onItemReady: (item) => {
-            if (controller.signal.aborted || !this.bodyEl) return;
-            if (item.id === 1 && item.trans.trim()) {
-              this.translatedText = item.trans.trim();
-              this.bodyEl.setAttribute('data-status', 'ready');
-              this.bodyEl.textContent = this.translatedText;
-              if (
-                this.glossaryEditorOpen &&
-                !this.glossaryTargetTouched &&
-                this.glossaryTargetInput
-              ) {
-                this.glossaryTargetInput.value = this.translatedText;
-                this.syncKeepOriginalPillState();
-              }
+            if (controller.signal.aborted || !this.bodyEl || item.id !== 1) {
+              return;
             }
+            if (item.partial) {
+              const cleaned = stripPartialInlineMarkers(item.trans).trim();
+              if (!cleaned) return;
+              const elapsed = perfNow() - lastPartialPaintAt;
+              if (lastPartialPaintAt === 0 || elapsed >= 16) {
+                cancelPendingPartial();
+                paintPartialPreview(cleaned);
+              } else {
+                pendingPartialText = cleaned;
+                if (partialFrameId === null) {
+                  if (raf) {
+                    partialUsingTimeout = false;
+                    partialFrameId = raf(() => {
+                      partialFrameId = null;
+                      const next = pendingPartialText;
+                      pendingPartialText = null;
+                      if (next) paintPartialPreview(next);
+                    });
+                  } else {
+                    partialUsingTimeout = true;
+                    partialFrameId = setTimeout(() => {
+                      partialFrameId = null;
+                      const next = pendingPartialText;
+                      pendingPartialText = null;
+                      if (next) paintPartialPreview(next);
+                    }, Math.max(1, 16 - Math.floor(elapsed)));
+                  }
+                }
+              }
+              return;
+            }
+            commitFinalBody(item.trans);
           },
         },
         controller.signal,
         preferStream,
       );
 
+      cancelPendingPartial();
       if (controller.signal.aborted || !this.bodyEl) return;
 
       if (!response.ok || !response.items[0]?.trans?.trim()) {
         this.bodyEl.setAttribute('data-status', 'error');
+        this.bodyEl.removeAttribute('aria-busy');
         this.bodyEl.textContent =
           response.error?.message || 'Translation failed.';
         return;
       }
 
-      this.translatedText = response.items[0].trans.trim();
-      this.bodyEl.setAttribute('data-status', 'ready');
-      this.bodyEl.textContent = this.translatedText;
-      if (
-        this.glossaryEditorOpen &&
-        !this.glossaryTargetTouched &&
-        this.glossaryTargetInput
-      ) {
-        this.glossaryTargetInput.value = this.translatedText;
-        this.syncKeepOriginalPillState();
-      }
+      commitFinalBody(response.items[0].trans);
     } catch (err) {
+      cancelPendingPartial();
       if (controller.signal.aborted || !this.bodyEl) return;
       this.bodyEl.setAttribute('data-status', 'error');
+      this.bodyEl.removeAttribute('aria-busy');
       this.bodyEl.textContent =
         err instanceof Error ? err.message : 'Translation failed.';
     } finally {
+      cancelPendingPartial();
       if (this.activeAbortController === controller) {
         this.activeAbortController = null;
       }

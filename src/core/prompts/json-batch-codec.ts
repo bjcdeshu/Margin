@@ -7,6 +7,7 @@ import type {
 } from '@shared/types';
 import {
   buildExpandedPromptVariables,
+  cleanPartialStreamingTrans,
   ensureRichTagInstruction,
   expandAssistantPrompts,
   extractStreamableVisibleText,
@@ -126,6 +127,27 @@ function parseJsonBatchEntries(cleaned: string): RawJsonBatchEntry[] {
   return recovered;
 }
 
+function extractTrailingPartialJsonEntry(
+  visible: string,
+): RawJsonBatchEntry | null {
+  const m =
+    /\{\s*"id"\s*:\s*"?(\d+)"?\s*,\s*"(?:trans|translation|target)"\s*:\s*"((?:\\.|[^"\\])*(?:\\)?)$/.exec(
+      visible,
+    );
+  if (!m) return null;
+  const id = Number.parseInt(m[1], 10);
+  if (!Number.isFinite(id)) return null;
+
+  // Strip trailing incomplete escape (`\` or `\u00`) so JSON.parse succeeds cleanly mid-string
+  const safeBody = m[2].replace(/\\(?:u[0-9a-fA-F]{0,3})?$/, '');
+  try {
+    const trans = JSON.parse(`"${safeBody}"`) as string;
+    return { id, trans };
+  } catch {
+    return null;
+  }
+}
+
 function alignJsonEntries(
   entries: readonly RawJsonBatchEntry[],
   items: readonly BatchItemInput[],
@@ -192,6 +214,16 @@ export class JsonBatchCodec implements PromptCodec {
     const contextLines: string[] = [];
     if (vars.title) contextLines.push(`Document Title: ${vars.title}`);
     if (vars.summary) contextLines.push(`Context Summary: ${vars.summary}`);
+    if (vars.threadContext) {
+      contextLines.push(
+        `Thread / Post Topic (context only — do NOT translate): ${vars.threadContext}`,
+      );
+    }
+    if (vars.prevContext) {
+      contextLines.push(
+        `Preceding Context (for pronoun/tone continuity only — do NOT translate): ${vars.prevContext}`,
+      );
+    }
     if (vars.styleGuide) {
       contextLines.push(`Style Guide: ${vars.styleGuide}`);
     }
@@ -237,6 +269,7 @@ export class JsonBatchCodec implements PromptCodec {
   ): CodecStreamParser {
     let buffer = '';
     const emittedIds = new Set<number>();
+    const lastEmittedPartialById = new Map<number, string>();
 
     return {
       push: (delta: string): BatchItemOutput[] => {
@@ -252,6 +285,26 @@ export class JsonBatchCodec implements PromptCodec {
             newlyReady.push(out);
           }
         }
+
+        const trailingPartial = extractTrailingPartialJsonEntry(visible);
+        if (trailingPartial) {
+          const alignedPartial = alignJsonEntries([trailingPartial], items)[0];
+          if (alignedPartial && !emittedIds.has(alignedPartial.id)) {
+            const cleaned = cleanPartialStreamingTrans(alignedPartial.trans);
+            if (
+              cleaned.replace(/\s+/g, '').length >= 2 &&
+              lastEmittedPartialById.get(alignedPartial.id) !== cleaned
+            ) {
+              lastEmittedPartialById.set(alignedPartial.id, cleaned);
+              newlyReady.push({
+                id: alignedPartial.id,
+                trans: cleaned,
+                partial: true,
+              });
+            }
+          }
+        }
+
         return newlyReady;
       },
 

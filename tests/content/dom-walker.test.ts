@@ -561,4 +561,66 @@ describe('dom-walker: smart paragraph extraction & math/code protection', () => 
     );
     expect(genericCtx.styleGuide).toBeUndefined();
   });
+
+  it('extracts focal-post threadContext (<= 280 chars, skipping Margin injected nodes) on X/Twitter /status/ URLs only', () => {
+    document.title = 'Andrej Karpathy on X';
+    document.body.innerHTML = `
+      <main>
+        <article>
+          <div id="focal-tweet" data-testid="tweetText">
+            We trained a compact reasoning model with speculative decoding and KV-cache compression.
+            <span data-margin-injected="true">这段已注入译文绝不能混入 threadContext</span>
+          </div>
+        </article>
+        <article>
+          <div id="reply-tweet" data-testid="tweetText">
+            How does acceptance rate scale at batch size 32?
+          </div>
+        </article>
+      </main>
+    `;
+
+    const statusCtx = extractPageContext(
+      document,
+      'https://x.com/karpathy/status/123456',
+    );
+    expect(statusCtx.threadContext).toBe(
+      'We trained a compact reasoning model with speculative decoding and KV-cache compression.',
+    );
+    expect(statusCtx.threadContext).not.toContain('这段已注入译文');
+
+    const twitterStatusCtx = extractPageContext(
+      document,
+      'https://twitter.com/karpathy/status/123456?s=20',
+    );
+    expect(twitterStatusCtx.threadContext).toBe(
+      'We trained a compact reasoning model with speculative decoding and KV-cache compression.',
+    );
+
+    // Non-status URLs (home timeline, GitHub) MUST NOT attach threadContext
+    expect(
+      extractPageContext(document, 'https://x.com/home').threadContext,
+    ).toBeUndefined();
+    expect(
+      extractPageContext(document, 'https://github.com/openai/openai-node')
+        .threadContext,
+    ).toBeUndefined();
+
+    // Long focal post is normalized and capped to <= 280 chars
+    document.getElementById('focal-tweet')!.textContent =
+      'Long architectural thread root sentence with detailed token latency benchmarks. '.repeat(
+        6,
+      );
+    const cappedCtx = extractPageContext(
+      document,
+      'https://x.com/karpathy/status/999999',
+    );
+    expect(cappedCtx.threadContext).toBeDefined();
+    expect(cappedCtx.threadContext!.length).toBeLessThanOrEqual(280);
+    expect(
+      cappedCtx.threadContext!.startsWith(
+        'Long architectural thread root sentence',
+      ),
+    ).toBe(true);
+  });
 });

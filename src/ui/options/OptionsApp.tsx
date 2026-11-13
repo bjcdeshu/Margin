@@ -7,9 +7,11 @@ import {
   saveMarginConfig,
 } from '@shared/storage';
 import type { MarginConfig, ModelCapabilityMap } from '@shared/types';
+import { BRAND } from '@shared/brand';
 import {
+  EditorialBadge,
+  Icon,
   PaperShell,
-  StatusPill,
   createSaveTracker,
   useUiColorMode,
   type NavRailItem,
@@ -197,37 +199,59 @@ export function OptionsApp({ initialTab }: OptionsAppProps = {}) {
     () => [
       {
         id: 'general',
+        group: lang === 'en' ? 'Core' : '核心',
+        icon: 'book',
         label: lang === 'en' ? 'Reading & General' : '常规与阅读',
         subtitle: lang === 'en' ? 'Languages, Style & Routing' : '语言、排版样式与渠道路由',
       },
       {
         id: 'providers',
+        group: lang === 'en' ? 'Core' : '核心',
+        icon: 'cpu',
         label: lang === 'en' ? 'AI & Translation Channels' : 'AI 与翻译渠道',
         subtitle: lang === 'en' ? 'Endpoints, Keys & Models' : '接口、密钥池与连通测试',
       },
       {
         id: 'subtitles',
+        group: lang === 'en' ? 'Craft' : '体验与精译',
+        icon: 'film',
         label: lang === 'en' ? 'Subtitles & Interaction' : '视频字幕与交互',
         subtitle: lang === 'en' ? '16:9 Preview, Input & Hover' : '字幕比例预览、三击空格与划词',
       },
       {
         id: 'prompts',
+        group: lang === 'en' ? 'Craft' : '体验与精译',
+        icon: 'sparkle',
         label: lang === 'en' ? 'Prompts & Glossary' : '提示词与术语库',
         subtitle: lang === 'en' ? '<yaml>, %% & Keep-Terms' : '自定义助手与原词保护',
       },
       {
         id: 'rules',
+        group: lang === 'en' ? 'System' : '规则与维护',
+        icon: 'shield',
         label: lang === 'en' ? 'Site URL Rules' : '站点规则',
         subtitle: lang === 'en' ? 'Auto-Translate & Exclusions' : '白名单与排除域名规则',
       },
       {
         id: 'migration',
+        group: lang === 'en' ? 'System' : '规则与维护',
+        icon: 'layers',
         label: lang === 'en' ? 'Migration & Diagnostics' : '配置迁移与诊断',
         subtitle: lang === 'en' ? '1-Click Import & Logs' : '一键导入、备份导出与日志',
       },
     ],
     [lang],
   );
+
+  const isMacPlatform =
+    typeof navigator !== 'undefined' && /Mac|iPhone|iPad/i.test(navigator.platform ?? '');
+  const saveShortcut = isMacPlatform ? '⌘S' : 'Ctrl+S';
+
+  const activeNavIndex = Math.max(
+    0,
+    navItems.findIndex((item) => item.id === activeTab),
+  );
+  const activeNavItem = navItems[activeNavIndex];
 
   const hasUnappliedImport = Boolean(
     stagedImport.importPreview && !stagedImport.importApplied,
@@ -238,47 +262,82 @@ export function OptionsApp({ initialTab }: OptionsAppProps = {}) {
       {hasUnappliedImport && activeTab !== 'migration' ? (
         <button
           type="button"
-          class="mp-btn mp-btn--sm"
-          style={{ borderColor: 'var(--action-solid)', color: 'var(--link)' }}
+          class="mp-btn mp-btn--sm mp-btn--ghost"
+          style={{ color: 'var(--accent-ink)' }}
           onClick={() => setActiveTab('migration')}
         >
+          <span class="mp-dot" aria-hidden="true" />
           {lang === 'en' ? '1 Import Pending Apply →' : '有待应用的导入配置 →'}
         </button>
       ) : null}
 
-      {saveState.status === 'saving' ? (
-        <StatusPill tone="accent" dataTestId="options-save-status">
-          {lang === 'en' ? 'Saving…' : '正在保存…'}
-        </StatusPill>
-      ) : saveState.status === 'error' ? (
-        <StatusPill tone="danger" dataTestId="options-save-status">
-          {lang === 'en' ? 'Save Failed' : `保存失败: ${saveState.errorMessage ?? ''}`}
-        </StatusPill>
-      ) : isDirty ? (
-        <StatusPill tone="accent" dataTestId="options-unsaved-pill">
-          {lang === 'en' ? 'Unsaved edits' : '有未保存更改'}
-        </StatusPill>
-      ) : saveState.status === 'saved' ? (
-        <StatusPill tone="ok" dataTestId="options-save-status">
-          {lang === 'en' ? 'Saved' : '已保存'}
-        </StatusPill>
-      ) : null}
+      <div class="mp-savebar" aria-live="polite">
+        {saveState.status === 'saving' ? (
+          <EditorialBadge tone="accent" pulse dataTestId="options-save-status">
+            {lang === 'en' ? 'Saving…' : '正在保存…'}
+          </EditorialBadge>
+        ) : saveState.status === 'error' ? (
+          <EditorialBadge tone="danger" dataTestId="options-save-status">
+            {lang === 'en' ? 'Save Failed' : `保存失败: ${saveState.errorMessage ?? ''}`}
+          </EditorialBadge>
+        ) : isDirty ? (
+          <EditorialBadge tone="accent" dataTestId="options-unsaved-pill">
+            {lang === 'en' ? 'Unsaved edits' : '有未保存更改'}
+          </EditorialBadge>
+        ) : saveState.status === 'saved' ? (
+          <EditorialBadge tone="ok" dataTestId="options-save-status">
+            {lang === 'en' ? 'Saved' : '已保存'}
+          </EditorialBadge>
+        ) : null}
 
-      {isDirty && persistedBaseline ? (
-        <button type="button" class="mp-btn mp-btn--sm" onClick={handleRevertDraft}>
-          {lang === 'en' ? 'Revert' : '放弃修改'}
+        {isDirty && persistedBaseline ? (
+          <button
+            type="button"
+            class="mp-btn mp-btn--ghost mp-btn--sm"
+            onClick={handleRevertDraft}
+          >
+            <Icon name="restore" size={13} />
+            {lang === 'en' ? 'Revert' : '放弃修改'}
+          </button>
+        ) : null}
+
+        <button
+          type="button"
+          class="mp-btn mp-btn--solid"
+          data-testid="options-save-btn"
+          title={lang === 'en' ? `Save (${saveShortcut})` : `保存设置 (${saveShortcut})`}
+          disabled={!hydrated || !isDirty || saveState.status === 'saving'}
+          onClick={() => void handleSaveChanges()}
+        >
+          {lang === 'en' ? 'Save Changes' : '保存设置'}
+          <kbd class="mp-kbd">{saveShortcut}</kbd>
         </button>
-      ) : null}
+      </div>
+    </>
+  );
 
-      <button
-        type="button"
-        class="mp-btn mp-btn--solid"
-        data-testid="options-save-btn"
-        disabled={!hydrated || !isDirty || saveState.status === 'saving'}
-        onClick={() => void handleSaveChanges()}
-      >
-        {lang === 'en' ? 'Save Changes' : '保存设置'}
-      </button>
+  const masthead = activeNavItem ? (
+    <header class="mp-tab-masthead">
+      <span class="mp-tab-masthead-eyebrow">
+        {`${String(activeNavIndex + 1).padStart(2, '0')} · ${activeNavItem.group ?? 'Studio'}`}
+      </span>
+      <h1 class="mp-tab-masthead-title">{activeNavItem.label}</h1>
+      {activeNavItem.subtitle ? (
+        <p class="mp-tab-masthead-desc">{activeNavItem.subtitle}</p>
+      ) : null}
+    </header>
+  ) : null;
+
+  const navFooter = (
+    <>
+      <div class="mp-nav-footer-row">
+        <span>Margin Studio</span>
+        <span class="mp-pill mp-pill--mono">v{BRAND.version}</span>
+      </div>
+      <div class="mp-nav-footer-row">
+        <span>{lang === 'en' ? 'Save draft' : '保存草稿'}</span>
+        <kbd class="mp-kbd">{saveShortcut}</kbd>
+      </div>
     </>
   );
 
@@ -293,6 +352,8 @@ export function OptionsApp({ initialTab }: OptionsAppProps = {}) {
         headerActions={headerActions}
         navItems={navItems}
         activeNav={activeTab}
+        navFooter={navFooter}
+        masthead={masthead}
         onSelectNav={(nextTab) => {
           pendingFlushRef.current?.();
           setActiveTab(nextTab);

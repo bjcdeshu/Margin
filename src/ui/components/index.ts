@@ -7,3 +7,4 @@ export * from './save-tracker';
 export * from './i18n';
 export * from './theme';
 export * from './endpoint-preview';
+export * from './PaperPrimitives';

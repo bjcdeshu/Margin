@@ -143,7 +143,7 @@ export const BUILTIN_ASSISTANTS: Record<string, AssistantConfig> = {
       '5. Fast YAML Contract: Respond ONLY inside a single <yaml>...</yaml> block where each item has `- id: <number>` and `  trans: <translation>` ONLY. Never include a `thinking` field, preamble, or trailing commentary.',
     ].join('\n'),
     prompt:
-      '{{title_prompt}}{{summary_prompt}}{{style_prompt}}{{glossary_prompt}}Translate into {{to}}:\n<yaml>\n{{yaml}}\n</yaml>',
+      '{{title_prompt}}{{summary_prompt}}{{thread_prompt}}{{context_window_prompt}}{{style_prompt}}{{glossary_prompt}}Translate into {{to}}:\n<yaml>\n{{yaml}}\n</yaml>',
     inputPrompt:
       '{{glossary_prompt}}Rewrite and translate the user draft into concise, idiomatic, native-speaker {{to}} ready to post or send directly (e.g. on X, GitHub issues/PRs, or chat). Preserve @mentions, #hashtags, URLs, Markdown, and inline code verbatim. Output ONLY `- id: 1` and `trans` inside <yaml>:\n<yaml>\n{{yaml}}\n</yaml>',
     selectionPrompt:
@@ -159,6 +159,10 @@ export const BUILTIN_ASSISTANTS: Record<string, AssistantConfig> = {
       imt_sub_trans_field: 'trans',
       title_prompt: 'Document Title: {{title}}\n',
       summary_prompt: 'Context Summary: {{summary}}\n',
+      thread_prompt:
+        'Thread / Post Topic (context only — do NOT translate): {{threadContext}}\n',
+      context_window_prompt:
+        'Preceding Context (for pronoun/tone continuity only — do NOT translate): {{prevContext}}\n',
       style_prompt: 'Style Guide: {{styleGuide}}\n',
       glossary_prompt: '{{glossaryInstruction}}\n',
       terms_prompt: 'Required Glossary: {{imt_terms}}\n',
@@ -184,7 +188,7 @@ export const BUILTIN_ASSISTANTS: Record<string, AssistantConfig> = {
       '4. Respond ONLY inside a <yaml>...</yaml> block using `- id: <number>`, `  thinking: <brief editorial note>`, and `  trans: <final translation>`.',
     ].join('\n'),
     prompt:
-      '{{title_prompt}}{{summary_prompt}}{{style_prompt}}{{glossary_prompt}}Translate into {{to}} with brief `thinking` and polished `trans`:\n<yaml>\n{{yaml}}\n</yaml>',
+      '{{title_prompt}}{{summary_prompt}}{{thread_prompt}}{{context_window_prompt}}{{style_prompt}}{{glossary_prompt}}Translate into {{to}} with brief `thinking` and polished `trans`:\n<yaml>\n{{yaml}}\n</yaml>',
     inputPrompt:
       '{{glossary_prompt}}Translate the user draft into idiomatic, native-speaker {{to}} ready to post on X, GitHub issues/PRs, or chat. Preserve @mentions, #hashtags, URLs, Markdown, and inline code verbatim. Respond inside <yaml> with `id: 1`, brief `thinking`, and `trans`:\n<yaml>\n{{yaml}}\n</yaml>',
     selectionPrompt:
@@ -200,6 +204,10 @@ export const BUILTIN_ASSISTANTS: Record<string, AssistantConfig> = {
       imt_sub_trans_field: 'trans',
       title_prompt: 'Document Title: {{title}}\n',
       summary_prompt: 'Context Summary: {{summary}}\n',
+      thread_prompt:
+        'Thread / Post Topic (context only — do NOT translate): {{threadContext}}\n',
+      context_window_prompt:
+        'Preceding Context (for pronoun/tone continuity only — do NOT translate): {{prevContext}}\n',
       style_prompt: 'Style Guide: {{styleGuide}}\n',
       glossary_prompt: '{{glossaryInstruction}}\n',
       terms_prompt: 'Required Glossary: {{imt_terms}}\n',
@@ -223,7 +231,7 @@ export const BUILTIN_ASSISTANTS: Record<string, AssistantConfig> = {
       'Preserve `%%` paragraph separators, inline <m0>...</m0> / <mN> tags, <m-g id="N"/> placeholders, @handles, #hashtags, URLs, and code verbatim.',
       'Strictly obey any provided Keep-Original and Term Mapping rules, and output ONLY the translated text.',
     ].join(' '),
-    prompt: '{{title_prompt}}{{style_prompt}}{{glossary_prompt}}{{text}}',
+    prompt: '{{title_prompt}}{{thread_prompt}}{{context_window_prompt}}{{style_prompt}}{{glossary_prompt}}{{text}}',
     inputPrompt:
       '{{glossary_prompt}}Rewrite and translate into concise, native-speaker {{to}} ready to send or post (preserving @mentions, #hashtags, URLs, and code verbatim; output ONLY the translation):\n{{text}}',
     selectionPrompt:
@@ -232,6 +240,10 @@ export const BUILTIN_ASSISTANTS: Record<string, AssistantConfig> = {
       '{{title_prompt}}{{sub_summary_prompt}}{{style_prompt}}{{glossary_prompt}}Translate each subtitle cue into natural spoken {{to}}, keeping exact `%%` cue boundaries without shifting words across cues:\n{{text}}',
     env: {
       title_prompt: 'Title: {{title}}\n',
+      thread_prompt:
+        'Thread / Post Topic (context only — do NOT translate): {{threadContext}}\n',
+      context_window_prompt:
+        'Preceding Context (for pronoun/tone continuity only — do NOT translate): {{prevContext}}\n',
       sub_summary_prompt: 'Video Context: {{summary}}\n',
       style_prompt: 'Style Guide: {{styleGuide}}\n',
       glossary_prompt: '{{glossaryInstruction}}\n',
@@ -335,7 +347,7 @@ export function createDefaultMarginConfig(): MarginConfig {
       { k: 'LLMs', v: '' },
     ],
     enabledGlossaryPacks: [...DEFAULT_ENABLED_GLOSSARY_PACK_IDS],
-    promptSystemVersion: 2,
+    promptSystemVersion: 3,
     webpage: {
       displayMode: 'bilingual',
       theme: 'none',

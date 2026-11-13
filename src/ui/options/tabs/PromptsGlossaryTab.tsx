@@ -32,8 +32,15 @@ import type {
 } from '@shared/types';
 import {
   FieldRow,
+  CollapsibleSection,
+  EditorialBadge,
+  EmptyState,
+  Icon,
+  Metric,
   SegmentedControl,
+  SettingGroup,
   StatusPill,
+  SubHead,
   ToggleSwitch,
   labelForCodec,
 } from '../../components';
@@ -70,6 +77,8 @@ const TEMPLATE_VARIABLES = [
   '{{style_prompt}}',
   '{{title_prompt}}',
   '{{summary_prompt}}',
+  '{{thread_prompt}}',
+  '{{context_window_prompt}}',
 ] as const;
 
 const DEFAULT_PREVIEW_SAMPLE_TEXT =
@@ -604,7 +613,8 @@ export function PromptsGlossaryTab({
             </p>
           </div>
           <button type="button" class="mp-btn mp-btn--solid" onClick={handleAddAssistant}>
-            + {lang === 'en' ? 'New Assistant' : '新建助手'}
+            <Icon name="plus" size={13} />
+            {lang === 'en' ? 'New Assistant' : '新建助手'}
           </button>
         </div>
 
@@ -635,9 +645,9 @@ export function PromptsGlossaryTab({
                 <span>{ast.name}</span>
                 <StatusPill tone="mono">{ast.codec}</StatusPill>
                 {isBoundToWebpage ? (
-                  <StatusPill tone="accent">
+                  <EditorialBadge tone="accent">
                     {lang === 'en' ? 'Active' : '当前绑定'}
-                  </StatusPill>
+                  </EditorialBadge>
                 ) : null}
               </button>
             );
@@ -647,18 +657,8 @@ export function PromptsGlossaryTab({
         {assistant ? (
           <div>
             {/* Preset Reset / Template Loader Bar (Staged, never auto-saved) */}
-            <div
-              style={{
-                display: 'flex',
-                alignItems: 'center',
-                justifyContent: 'space-between',
-                gap: '8px',
-                paddingBottom: '12px',
-                borderBottom: '1px solid var(--rule-soft)',
-                flexWrap: 'wrap',
-              }}
-            >
-              <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+            <div class="mp-row mp-row--between mp-preset-bar">
+              <div class="mp-row">
                 <StatusPill tone="mono">{assistant.id}</StatusPill>
                 {builtinPresetForSelected ? (
                   <button
@@ -727,11 +727,12 @@ export function PromptsGlossaryTab({
               </div>
             ) : null}
 
+            <SettingGroup label={lang === 'en' ? 'Assistant Parameters' : '助手参数'}>
             <FieldRow label={lang === 'en' ? 'Assistant Name' : '助手名称'}>
               <input
                 type="text"
                 class="mp-input"
-                style={{ minWidth: '340px' }}
+                style={{ minWidth: '300px' }}
                 value={assistant.name}
                 onInput={(e) => {
                   const val = (e.currentTarget as HTMLInputElement).value;
@@ -782,12 +783,12 @@ export function PromptsGlossaryTab({
               }
             >
               <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
-                <label class="mp-muted" style={{ fontSize: '12px' }}>
+                <label class="mp-inline-field">
                   {lang === 'en' ? 'Web' : '网页'}
                   <input
                     type="number"
                     class="mp-input mp-input--mono"
-                    style={{ width: '68px', marginLeft: '4px' }}
+                    style={{ width: '64px' }}
                     min={1}
                     max={60}
                     value={assistant.maxBatchCount}
@@ -800,12 +801,12 @@ export function PromptsGlossaryTab({
                   />
                 </label>
 
-                <label class="mp-muted" style={{ fontSize: '12px' }}>
+                <label class="mp-inline-field">
                   {lang === 'en' ? 'Subtitle' : '字幕'}
                   <input
                     type="number"
                     class="mp-input mp-input--mono"
-                    style={{ width: '68px', marginLeft: '4px' }}
+                    style={{ width: '64px' }}
                     min={1}
                     max={60}
                     value={assistant.maxSubtitleBatchCount}
@@ -818,12 +819,12 @@ export function PromptsGlossaryTab({
                   />
                 </label>
 
-                <label class="mp-muted" style={{ fontSize: '12px' }}>
+                <label class="mp-inline-field">
                   {lang === 'en' ? 'Chars' : '字符'}
                   <input
                     type="number"
                     class="mp-input mp-input--mono"
-                    style={{ width: '84px', marginLeft: '4px' }}
+                    style={{ width: '80px' }}
                     min={200}
                     max={32000}
                     value={assistant.maxCharsPerBatch}
@@ -883,13 +884,22 @@ export function PromptsGlossaryTab({
                 ) : null}
               </div>
             </FieldRow>
+            </SettingGroup>
 
             {/* 5-Slot Scene & System Prompt Template Editor */}
-            <FieldRow
-              stacked
-              label={lang === 'en' ? 'Prompt Templates (5 Scene Slots)' : '提示词模板编辑器（5 大场景槽位）'}
-              hint={
-                activePromptSlot === 'inputPrompt'
+            <SubHead
+              title={
+                <>
+                  <Icon name="file" />
+                  {lang === 'en'
+                    ? 'Prompt Templates (5 Scene Slots)'
+                    : '提示词模板编辑器（5 大场景槽位）'}
+                </>
+              }
+            />
+            <div class="mp-stack">
+              <p class="mp-field-hint" style={{ margin: 0 }}>
+                {activePromptSlot === 'inputPrompt'
                   ? lang === 'en'
                     ? 'Dedicated prompt for triple-space / Alt+I input-box writing & native expression polishing.'
                     : '专用于输入框三击空格 / Alt+I 快捷写作润色（保留 @提及、#标签、URL 与行内代码）。'
@@ -903,35 +913,35 @@ export function PromptsGlossaryTab({
                         : '专用于视频与 YouTube 双语字幕（口语化表达、严格对齐单条时间轴不串行）。'
                       : lang === 'en'
                         ? 'Switch slots to customize scene prompts; variable chips insert into the draft.'
-                        : '切换上方槽位分别编辑；点击变量芯片可快捷插入草稿，不会自动提交保存。'
-              }
-            >
-              <div style={{ width: '100%', display: 'flex', flexDirection: 'column', gap: '8px' }}>
-                <div
-                  style={{
-                    display: 'flex',
-                    justifyContent: 'space-between',
-                    flexWrap: 'wrap',
-                    gap: '8px',
-                  }}
-                >
-                  <SegmentedControl
-                    ariaLabel={lang === 'en' ? 'Prompt Slot' : '提示词槽位'}
-                    dataTestId="assistant-prompt-slot-tabs"
-                    options={promptSlotOptions}
-                    value={activePromptSlot}
-                    onChange={setActivePromptSlot}
-                  />
+                        : '切换槽位分别编辑；点击变量芯片可快捷插入草稿，不会自动提交保存。'}
+              </p>
 
+              <SegmentedControl
+                ariaLabel={lang === 'en' ? 'Prompt Slot' : '提示词槽位'}
+                dataTestId="assistant-prompt-slot-tabs"
+                options={promptSlotOptions}
+                value={activePromptSlot}
+                onChange={setActivePromptSlot}
+              />
+
+              <div class="mp-code-frame">
+                <div class="mp-code-frame-head">
+                  <span class="mp-eyebrow">
+                    {promptSlotOptions.find((opt) => opt.value === activePromptSlot)?.label}
+                    {' · '}
+                    {activePromptSlot}
+                  </span>
                   <div class="mp-chip-list">
                     {TEMPLATE_VARIABLES.map((token) => (
                       <button
                         key={token}
                         type="button"
-                        class="mp-btn mp-btn--sm mp-mono"
+                        class="mp-var-chip"
+                        title={lang === 'en' ? `Insert ${token}` : `插入 ${token}`}
                         onClick={() => handleInsertVariable(token)}
                       >
-                        +{token}
+                        <span class="mp-var-chip-plus">+</span>
+                        {token}
                       </button>
                     ))}
                   </div>
@@ -940,7 +950,7 @@ export function PromptsGlossaryTab({
                 <textarea
                   class="mp-textarea mp-textarea--mono"
                   data-testid="assistant-prompt-textarea"
-                  style={{ minHeight: '132px' }}
+                  style={{ minHeight: '150px' }}
                   placeholder={
                     activePromptSlot === 'inputPrompt' ||
                     activePromptSlot === 'selectionPrompt' ||
@@ -966,17 +976,13 @@ export function PromptsGlossaryTab({
                   }}
                 />
 
-                {activePromptSlot === 'prompt' ? (
-                  <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
-                    <div
-                      style={{
-                        display: 'flex',
-                        alignItems: 'center',
-                        justifyContent: 'space-between',
-                        gap: '8px',
-                        flexWrap: 'wrap',
-                      }}
-                    >
+                <div class="mp-code-frame-foot">
+                  <span class="mp-muted mp-mono mp-tnum" style={{ fontSize: '11px' }}>
+                    {(assistant[activePromptSlot] ?? '').length}
+                    {lang === 'en' ? ' chars' : ' 字符'}
+                  </span>
+                  {activePromptSlot === 'prompt' ? (
+                    <div class="mp-row mp-row--tight">
                       <button
                         type="button"
                         class="mp-btn mp-btn--ghost mp-btn--sm"
@@ -1008,272 +1014,263 @@ export function PromptsGlossaryTab({
                         </button>
                       ) : null}
                     </div>
-
-                    {showMultiOverride || Boolean(assistant.multiplePrompt?.trim()) ? (
-                      <textarea
-                        class="mp-textarea mp-textarea--mono"
-                        data-testid="assistant-multiple-prompt-textarea"
-                        style={{ minHeight: '96px' }}
-                        placeholder={
-                          lang === 'en'
-                            ? '(Empty — multi-paragraph batches reuse prompt automatically)'
-                            : '（留空默认复用主 prompt 模板）'
-                        }
-                        value={assistant.multiplePrompt ?? ''}
-                        onInput={(e) => {
-                          const val = (e.currentTarget as HTMLTextAreaElement).value;
-                          updateAssistant((ast) => {
-                            if (!val.trim()) {
-                              delete ast.multiplePrompt;
-                            } else {
-                              ast.multiplePrompt = val;
-                            }
-                          });
-                        }}
-                      />
-                    ) : null}
-                  </div>
-                ) : null}
+                  ) : null}
+                </div>
               </div>
-            </FieldRow>
+
+              {activePromptSlot === 'prompt' &&
+              (showMultiOverride || Boolean(assistant.multiplePrompt?.trim())) ? (
+                <div class="mp-code-frame">
+                  <div class="mp-code-frame-head">
+                    <span class="mp-eyebrow">multiplePrompt</span>
+                    <span class="mp-muted" style={{ fontSize: '11.5px' }}>
+                      {lang === 'en'
+                        ? 'Used for multi-paragraph batches'
+                        : '多段落批量请求专用'}
+                    </span>
+                  </div>
+                  <textarea
+                    class="mp-textarea mp-textarea--mono"
+                    data-testid="assistant-multiple-prompt-textarea"
+                    style={{ minHeight: '96px' }}
+                    placeholder={
+                      lang === 'en'
+                        ? '(Empty — multi-paragraph batches reuse prompt automatically)'
+                        : '（留空默认复用主 prompt 模板）'
+                    }
+                    value={assistant.multiplePrompt ?? ''}
+                    onInput={(e) => {
+                      const val = (e.currentTarget as HTMLTextAreaElement).value;
+                      updateAssistant((ast) => {
+                        if (!val.trim()) {
+                          delete ast.multiplePrompt;
+                        } else {
+                          ast.multiplePrompt = val;
+                        }
+                      });
+                    }}
+                  />
+                </div>
+              ) : null}
+            </div>
 
             {/* Collapsible Live Prompt Preview & Sample Tester */}
-            <details
-              class="mp-advanced-details"
-              data-testid="prompt-live-preview-panel"
-              open
-            >
-              <summary class="mp-advanced-summary">
-                <span>
-                  {lang === 'en'
-                    ? 'Live Prompt Expansion Preview & Sample Tester'
-                    : '实时提示词展开预览与在线试译'}
-                </span>
-                <span style={{ display: 'inline-flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+            <CollapsibleSection
+              dataTestId="prompt-live-preview-panel"
+              defaultOpen
+              icon="eye"
+              title={
+                lang === 'en'
+                  ? 'Live Prompt Expansion Preview & Sample Tester'
+                  : '实时提示词展开预览与在线试译'
+              }
+              meta={
+                <>
                   <StatusPill tone="accent" dataTestId="preview-matched-glossary-pill">
                     {lang === 'en'
                       ? `Matched Terms: ${matchedPreviewGlossary.length}`
                       : `命中术语 ${matchedPreviewGlossary.length} 项`}
                   </StatusPill>
                   <StatusPill tone="mono">{previewScene}</StatusPill>
-                  <span class="mp-advanced-chevron">▸</span>
-                </span>
-              </summary>
+                </>
+              }
+              bodyClass="mp-stack mp-stack--loose mp-preview-body"
+            >
+              <div class="mp-row mp-row--between">
+                <SegmentedControl
+                  ariaLabel={lang === 'en' ? 'Preview Scene' : '预览场景'}
+                  dataTestId="preview-scene-control"
+                  options={[
+                    {
+                      value: 'webpage',
+                      label: lang === 'en' ? 'Webpage' : '网页正文',
+                      dataTestId: 'preview-scene-webpage',
+                    },
+                    {
+                      value: 'input',
+                      label: lang === 'en' ? 'Input' : '输入框写作',
+                      dataTestId: 'preview-scene-input',
+                    },
+                    {
+                      value: 'selection',
+                      label: lang === 'en' ? 'Selection' : '划词精译',
+                      dataTestId: 'preview-scene-selection',
+                    },
+                    {
+                      value: 'subtitle',
+                      label: lang === 'en' ? 'Subtitles' : '视频字幕',
+                      dataTestId: 'preview-scene-subtitle',
+                    },
+                  ]}
+                  value={previewScene}
+                  onChange={setPreviewScene}
+                />
 
-              <div class="mp-advanced-body" style={{ paddingTop: '10px', display: 'flex', flexDirection: 'column', gap: '10px' }}>
-                <div
-                  style={{
-                    display: 'flex',
-                    alignItems: 'center',
-                    justifyContent: 'space-between',
-                    gap: '10px',
-                    flexWrap: 'wrap',
-                  }}
-                >
-                  <SegmentedControl
-                    ariaLabel={lang === 'en' ? 'Preview Scene' : '预览场景'}
-                    dataTestId="preview-scene-control"
-                    options={[
-                      {
-                        value: 'webpage',
-                        label: lang === 'en' ? 'Webpage' : '网页正文',
-                        dataTestId: 'preview-scene-webpage',
-                      },
-                      {
-                        value: 'input',
-                        label: lang === 'en' ? 'Input' : '输入框写作',
-                        dataTestId: 'preview-scene-input',
-                      },
-                      {
-                        value: 'selection',
-                        label: lang === 'en' ? 'Selection' : '划词精译',
-                        dataTestId: 'preview-scene-selection',
-                      },
-                      {
-                        value: 'subtitle',
-                        label: lang === 'en' ? 'Subtitles' : '视频字幕',
-                        dataTestId: 'preview-scene-subtitle',
-                      },
-                    ]}
-                    value={previewScene}
-                    onChange={setPreviewScene}
-                  />
-
-                  <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
-                    <label class="mp-muted" style={{ fontSize: '12px' }}>
-                      {lang === 'en' ? 'Sample Domain' : '模拟站点语境'}
-                    </label>
-                    <select
-                      class="mp-select"
-                      data-testid="preview-domain-select"
-                      aria-label={lang === 'en' ? 'Sample Domain' : '模拟站点语境'}
-                      value={sampleDomain}
-                      onChange={(e) =>
-                        setSampleDomain(
-                          (e.currentTarget as HTMLSelectElement).value as SampleDomainKey,
-                        )
-                      }
-                    >
-                      <option value="x.com">x.com (Social Thread)</option>
-                      <option value="github.com">github.com (PR / Docs)</option>
-                      <option value="youtube.com">youtube.com (Creator Subtitles)</option>
-                      <option value="arxiv.org">arxiv.org (Research Paper)</option>
-                      <option value="none">
-                        {lang === 'en' ? 'None (Plain Text Only)' : '无站点上下文 (纯文本)'}
-                      </option>
-                    </select>
-                  </div>
-                </div>
-
-                <div>
-                  <label
-                    class="mp-muted"
-                    style={{ display: 'block', fontSize: '12px', marginBottom: '4px' }}
-                  >
-                    {lang === 'en'
-                      ? 'Editable Sample Source Text (auto-injects matched glossary & domain style guide below)'
-                      : '试译示例源文本（实时匹配保留原文词、强制译名与站点文风指南）'}
-                  </label>
-                  <textarea
-                    class="mp-textarea"
-                    data-testid="preview-sample-textarea"
-                    style={{ minHeight: '64px' }}
-                    value={sampleText}
-                    onInput={(e) =>
-                      setSampleText((e.currentTarget as HTMLTextAreaElement).value)
+                <label class="mp-inline-field">
+                  <Icon name="globe" size={13} />
+                  {lang === 'en' ? 'Sample Domain' : '模拟站点语境'}
+                  <select
+                    class="mp-select"
+                    data-testid="preview-domain-select"
+                    aria-label={lang === 'en' ? 'Sample Domain' : '模拟站点语境'}
+                    value={sampleDomain}
+                    onChange={(e) =>
+                      setSampleDomain(
+                        (e.currentTarget as HTMLSelectElement).value as SampleDomainKey,
+                      )
                     }
-                  />
-                </div>
+                  >
+                    <option value="x.com">x.com (Social Thread)</option>
+                    <option value="github.com">github.com (PR / Docs)</option>
+                    <option value="youtube.com">youtube.com (Creator Subtitles)</option>
+                    <option value="arxiv.org">arxiv.org (Research Paper)</option>
+                    <option value="none">
+                      {lang === 'en' ? 'None (Plain Text Only)' : '无站点上下文 (纯文本)'}
+                    </option>
+                  </select>
+                </label>
+              </div>
 
-                {expandedPreview ? (
-                  <div class="mp-preview-grid">
-                    <div class="mp-preview-pane">
-                      <span class="mp-muted mp-mono" style={{ fontSize: '11.5px' }}>
-                        Expanded System Prompt
-                      </span>
-                      <pre class="mp-preview-code" data-testid="preview-expanded-system">
-                        {expandedPreview.systemPrompt || '(empty)'}
-                      </pre>
-                    </div>
-                    <div class="mp-preview-pane">
-                      <span class="mp-muted mp-mono" style={{ fontSize: '11.5px' }}>
-                        Expanded User Prompt
-                      </span>
-                      <pre class="mp-preview-code" data-testid="preview-expanded-user">
-                        {expandedPreview.userPrompt || '(empty)'}
-                      </pre>
-                    </div>
-                  </div>
-                ) : null}
-
-                <div
-                  style={{
-                    display: 'flex',
-                    alignItems: 'center',
-                    justifyContent: 'space-between',
-                    gap: '10px',
-                    flexWrap: 'wrap',
-                    paddingTop: '4px',
-                  }}
-                >
-                  <span class="mp-muted" style={{ fontSize: '12px' }}>
-                    {lang === 'en' ? 'Active Channel for Scene:' : '当前场景生效试译渠道：'}{' '}
-                    <span class="mp-mono" style={{ color: 'var(--ink)' }}>
-                      {activeSceneProvider
-                        ? `${activeSceneProvider.name} · ${activeSceneProvider.model}`
-                        : activeSceneProviderId}
-                    </span>
+              <div class="mp-code-frame">
+                <div class="mp-code-frame-head">
+                  <span class="mp-eyebrow">{lang === 'en' ? 'Sample Source' : '试译示例源文本'}</span>
+                  <span class="mp-muted" style={{ fontSize: '11.5px' }}>
+                    {lang === 'en'
+                      ? 'Auto-injects matched glossary & domain style guide'
+                      : '实时匹配保留原文词、强制译名与站点文风指南'}
                   </span>
-
-                  <button
-                    type="button"
-                    class="mp-btn mp-btn--solid"
-                    data-testid="preview-run-translate-btn"
-                    disabled={trialRunning || !sampleText.trim()}
-                    onClick={() => void handleRunLiveTrial()}
-                  >
-                    {trialRunning
-                      ? lang === 'en'
-                        ? 'Translating…'
-                        : '在线试译中…'
-                      : lang === 'en'
-                        ? 'Live Translate Sample'
-                        : '在线试译'}
-                  </button>
                 </div>
+                <textarea
+                  class="mp-textarea"
+                  data-testid="preview-sample-textarea"
+                  style={{ minHeight: '68px' }}
+                  value={sampleText}
+                  onInput={(e) =>
+                    setSampleText((e.currentTarget as HTMLTextAreaElement).value)
+                  }
+                />
+              </div>
 
-                {trialResult ? (
-                  <div
-                    class="mp-editorial-note"
-                    data-testid="preview-translate-result"
-                    style={{
-                      margin: 0,
-                      borderLeftColor: trialResult.ok
-                        ? 'var(--ok-ink)'
-                        : 'var(--danger-ink)',
-                    }}
-                  >
-                    {trialResult.ok ? (
-                      <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
-                        <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
-                          <StatusPill tone="ok">
-                            {lang === 'en' ? 'Translated' : '试译完成'} · {trialResult.latencyMs}ms
-                          </StatusPill>
-                          {trialResult.model ? (
-                            <StatusPill tone="mono">{trialResult.model}</StatusPill>
-                          ) : null}
-                        </div>
-                        <div style={{ color: 'var(--ink)', fontSize: '13.5px', lineHeight: 1.55 }}>
-                          {trialResult.translation}
-                        </div>
-                        {trialResult.thinking ? (
-                          <div class="mp-muted mp-mono" style={{ fontSize: '11.5px' }}>
-                            thinking: {trialResult.thinking}
-                          </div>
+              {expandedPreview ? (
+                <div class="mp-preview-grid">
+                  <div class="mp-preview-pane">
+                    <div class="mp-preview-pane-head">
+                      <span>System Prompt</span>
+                      <span class="mp-tnum">{(expandedPreview.systemPrompt || '').length}</span>
+                    </div>
+                    <pre class="mp-preview-code" data-testid="preview-expanded-system">
+                      {expandedPreview.systemPrompt || '(empty)'}
+                    </pre>
+                  </div>
+                  <div class="mp-preview-pane">
+                    <div class="mp-preview-pane-head">
+                      <span>User Prompt</span>
+                      <span class="mp-tnum">{(expandedPreview.userPrompt || '').length}</span>
+                    </div>
+                    <pre class="mp-preview-code" data-testid="preview-expanded-user">
+                      {expandedPreview.userPrompt || '(empty)'}
+                    </pre>
+                  </div>
+                </div>
+              ) : null}
+
+              <div class="mp-row mp-row--between">
+                <span class="mp-inline-field">
+                  <Icon name="route" size={13} />
+                  {lang === 'en' ? 'Active channel for scene' : '当前场景生效试译渠道'}
+                  <span class="mp-pill mp-pill--mono">
+                    {activeSceneProvider
+                      ? `${activeSceneProvider.name} · ${activeSceneProvider.model}`
+                      : activeSceneProviderId}
+                  </span>
+                </span>
+
+                <button
+                  type="button"
+                  class="mp-btn mp-btn--solid"
+                  data-testid="preview-run-translate-btn"
+                  disabled={trialRunning || !sampleText.trim()}
+                  onClick={() => void handleRunLiveTrial()}
+                >
+                  <Icon name={trialRunning ? 'pulse' : 'bolt'} size={13} />
+                  {trialRunning
+                    ? lang === 'en'
+                      ? 'Translating…'
+                      : '在线试译中…'
+                    : lang === 'en'
+                      ? 'Live Translate Sample'
+                      : '在线试译'}
+                </button>
+              </div>
+
+              {trialResult ? (
+                <div
+                  class="mp-trial-result"
+                  data-ok={trialResult.ok ? 'true' : 'false'}
+                  data-testid="preview-translate-result"
+                >
+                  {trialResult.ok ? (
+                    <>
+                      <div class="mp-row">
+                        <EditorialBadge tone="ok">
+                          {lang === 'en' ? 'Translated' : '试译完成'} · {trialResult.latencyMs}ms
+                        </EditorialBadge>
+                        {trialResult.model ? (
+                          <StatusPill tone="mono">{trialResult.model}</StatusPill>
                         ) : null}
                       </div>
-                    ) : (
-                      <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
-                        <StatusPill tone="danger">
-                          {lang === 'en' ? 'Trial Failed' : '试译失败'}
-                        </StatusPill>
-                        <span>{trialResult.error}</span>
-                      </div>
-                    )}
-                  </div>
-                ) : null}
-              </div>
-            </details>
+                      <div class="mp-trial-translation">{trialResult.translation}</div>
+                      {trialResult.thinking ? (
+                        <div class="mp-muted mp-mono" style={{ fontSize: '11.5px' }}>
+                          thinking: {trialResult.thinking}
+                        </div>
+                      ) : null}
+                    </>
+                  ) : (
+                    <div class="mp-row">
+                      <EditorialBadge tone="danger">
+                        {lang === 'en' ? 'Trial Failed' : '试译失败'}
+                      </EditorialBadge>
+                      <span style={{ color: 'var(--danger-ink)', fontSize: '12.5px' }}>
+                        {trialResult.error}
+                      </span>
+                    </div>
+                  )}
+                </div>
+              ) : null}
+            </CollapsibleSection>
 
-            {/* env Key-Value Editor */}
-            <FieldRow
-              stacked
-              label={lang === 'en' ? 'Environment Macros (env)' : '环境变量宏片段 (env 键值表)'}
-              hint={
-                lang === 'en'
-                  ? 'Two-pass conditional template macros such as imt_yaml_item, title_prompt, style_prompt, glossary_prompt'
-                  : '支持 imt_yaml_item、title_prompt、style_prompt、glossary_prompt 等两阶段条件展开变量（空值自动剪枝）'
+            {/* env Key-Value Editor — low-frequency, collapsed by default */}
+            <CollapsibleSection
+              quiet
+              icon="layers"
+              title={lang === 'en' ? 'Advanced Macro Snippets (env)' : '高级宏变量片段 (env)'}
+              meta={
+                <StatusPill tone="mono">
+                  {lang === 'en'
+                    ? `${Object.keys(assistant.env).length} items`
+                    : `${Object.keys(assistant.env).length} 项`}
+                </StatusPill>
               }
+              bodyClass="mp-env-body"
             >
-              <div style={{ width: '100%', display: 'flex', flexDirection: 'column', gap: '6px' }}>
+              <p class="mp-field-hint" style={{ margin: '10px 0 4px' }}>
+                {lang === 'en'
+                  ? 'Two-pass conditional template macros such as imt_yaml_item, title_prompt, style_prompt, glossary_prompt'
+                  : '支持 imt_yaml_item、title_prompt、style_prompt、glossary_prompt 等两阶段条件展开变量（空值自动剪枝）'}
+              </p>
+              <div class="mp-env-list">
                 {Object.entries(assistant.env).map(([envKey, envVal]) => (
-                  <div
-                    key={envKey}
-                    style={{ display: 'flex', alignItems: 'flex-start', gap: '8px' }}
-                  >
-                    <span
-                      class="mp-chip"
-                      style={{ minWidth: '168px', justifyContent: 'space-between' }}
-                    >
+                  <div key={envKey} class="mp-env-row">
+                    <span class="mp-env-key" title={envKey}>
                       {envKey}
                     </span>
                     <textarea
                       class="mp-textarea mp-textarea--mono"
                       rows={envVal.includes('\n') ? Math.min(4, envVal.split('\n').length) : 1}
                       style={{
-                        flex: 1,
-                        minHeight: envVal.includes('\n') ? '64px' : '34px',
-                        padding: '6px 10px',
+                        minHeight: envVal.includes('\n') ? '64px' : '32px',
+                        padding: '5px 10px',
                       }}
                       value={envVal}
                       onInput={(e) => {
@@ -1285,51 +1282,51 @@ export function PromptsGlossaryTab({
                     />
                     <button
                       type="button"
-                      class="mp-btn mp-btn--ghost mp-btn--sm"
+                      class="mp-icon-btn"
+                      aria-label={lang === 'en' ? `Remove ${envKey}` : `删除 ${envKey}`}
                       onClick={() =>
                         updateAssistant((ast) => {
                           delete ast.env[envKey];
                         })
                       }
                     >
-                      ×
+                      <Icon name="x" size={13} />
                     </button>
                   </div>
                 ))}
-
-                <div style={{ display: 'flex', gap: '8px', paddingTop: '4px' }}>
-                  <input
-                    type="text"
-                    class="mp-input mp-input--mono"
-                    style={{ width: '168px' }}
-                    placeholder="env_key"
-                    value={newEnvKey}
-                    onInput={(e) => setNewEnvKey((e.currentTarget as HTMLInputElement).value)}
-                  />
-                  <input
-                    type="text"
-                    class="mp-input mp-input--mono"
-                    style={{ flex: 1 }}
-                    placeholder="Template value..."
-                    value={newEnvVal}
-                    onInput={(e) => setNewEnvVal((e.currentTarget as HTMLInputElement).value)}
-                    onKeyDown={(e) => {
-                      if (e.key === 'Enter') {
-                        e.preventDefault();
-                        commitPendingEnvEntry();
-                      }
-                    }}
-                  />
-                  <button
-                    type="button"
-                    class="mp-btn mp-btn--sm"
-                    onClick={() => commitPendingEnvEntry()}
-                  >
-                    + {lang === 'en' ? 'Add env' : '添加变量'}
-                  </button>
-                </div>
               </div>
-            </FieldRow>
+
+              <div class="mp-env-row mp-env-row--new">
+                <input
+                  type="text"
+                  class="mp-input mp-input--mono"
+                  placeholder="env_key"
+                  value={newEnvKey}
+                  onInput={(e) => setNewEnvKey((e.currentTarget as HTMLInputElement).value)}
+                />
+                <input
+                  type="text"
+                  class="mp-input mp-input--mono"
+                  placeholder="Template value..."
+                  value={newEnvVal}
+                  onInput={(e) => setNewEnvVal((e.currentTarget as HTMLInputElement).value)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') {
+                      e.preventDefault();
+                      commitPendingEnvEntry();
+                    }
+                  }}
+                />
+                <button
+                  type="button"
+                  class="mp-btn mp-btn--sm"
+                  onClick={() => commitPendingEnvEntry()}
+                >
+                  <Icon name="plus" size={12} />
+                  {lang === 'en' ? 'Add env' : '添加变量'}
+                </button>
+              </div>
+            </CollapsibleSection>
           </div>
         ) : null}
       </section>
@@ -1364,6 +1361,9 @@ export function PromptsGlossaryTab({
             const visibleEntries = isExpanded
               ? pack.entries
               : pack.entries.slice(0, 6);
+            const keepCount = pack.entries.filter(
+              (entry) => String(entry.v ?? '').trim() === '',
+            ).length;
 
             return (
               <div
@@ -1373,14 +1373,16 @@ export function PromptsGlossaryTab({
                 data-enabled={enabled ? 'true' : 'false'}
               >
                 <div class="mp-pack-head">
-                  <div class="mp-pack-title-line">
-                    <span class="mp-pack-title">{pack.name}</span>
-                    <StatusPill tone="accent">{pack.badge}</StatusPill>
-                    <StatusPill tone="mono">
+                  <div class="mp-stack mp-stack--tight">
+                    <div class="mp-pack-title-line">
+                      <span class="mp-pack-title">{pack.name}</span>
+                      <StatusPill tone="accent">{pack.badge}</StatusPill>
+                    </div>
+                    <span class="mp-pack-count mp-tnum">
                       {lang === 'en'
-                        ? `${pack.entries.length} terms`
-                        : `${pack.entries.length} 词`}
-                    </StatusPill>
+                        ? `${pack.entries.length} terms · ${keepCount} keep · ${pack.entries.length - keepCount} mapped`
+                        : `${pack.entries.length} 词 · 保留 ${keepCount} · 译名 ${pack.entries.length - keepCount}`}
+                    </span>
                   </div>
 
                   <ToggleSwitch
@@ -1397,14 +1399,25 @@ export function PromptsGlossaryTab({
                   {visibleEntries.map((entry) => {
                     const isKeep = String(entry.v ?? '').trim() === '';
                     return (
-                      <span key={entry.k} class="mp-pack-term-pill">
+                      <span
+                        key={entry.k}
+                        class="mp-pack-term-pill"
+                        data-kind={isKeep ? 'keep' : 'map'}
+                      >
                         <span>{entry.k}</span>
                         <span class="mp-pack-term-target">
-                          {isKeep
-                            ? lang === 'en'
-                              ? 'Keep'
-                              : '保留原文'
-                            : `=> ${entry.v}`}
+                          {isKeep ? (
+                            lang === 'en' ? (
+                              'Keep'
+                            ) : (
+                              '保留原文'
+                            )
+                          ) : (
+                            <>
+                              <span class="mp-visually-hidden">{'=> '}</span>
+                              {entry.v}
+                            </>
+                          )}
                         </span>
                       </span>
                     );
@@ -1412,11 +1425,12 @@ export function PromptsGlossaryTab({
                 </div>
 
                 {pack.entries.length > 6 ? (
-                  <div>
+                  <div class="mp-pack-foot">
                     <button
                       type="button"
                       class="mp-btn mp-btn--ghost mp-btn--sm"
                       data-testid={`glossary-pack-expand-${pack.id}`}
+                      aria-expanded={isExpanded ? 'true' : 'false'}
                       onClick={() =>
                         setExpandedPacks((prev) => ({
                           ...prev,
@@ -1424,6 +1438,7 @@ export function PromptsGlossaryTab({
                         }))
                       }
                     >
+                      <Icon name={isExpanded ? 'chevron-down' : 'chevron-right'} size={12} />
                       {isExpanded
                         ? lang === 'en'
                           ? 'Collapse Terms'
@@ -1440,268 +1455,291 @@ export function PromptsGlossaryTab({
         </div>
 
         {/* Custom Glossary Sub-header + Search + Add */}
-        <div
-          style={{
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'space-between',
-            gap: '10px',
-            flexWrap: 'wrap',
-            marginTop: '20px',
-            paddingTop: '16px',
-            borderTop: '1px solid var(--rule-soft)',
-          }}
-        >
-          <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
-            <strong style={{ fontSize: '14px', color: 'var(--ink)' }}>
+        <SubHead
+          title={
+            <>
               {lang === 'en' ? 'Custom Glossary Rules' : '自定义术语与原词保护规则'}
-            </strong>
-            <StatusPill tone="mono">{draft.glossary.length}</StatusPill>
-          </div>
+              <StatusPill tone="mono">{draft.glossary.length}</StatusPill>
+            </>
+          }
+          actions={
+            <>
+              <input
+                type="search"
+                class="mp-input"
+                data-testid="glossary-search-input"
+                style={{ width: '220px' }}
+                placeholder={
+                  lang === 'en' ? 'Filter custom terms…' : '搜索源词、译词或域名…'
+                }
+                value={glossarySearch}
+                onInput={(e) =>
+                  setGlossarySearch((e.currentTarget as HTMLInputElement).value)
+                }
+              />
+              <button
+                type="button"
+                class="mp-btn mp-btn--solid"
+                data-testid="glossary-add-btn"
+                onClick={() =>
+                  onMutate((d) => {
+                    d.glossary = [...d.glossary, { k: '', v: '' }];
+                  })
+                }
+              >
+                <Icon name="plus" size={13} />
+                {lang === 'en' ? 'Add Term' : '添加术语'}
+              </button>
+            </>
+          }
+        />
 
-          <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
-            <input
-              type="search"
-              class="mp-input"
-              data-testid="glossary-search-input"
-              style={{ width: '210px' }}
-              placeholder={
-                lang === 'en' ? 'Filter custom terms…' : '搜索源词、译词或域名…'
-              }
-              value={glossarySearch}
-              onInput={(e) =>
-                setGlossarySearch((e.currentTarget as HTMLInputElement).value)
-              }
-            />
-            <button
-              type="button"
-              class="mp-btn mp-btn--solid"
-              data-testid="glossary-add-btn"
-              onClick={() =>
-                onMutate((d) => {
-                  d.glossary = [...d.glossary, { k: '', v: '' }];
-                })
-              }
-            >
-              + {lang === 'en' ? 'Add Term' : '添加术语'}
-            </button>
-          </div>
-        </div>
-
-        <div class="mp-editorial-note">
+        <div class="mp-editorial-note" style={{ marginTop: 0 }}>
           {lang === 'en'
             ? 'Tip: Leave target blank ("") for Keep-Original terms (e.g. LLM), or enter a target phrase for exact translation. Optional domain (e.g. x.com) scopes the rule to matching sites.'
             : '提示：译文留空代表「保留原文」不翻译（如 LLM）；填写译词代表「指定译法」；可可选填写限定域名（如 x.com）。停用某条自定义词条也会同步屏蔽同名内置词条。'}
         </div>
 
-        <div class="mp-flat-list" data-testid="custom-glossary-list">
-          {filteredCustomGlossary.map(({ entry: item, idx }) => {
-            const isKeepOriginal = String(item.v ?? '').trim() === '';
-            const isEntryEnabled = item.enabled !== false;
+        <div class="mp-card mp-glossary-card">
+          {filteredCustomGlossary.length > 0 ? (
+            <div class="mp-glossary-head" aria-hidden="true">
+              <span />
+              <span>{lang === 'en' ? 'Source' : '源词'}</span>
+              <span style={{ textAlign: 'center' }}>{lang === 'en' ? 'Type' : '类型'}</span>
+              <span>{lang === 'en' ? 'Target' : '译词'}</span>
+              <span>{lang === 'en' ? 'Domain' : '限定域名'}</span>
+              <span />
+            </div>
+          ) : null}
 
-            return (
-              <div
-                key={idx}
-                class="mp-flat-item"
-                data-testid={`glossary-row-${idx}`}
-                style={{ opacity: isEntryEnabled ? 1 : 0.6 }}
-              >
-                <ToggleSwitch
-                  ariaLabel={
-                    lang === 'en'
-                      ? `Enable term ${item.k || idx}`
-                      : `启用术语 ${item.k || idx}`
-                  }
-                  dataTestId={`glossary-item-toggle-${idx}`}
-                  checked={isEntryEnabled}
-                  onChange={(next) =>
-                    onMutate((d) => {
-                      const row = d.glossary[idx];
-                      if (!row) return;
-                      if (next) {
-                        delete row.enabled;
-                      } else {
-                        row.enabled = false;
-                      }
-                    })
-                  }
-                />
-
-                <input
-                  type="text"
-                  class="mp-input mp-input--mono"
-                  style={{ flex: '1 1 140px' }}
-                  placeholder={lang === 'en' ? 'Source term (e.g. LLM)' : '源词 (如 LLM)'}
-                  value={item.k}
-                  onInput={(e) => {
-                    const val = (e.currentTarget as HTMLInputElement).value;
-                    onMutate((d) => {
-                      if (d.glossary[idx]) d.glossary[idx].k = val;
-                    });
-                  }}
-                />
-
-                <StatusPill tone={isKeepOriginal ? 'mono' : 'accent'}>
-                  {isKeepOriginal
+          <div class="mp-flat-list" data-testid="custom-glossary-list">
+            {filteredCustomGlossary.length === 0 ? (
+              <EmptyState
+                title={
+                  glossarySearch.trim()
                     ? lang === 'en'
-                      ? 'Keep Original'
-                      : '保留原文'
+                      ? 'No matching terms'
+                      : '没有匹配的自定义术语'
                     : lang === 'en'
-                      ? 'Mapped'
-                      : '指定译法'}
-                </StatusPill>
+                      ? 'No custom terms yet'
+                      : '还没有自定义术语'
+                }
+              >
+                {glossarySearch.trim()
+                  ? lang === 'en'
+                    ? 'Try a different source term, target, or domain.'
+                    : '换个源词、译词或域名试试。'
+                  : lang === 'en'
+                    ? 'Built-in packs above are already active. Add a term to override them.'
+                    : '上方内置术语包已生效；添加术语即可覆盖或补充。'}
+              </EmptyState>
+            ) : null}
 
-                <input
-                  type="text"
-                  class="mp-input"
-                  style={{ flex: '1 1 180px' }}
-                  placeholder={
-                    lang === 'en'
-                      ? 'Keep original untranslated (leave empty)'
-                      : '留空 = 保留原文不翻译'
-                  }
-                  value={item.v}
-                  onInput={(e) => {
-                    const val = (e.currentTarget as HTMLInputElement).value;
-                    onMutate((d) => {
-                      if (d.glossary[idx]) d.glossary[idx].v = val;
-                    });
-                  }}
-                />
+            {filteredCustomGlossary.map(({ entry: item, idx }) => {
+              const isKeepOriginal = String(item.v ?? '').trim() === '';
+              const isEntryEnabled = item.enabled !== false;
 
-                <input
-                  type="text"
-                  class="mp-input mp-input--mono"
-                  style={{ width: '132px' }}
-                  placeholder={lang === 'en' ? 'Domain (x.com)' : '限定域名 (如 x.com)'}
-                  value={item.domain ?? ''}
-                  onInput={(e) => {
-                    const val = (e.currentTarget as HTMLInputElement).value;
-                    onMutate((d) => {
-                      if (d.glossary[idx]) {
-                        if (val.trim()) {
-                          d.glossary[idx].domain = val;
-                        } else {
-                          delete d.glossary[idx].domain;
-                        }
-                      }
-                    });
-                  }}
-                />
-
-                <button
-                  type="button"
-                  class="mp-btn mp-btn--ghost mp-btn--sm"
-                  aria-label={`Remove term ${item.k || idx}`}
-                  onClick={() =>
-                    onMutate((d) => {
-                      d.glossary = d.glossary.filter((_, i) => i !== idx);
-                    })
-                  }
+              return (
+                <div
+                  key={idx}
+                  class="mp-glossary-row"
+                  data-testid={`glossary-row-${idx}`}
+                  data-enabled={isEntryEnabled ? 'true' : 'false'}
+                  style={{ opacity: isEntryEnabled ? 1 : 0.55 }}
                 >
-                  ×
-                </button>
-              </div>
-            );
-          })}
+                  <ToggleSwitch
+                    ariaLabel={
+                      lang === 'en'
+                        ? `Enable term ${item.k || idx}`
+                        : `启用术语 ${item.k || idx}`
+                    }
+                    dataTestId={`glossary-item-toggle-${idx}`}
+                    checked={isEntryEnabled}
+                    onChange={(next) =>
+                      onMutate((d) => {
+                        const row = d.glossary[idx];
+                        if (!row) return;
+                        if (next) {
+                          delete row.enabled;
+                        } else {
+                          row.enabled = false;
+                        }
+                      })
+                    }
+                  />
+
+                  <input
+                    type="text"
+                    class="mp-input mp-input--mono"
+                    placeholder={lang === 'en' ? 'Source term (e.g. LLM)' : '源词 (如 LLM)'}
+                    value={item.k}
+                    onInput={(e) => {
+                      const val = (e.currentTarget as HTMLInputElement).value;
+                      onMutate((d) => {
+                        if (d.glossary[idx]) d.glossary[idx].k = val;
+                      });
+                    }}
+                  />
+
+                  <StatusPill tone={isKeepOriginal ? 'neutral' : 'accent'}>
+                    {isKeepOriginal
+                      ? lang === 'en'
+                        ? 'Keep Original'
+                        : '保留原文'
+                      : lang === 'en'
+                        ? 'Mapped'
+                        : '指定译法'}
+                  </StatusPill>
+
+                  <input
+                    type="text"
+                    class="mp-input"
+                    placeholder={
+                      lang === 'en'
+                        ? 'Keep original untranslated (leave empty)'
+                        : '留空 = 保留原文不翻译'
+                    }
+                    value={item.v}
+                    onInput={(e) => {
+                      const val = (e.currentTarget as HTMLInputElement).value;
+                      onMutate((d) => {
+                        if (d.glossary[idx]) d.glossary[idx].v = val;
+                      });
+                    }}
+                  />
+
+                  <input
+                    type="text"
+                    class="mp-input mp-input--mono mp-glossary-domain"
+                    placeholder={lang === 'en' ? 'Domain (x.com)' : '限定域名 (如 x.com)'}
+                    value={item.domain ?? ''}
+                    onInput={(e) => {
+                      const val = (e.currentTarget as HTMLInputElement).value;
+                      onMutate((d) => {
+                        if (d.glossary[idx]) {
+                          if (val.trim()) {
+                            d.glossary[idx].domain = val;
+                          } else {
+                            delete d.glossary[idx].domain;
+                          }
+                        }
+                      });
+                    }}
+                  />
+
+                  <button
+                    type="button"
+                    class="mp-icon-btn"
+                    aria-label={`Remove term ${item.k || idx}`}
+                    onClick={() =>
+                      onMutate((d) => {
+                        d.glossary = d.glossary.filter((_, i) => i !== idx);
+                      })
+                    }
+                  >
+                    <Icon name="x" size={13} />
+                  </button>
+                </div>
+              );
+            })}
+          </div>
         </div>
 
         {/* Collapsible Bulk Text Import / Export */}
-        <details class="mp-advanced-details" data-testid="glossary-bulk-panel">
-          <summary class="mp-advanced-summary">
-            <span>
-              {lang === 'en'
-                ? 'Bulk Text Import / Export (source = target or bare Keep-Original)'
-                : '批量文本导入 / 导出（源词 = 译词 或单行保留原文）'}
-            </span>
-            <span class="mp-advanced-chevron">▸</span>
-          </summary>
+        <CollapsibleSection
+          quiet
+          icon="upload"
+          dataTestId="glossary-bulk-panel"
+          title={
+            lang === 'en'
+              ? 'Bulk Text Import / Export (source = target or bare Keep-Original)'
+              : '批量文本导入 / 导出（源词 = 译词 或单行保留原文）'
+          }
+          bodyClass="mp-stack mp-bulk-body"
+        >
+          <p class="mp-field-hint" style={{ margin: 0 }}>
+            {lang === 'en'
+              ? 'Format: one entry per line — `Context Window = 上下文窗口`, `Phantom Blade Zero => 影之刃零`, or bare `LLM` to keep original. Optional `@x.com` suffix scopes domain.'
+              : '支持每行一条：`Context Window = 上下文窗口`、`Phantom Blade Zero => 影之刃零`，或单写 `LLM` 表示保留原文；末尾可加 `@x.com` 限定域名。'}
+          </p>
 
-          <div
-            class="mp-advanced-body"
-            style={{ paddingTop: '10px', display: 'flex', flexDirection: 'column', gap: '8px' }}
-          >
-            <p class="mp-muted" style={{ margin: 0, fontSize: '12px', lineHeight: 1.5 }}>
-              {lang === 'en'
-                ? 'Format: one entry per line — `Context Window = 上下文窗口`, `Phantom Blade Zero => 影之刃零`, or bare `LLM` to keep original. Optional `@x.com` suffix scopes domain.'
-                : '支持每行一条：`Context Window = 上下文窗口`、`Phantom Blade Zero => 影之刃零`，或单写 `LLM` 表示保留原文；末尾可加 `@x.com` 限定域名。'}
-            </p>
-
+          <div class="mp-code-frame">
             <textarea
               class="mp-textarea mp-textarea--mono"
               data-testid="glossary-bulk-textarea"
-              style={{ minHeight: '108px' }}
+              style={{ minHeight: '120px' }}
               placeholder={'LLM\nContext Window = 上下文窗口\nParry = 弹反 @x.com'}
               value={bulkGlossaryText}
               onInput={(e) =>
                 setBulkGlossaryText((e.currentTarget as HTMLTextAreaElement).value)
               }
             />
-
-            <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
-              <button
-                type="button"
-                class="mp-btn mp-btn--solid mp-btn--sm"
-                data-testid="glossary-bulk-import-btn"
-                onClick={() => {
-                  const parsed = parseGlossaryBulkText(bulkGlossaryText);
-                  onMutate((d) => {
-                    d.glossary = mergeBulkGlossaryEntries(d.glossary, parsed);
-                  });
-                  setBulkGlossaryNotice(
-                    lang === 'en'
-                      ? `Merged ${parsed.length} term(s) into draft`
-                      : `已合并导入 ${parsed.length} 条术语至草稿（点击顶部「保存设置」持久化）`,
-                  );
-                }}
-              >
-                {lang === 'en' ? 'Merge Import into Custom Terms' : '合并导入至自定义术语'}
-              </button>
-
-              <button
-                type="button"
-                class="mp-btn mp-btn--sm"
-                data-testid="glossary-bulk-replace-btn"
-                onClick={() => {
-                  const parsed = parseGlossaryBulkText(bulkGlossaryText);
-                  onMutate((d) => {
-                    d.glossary = parsed;
-                  });
-                  setBulkGlossaryNotice(
-                    lang === 'en'
-                      ? `Replaced custom glossary with ${parsed.length} term(s)`
-                      : `已用 ${parsed.length} 条批量规则替换自定义术语`,
-                  );
-                }}
-              >
-                {lang === 'en' ? 'Replace All Custom Terms' : '覆盖替换自定义术语'}
-              </button>
-
-              <button
-                type="button"
-                class="mp-btn mp-btn--sm"
-                data-testid="glossary-bulk-export-btn"
-                onClick={() => {
-                  const formatted = formatGlossaryBulkText(draft.glossary);
-                  setBulkGlossaryText(formatted);
-                  setBulkGlossaryNotice(
-                    lang === 'en'
-                      ? 'Exported active custom terms to text box above'
-                      : '已将当前启用的自定义术语导出至上方文本框',
-                  );
-                }}
-              >
-                {lang === 'en' ? 'Export Current Terms to Text' : '从当前自定义术语导出文本'}
-              </button>
-
-              {bulkGlossaryNotice ? (
-                <StatusPill tone="ok" dataTestId="glossary-bulk-notice">
-                  {bulkGlossaryNotice}
-                </StatusPill>
-              ) : null}
-            </div>
           </div>
-        </details>
+
+          <div class="mp-row">
+            <button
+              type="button"
+              class="mp-btn mp-btn--solid mp-btn--sm"
+              data-testid="glossary-bulk-import-btn"
+              onClick={() => {
+                const parsed = parseGlossaryBulkText(bulkGlossaryText);
+                onMutate((d) => {
+                  d.glossary = mergeBulkGlossaryEntries(d.glossary, parsed);
+                });
+                setBulkGlossaryNotice(
+                  lang === 'en'
+                    ? `Merged ${parsed.length} term(s) into draft`
+                    : `已合并导入 ${parsed.length} 条术语至草稿（点击顶部「保存设置」持久化）`,
+                );
+              }}
+            >
+              {lang === 'en' ? 'Merge Import into Custom Terms' : '合并导入至自定义术语'}
+            </button>
+
+            <button
+              type="button"
+              class="mp-btn mp-btn--sm"
+              data-testid="glossary-bulk-replace-btn"
+              onClick={() => {
+                const parsed = parseGlossaryBulkText(bulkGlossaryText);
+                onMutate((d) => {
+                  d.glossary = parsed;
+                });
+                setBulkGlossaryNotice(
+                  lang === 'en'
+                    ? `Replaced custom glossary with ${parsed.length} term(s)`
+                    : `已用 ${parsed.length} 条批量规则替换自定义术语`,
+                );
+              }}
+            >
+              {lang === 'en' ? 'Replace All Custom Terms' : '覆盖替换自定义术语'}
+            </button>
+
+            <button
+              type="button"
+              class="mp-btn mp-btn--sm"
+              data-testid="glossary-bulk-export-btn"
+              onClick={() => {
+                const formatted = formatGlossaryBulkText(draft.glossary);
+                setBulkGlossaryText(formatted);
+                setBulkGlossaryNotice(
+                  lang === 'en'
+                    ? 'Exported active custom terms to text box above'
+                    : '已将当前启用的自定义术语导出至上方文本框',
+                );
+              }}
+            >
+              <Icon name="download" size={12} />
+              {lang === 'en' ? 'Export Current Terms to Text' : '从当前自定义术语导出文本'}
+            </button>
+
+            {bulkGlossaryNotice ? (
+              <EditorialBadge tone="ok" dataTestId="glossary-bulk-notice">
+                {bulkGlossaryNotice}
+              </EditorialBadge>
+            ) : null}
+          </div>
+        </CollapsibleSection>
       </section>
 
       {/* Section 3: Persistent Local Translation Database Status Card */}
@@ -1719,55 +1757,79 @@ export function PromptsGlossaryTab({
                 : '二级内存热缓存 + IndexedDB 本地持久化译文库，按模型、提示词指纹与实际命中的术语签名精准索引，重启浏览器秒开复用。'}
             </p>
           </div>
+          <EditorialBadge tone={cacheStats.dbAvailable ? 'ok' : 'neutral'}>
+            {cacheStats.dbAvailable
+              ? lang === 'en'
+                ? 'IndexedDB Ready'
+                : 'IndexedDB 已就绪'
+              : lang === 'en'
+                ? 'Memory Only'
+                : '内存缓存模式'}
+          </EditorialBadge>
         </div>
 
         <div class="mp-db-card" data-testid="translation-db-card">
-          <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
-            <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
-              <strong
-                style={{ fontSize: '13.5px', color: 'var(--ink)' }}
-                data-testid="translation-db-stats"
-              >
+          <div class="mp-metric-grid" aria-hidden="true">
+            <Metric
+              icon="bolt"
+              label={lang === 'en' ? 'L1 · Memory hot cache' : 'L1 · 内存热缓存'}
+              value={cacheStats.memoryEntries.toLocaleString()}
+              unit={lang === 'en' ? 'entries' : '条'}
+              caption={lang === 'en' ? 'LRU, cleared on restart' : 'LRU，浏览器重启即清空'}
+            />
+            <Metric
+              icon="database"
+              label={lang === 'en' ? 'L2 · IndexedDB' : 'L2 · 本地持久化库'}
+              value={cacheStats.persistentEntries.toLocaleString()}
+              unit={lang === 'en' ? 'entries' : '条'}
+              caption={
+                cacheStats.dbAvailable
+                  ? lang === 'en'
+                    ? 'Survives restarts · instant reuse'
+                    : '跨重启保留 · 秒开复用'
+                  : lang === 'en'
+                    ? 'Unavailable in this context'
+                    : '当前环境不可用'
+              }
+            />
+          </div>
+
+          <div class="mp-db-card-foot">
+            <div class="mp-stack mp-stack--tight">
+              <strong class="mp-db-summary" data-testid="translation-db-stats">
                 {lang === 'en'
                   ? `Memory Hot Cache ${cacheStats.memoryEntries} · Persistent DB ${cacheStats.persistentEntries} (IndexedDB)`
                   : `内存热缓存 ${cacheStats.memoryEntries} 条 · 本地持久化库 ${cacheStats.persistentEntries} 条 (IndexedDB)`}
               </strong>
-              <StatusPill tone={cacheStats.dbAvailable ? 'ok' : 'mono'}>
-                {cacheStats.dbAvailable
-                  ? lang === 'en'
-                    ? 'IndexedDB Ready'
-                    : 'IndexedDB 已就绪'
-                  : lang === 'en'
-                    ? 'Memory Only'
-                    : '内存缓存模式'}
-              </StatusPill>
+              {cacheNotice ? (
+                <span class="mp-muted" style={{ fontSize: '12px' }} data-testid="translation-db-notice">
+                  {cacheNotice}
+                </span>
+              ) : null}
             </div>
-            {cacheNotice ? (
-              <span class="mp-muted" style={{ fontSize: '12px' }} data-testid="translation-db-notice">
-                {cacheNotice}
-              </span>
-            ) : null}
-          </div>
 
-          <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
-            <button
-              type="button"
-              class="mp-btn mp-btn--sm"
-              data-testid="translation-db-refresh-btn"
-              disabled={cacheBusy}
-              onClick={() => void refreshCacheStats()}
-            >
-              {lang === 'en' ? 'Refresh' : '刷新'}
-            </button>
-            <button
-              type="button"
-              class="mp-btn mp-btn--danger mp-btn--sm"
-              data-testid="translation-db-clear-btn"
-              disabled={cacheBusy}
-              onClick={() => void handleClearTranslationDb()}
-            >
-              {lang === 'en' ? 'Clear Translation Database' : '清空翻译数据库'}
-            </button>
+            <div class="mp-row">
+              <button
+                type="button"
+                class="mp-btn mp-btn--sm"
+                data-testid="translation-db-refresh-btn"
+                disabled={cacheBusy}
+                onClick={() => void refreshCacheStats()}
+              >
+                <Icon name="refresh" size={12} />
+                {lang === 'en' ? 'Refresh' : '刷新'}
+              </button>
+              <button
+                type="button"
+                class="mp-btn mp-btn--danger mp-btn--sm"
+                data-testid="translation-db-clear-btn"
+                disabled={cacheBusy}
+                onClick={() => void handleClearTranslationDb()}
+              >
+                <Icon name="trash" size={12} />
+                {lang === 'en' ? 'Clear Translation Database' : '清空翻译数据库'}
+              </button>
+            </div>
           </div>
         </div>
       </section>

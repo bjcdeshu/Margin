@@ -8,6 +8,7 @@ import {
 } from '@shared/constants';
 import {
   requestClearTranslationCache,
+  requestRuntimeWarmup,
   requestTranslationCacheStats,
   sendTabCommand,
 } from '@shared/messaging';
@@ -44,7 +45,7 @@ describe('Margin shared contracts & temperature engine', () => {
   it('locks brand constants and Shadow DOM CSS reset invariants', () => {
     expect(BRAND.name).toBe('Margin');
     expect(BRAND.slug).toBe('margin');
-    expect(BRAND.version).toBe('2.2.0');
+    expect(BRAND.version).toBe('2.3.0');
     expect(BRAND.pinnedExtensionId).toMatch(/^[a-p]{32}$/);
     expect(SHADOW_HOST_RESET_CSS).toContain('all: initial !important');
     expect(SHADOW_HOST_RESET_CSS).toContain('font-size: 16px !important');
@@ -62,7 +63,7 @@ describe('Margin shared contracts & temperature engine', () => {
     expect(defaults.enabledGlossaryPacks).toEqual([
       ...DEFAULT_ENABLED_GLOSSARY_PACK_IDS,
     ]);
-    expect(defaults.promptSystemVersion).toBe(2);
+    expect(defaults.promptSystemVersion).toBe(3);
     expect(defaults.assistants['builtin-yaml']).toBeDefined();
     expect(defaults.assistants['builtin-yaml-thinking']).toBeDefined();
     expect(defaults.assistants['builtin-delimiter']).toBeDefined();
@@ -471,7 +472,7 @@ describe('Margin shared contracts & temperature engine', () => {
       legacyV20 as unknown as ReturnType<typeof createDefaultMarginConfig>,
     );
     expect(mutated).toBe(true);
-    expect(upgraded.promptSystemVersion).toBe(2);
+    expect(upgraded.promptSystemVersion).toBe(3);
     expect(upgraded.webpage.autoTranslateMode).toBe('foreign');
     expect(upgraded.webpage.autoTranslateMatches).toBe(true);
     expect(upgraded.webpage.autoTranslateLanguages).toEqual([]);
@@ -534,12 +535,103 @@ describe('Margin shared contracts & temperature engine', () => {
       });
       const cleared = await requestClearTranslationCache();
       expect(cleared).toEqual({ ok: true });
+      const warmup = await requestRuntimeWarmup({ scene: 'webpage' });
+      expect(warmup).toEqual({ ok: true });
       expect(sentTypes).toEqual([
         'margin:get-translation-cache-stats',
         'margin:clear-translation-cache',
+        'margin:warmup',
       ]);
     } finally {
       (globalThis as Record<string, unknown>).chrome = origChrome;
     }
+  });
+
+  it('migrates promptSystemVersion 2 -> 3 non-destructively, refreshing unedited stock prompts while preserving user edits and custom assistants', () => {
+    const v2Cfg = createDefaultMarginConfig();
+    v2Cfg.promptSystemVersion = 2;
+
+    // Unedited v2 stock prompts for `builtin-yaml` and `builtin-yaml-thinking`
+    v2Cfg.assistants['builtin-yaml'] = {
+      ...structuredClone(BUILTIN_ASSISTANTS['builtin-yaml']),
+      prompt:
+        '{{title_prompt}}{{summary_prompt}}{{style_prompt}}{{glossary_prompt}}Translate into {{to}}:\n<yaml>\n{{yaml}}\n</yaml>',
+      env: { ...BUILTIN_ASSISTANTS['builtin-yaml'].env },
+    };
+    delete v2Cfg.assistants['builtin-yaml'].env.thread_prompt;
+    delete v2Cfg.assistants['builtin-yaml'].env.context_window_prompt;
+
+    v2Cfg.assistants['builtin-yaml-thinking'] = {
+      ...structuredClone(BUILTIN_ASSISTANTS['builtin-yaml-thinking']),
+      prompt:
+        '{{title_prompt}}{{summary_prompt}}{{style_prompt}}{{glossary_prompt}}Translate into {{to}} with brief `thinking` and polished `trans`:\n<yaml>\n{{yaml}}\n</yaml>',
+      env: { ...BUILTIN_ASSISTANTS['builtin-yaml-thinking'].env },
+    };
+    delete v2Cfg.assistants['builtin-yaml-thinking'].env.thread_prompt;
+    delete v2Cfg.assistants['builtin-yaml-thinking'].env.context_window_prompt;
+
+    // User-edited built-in delimiter prompt MUST be strictly preserved!
+    v2Cfg.assistants['builtin-delimiter'] = {
+      ...structuredClone(BUILTIN_ASSISTANTS['builtin-delimiter']),
+      prompt: 'USER CUSTOM DELIMITER PROMPT:\n{{text}}',
+      env: {
+        ...BUILTIN_ASSISTANTS['builtin-delimiter'].env,
+        thread_prompt: 'USER CUSTOM THREAD: {{threadContext}}\n',
+      },
+    };
+
+    // Custom user assistant MUST be strictly preserved!
+    v2Cfg.assistants['my-custom-v2'] = {
+      id: 'my-custom-v2',
+      name: 'User Custom v2',
+      codec: 'yaml',
+      enableRichHtml: true,
+      temperaturePolicy: { mode: 'omit' },
+      maxBatchCount: 10,
+      maxSubtitleBatchCount: 10,
+      maxCharsPerBatch: 3000,
+      separator: '\n\n%%\n\n',
+      systemPrompt: 'Custom system prompt.',
+      prompt: 'Custom prompt {{yaml}}',
+      env: { imt_yaml_item: '- id: {{id}}\n  src: {{text}}' },
+    };
+
+    const { config: v3Cfg, mutated } = backfillStoredConfig(v2Cfg);
+    expect(mutated).toBe(true);
+    expect(v3Cfg.promptSystemVersion).toBe(3);
+
+    // Unedited built-ins refreshed with {{thread_prompt}}{{context_window_prompt}} and env macros
+    expect(v3Cfg.assistants['builtin-yaml'].prompt).toContain(
+      '{{thread_prompt}}{{context_window_prompt}}',
+    );
+    expect(v3Cfg.assistants['builtin-yaml'].env.thread_prompt).toBe(
+      BUILTIN_ASSISTANTS['builtin-yaml'].env.thread_prompt,
+    );
+    expect(v3Cfg.assistants['builtin-yaml'].env.context_window_prompt).toBe(
+      BUILTIN_ASSISTANTS['builtin-yaml'].env.context_window_prompt,
+    );
+    expect(v3Cfg.assistants['builtin-yaml-thinking'].prompt).toContain(
+      '{{thread_prompt}}{{context_window_prompt}}',
+    );
+
+    // User-edited built-in prompt and env preserved, while missing context_window_prompt env added safely
+    expect(v3Cfg.assistants['builtin-delimiter'].prompt).toBe(
+      'USER CUSTOM DELIMITER PROMPT:\n{{text}}',
+    );
+    expect(v3Cfg.assistants['builtin-delimiter'].env.thread_prompt).toBe(
+      'USER CUSTOM THREAD: {{threadContext}}\n',
+    );
+    expect(v3Cfg.assistants['builtin-delimiter'].env.context_window_prompt).toBe(
+      BUILTIN_ASSISTANTS['builtin-delimiter'].env.context_window_prompt,
+    );
+
+    // Custom assistant untouched
+    expect(v3Cfg.assistants['my-custom-v2'].prompt).toBe('Custom prompt {{yaml}}');
+    expect(v3Cfg.assistants['my-custom-v2'].env).toEqual({
+      imt_yaml_item: '- id: {{id}}\n  src: {{text}}',
+    });
+
+    // Idempotent on second run
+    expect(backfillStoredConfig(v3Cfg).mutated).toBe(false);
   });
 });

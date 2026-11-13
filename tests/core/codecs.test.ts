@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { importLegacyConfig } from '../../src/core/migration';
 import {
   buildDefaultJsonBatchSystemPrompt,
+  cleanPartialStreamingTrans,
   DEFAULT_JSON_BATCH_SYSTEM_PROMPT,
   delimiterPromptCodec,
   expandAssistantPrompts,
@@ -146,7 +147,9 @@ Item 2 was empty or skipped; item 1 and item 3 have colons and quotes!
     const parser = yamlPromptCodec.createStreamParser(items);
 
     expect(parser.push('<think>Thinking...\n- id: 1\n  trans: Fake')).toEqual([]);
-    expect(parser.push('</think>\n<yaml>\n- id: 1\n  trans: 你好\n')).toEqual([]);
+    expect(parser.push('</think>\n<yaml>\n- id: 1\n  trans: 你好\n')).toEqual([
+      { id: 1, trans: '你好', partial: true },
+    ]);
     // Starting `- id: 2` proves `- id: 1` is complete!
     const ready1 = parser.push('- id: 2\n  trans: 世');
     expect(ready1).toEqual([{ id: 1, trans: '你好' }]);
@@ -255,16 +258,20 @@ describe('DelimiterPromptCodec ("通用翻译" %% streaming & mismatch recovery)
 
     // Unclosed <think> containing `%%` must NEVER emit premature items
     expect(parser.push('<think>Let us split with \n\n%%\n\n first')).toEqual([]);
-    expect(parser.push('</think>段落一译文')).toEqual([]);
-
-    // First delimiter completed -> item 1 emits immediately!
-    expect(parser.push('\n\n%%\n\n段落二')).toEqual([
-      { id: 1, trans: '段落一译文' },
+    expect(parser.push('</think>段落一译文')).toEqual([
+      { id: 1, trans: '段落一译文', partial: true },
     ]);
 
-    // Second delimiter completed -> item 2 emits immediately!
+    // First delimiter completed -> item 1 emits finalized, item 2 emits partial preview!
+    expect(parser.push('\n\n%%\n\n段落二')).toEqual([
+      { id: 1, trans: '段落一译文' },
+      { id: 2, trans: '段落二', partial: true },
+    ]);
+
+    // Second delimiter completed -> item 2 emits finalized, item 3 emits partial preview!
     expect(parser.push('完整译文\n%%\n段落三开始')).toEqual([
       { id: 2, trans: '段落二完整译文' },
+      { id: 3, trans: '段落三开始', partial: true },
     ]);
 
     // Stream ends -> item 3 emits in `finish()`
@@ -475,5 +482,248 @@ describe('JsonBatchCodec & SingleTextMtCodec', () => {
     });
     expect(importedOff.config.webpage.autoTranslateMode).toBe('off');
     expect(importedOff.config.webpage.autoTranslateMatches).toBe(false);
+  });
+});
+
+describe('v2.3.0 Intra-Item Streaming & Context Window Macros', () => {
+  it('cleanPartialStreamingTrans strips trailing incomplete tags, unclosed quotes, and block-chomp markers', () => {
+    expect(cleanPartialStreamingTrans('你好<')).toBe('你好');
+    expect(cleanPartialStreamingTrans('你好<m0')).toBe('你好');
+    expect(cleanPartialStreamingTrans('点击<m0>这里</m0')).toBe('点击<m0>这里');
+    expect(cleanPartialStreamingTrans('术语<m-g id="0"')).toBe('术语');
+    expect(cleanPartialStreamingTrans('译文内容</yam')).toBe('译文内容');
+    expect(cleanPartialStreamingTrans('"第一行\\n正在翻译')).toBe(
+      '第一行\n正在翻译',
+    );
+    expect(cleanPartialStreamingTrans("'正在单引号流式")).toBe('正在单引号流式');
+    expect(cleanPartialStreamingTrans('|-')).toBe('');
+  });
+
+  it('yamlPromptCodec.createStreamParser streams 1-item & multi-item partial: true previews and transitions cleanly to finalized', () => {
+    // 1-item batch live partial: true emission before </yaml>
+    const singleItems = [{ id: 42, text: 'Hello world' }];
+    const singleParser = yamlPromptCodec.createStreamParser(singleItems);
+    expect(singleParser.push('<yaml>\n- id: 1\n  trans: 你好<m0')).toEqual([
+      { id: 42, trans: '你好', partial: true },
+    ]);
+    expect(singleParser.push('>世界</m0')).toEqual([
+      { id: 42, trans: '你好<m0>世界', partial: true },
+    ]);
+    expect(singleParser.push('></yam')).toEqual([
+      { id: 42, trans: '你好<m0>世界</m0>', partial: true },
+    ]);
+    // Completing `</yaml>` finalizes the single item (`partial` omitted)
+    const finalizedSingle = singleParser.push('l>');
+    expect(finalizedSingle).toEqual([{ id: 42, trans: '你好<m0>世界</m0>' }]);
+    expect(finalizedSingle[0].partial).toBeUndefined();
+    expect(singleParser.finish().newlyReady).toEqual([]);
+
+    // Unclosed quote inside 1-item YAML stream strips leading quote during partial preview
+    const quotedParser = yamlPromptCodec.createStreamParser(singleItems);
+    expect(quotedParser.push('<yaml>\n- id: 1\n  trans: "正在流式')).toEqual([
+      { id: 42, trans: '正在流式', partial: true },
+    ]);
+    expect(quotedParser.push('"\n</yaml>')).toEqual([
+      { id: 42, trans: '正在流式' },
+    ]);
+
+    // Multi-item batch partial -> finalized transition
+    const multiItems = [
+      { id: 10, text: 'First' },
+      { id: 20, text: 'Second' },
+    ];
+    const multiParser = yamlPromptCodec.createStreamParser(multiItems);
+    expect(multiParser.push('<yaml>\n- id: 1\n  trans: <m0>第一')).toEqual([
+      { id: 10, trans: '<m0>第一', partial: true },
+    ]);
+    expect(multiParser.push('句</m')).toEqual([
+      { id: 10, trans: '<m0>第一句', partial: true },
+    ]);
+    expect(multiParser.push('0>。\n- id: 2\n  trans: 第二')).toEqual([
+      { id: 10, trans: '<m0>第一句</m0>。' },
+      { id: 20, trans: '第二', partial: true },
+    ]);
+    const doneMulti = multiParser.push('句\n</yaml>');
+    expect(doneMulti).toEqual([{ id: 20, trans: '第二句' }]);
+    expect(doneMulti[0].partial).toBeUndefined();
+    expect(multiParser.finish().allItems).toEqual([
+      { id: 10, trans: '<m0>第一句</m0>。' },
+      { id: 20, trans: '第二句' },
+    ]);
+  });
+
+  it('delimiterPromptCodec.createStreamParser streams 1-item batches progressively (regression guard) and strips trailing half-typed %', () => {
+    // 1-item batch: previously suppressed by `items.length <= 1` early exit
+    const singleParser = delimiterPromptCodec.createStreamParser([
+      { id: 7, text: 'Single tweet' },
+    ]);
+    expect(singleParser.push('单条')).toEqual([
+      { id: 7, trans: '单条', partial: true },
+    ]);
+    expect(singleParser.push('推文%')).toEqual([
+      { id: 7, trans: '单条推文', partial: true },
+    ]);
+    expect(singleParser.push('%译文')).toEqual([
+      { id: 7, trans: '单条推文%%译文', partial: true },
+    ]);
+    const singleDone = singleParser.finish();
+    expect(singleDone.newlyReady).toEqual([{ id: 7, trans: '单条推文%%译文' }]);
+    expect(singleDone.newlyReady[0].partial).toBeUndefined();
+
+    // Multi-item batch: trailing half-typed `%` stripped during partial preview, finalized on `\n\n%%\n\n`
+    const multiParser = delimiterPromptCodec.createStreamParser([
+      { id: 1, text: 'A' },
+      { id: 2, text: 'B' },
+    ]);
+    expect(multiParser.push('第一段内容\n\n%')).toEqual([
+      { id: 1, trans: '第一段内容', partial: true },
+    ]);
+    expect(multiParser.push('%\n\n第二段')).toEqual([
+      { id: 1, trans: '第一段内容' },
+      { id: 2, trans: '第二段', partial: true },
+    ]);
+    expect(multiParser.finish().newlyReady).toEqual([{ id: 2, trans: '第二段' }]);
+  });
+
+  it('singleTextMtCodec and jsonBatchCodec stream partial: true previews safely including dangling JSON escapes', () => {
+    // SingleTextMtCodec: 1-item & multi-item
+    const st1 = singleTextMtCodec.createStreamParser([{ id: 1, text: 'One' }]);
+    expect(st1.push('正在<m0')).toEqual([
+      { id: 1, trans: '正在', partial: true },
+    ]);
+    expect(st1.push('>翻译</m0>')).toEqual([
+      { id: 1, trans: '正在<m0>翻译</m0>', partial: true },
+    ]);
+    expect(st1.finish().newlyReady).toEqual([
+      { id: 1, trans: '正在<m0>翻译</m0>' },
+    ]);
+
+    const st2 = singleTextMtCodec.createStreamParser([
+      { id: 1, text: 'One' },
+      { id: 2, text: 'Two' },
+    ]);
+    expect(st2.push('段落一')).toEqual([
+      { id: 1, trans: '段落一', partial: true },
+    ]);
+    expect(st2.push('\n\n段落二')).toEqual([
+      { id: 1, trans: '段落一' },
+      { id: 2, trans: '段落二', partial: true },
+    ]);
+    expect(st2.finish().newlyReady).toEqual([{ id: 2, trans: '段落二' }]);
+
+    // JsonBatchCodec: trailing unclosed `"trans": "..."` with dangling `\` and `\u00`
+    const jp = jsonBatchCodec.createStreamParser([
+      { id: 101, text: 'First' },
+      { id: 102, text: 'Second' },
+    ]);
+    expect(jp.push('[{"id":1,"trans":"你好\\')).toEqual([
+      { id: 101, trans: '你好', partial: true },
+    ]);
+    expect(jp.push('n世界\\u00')).toEqual([
+      { id: 101, trans: '你好\n世界', partial: true },
+    ]);
+    expect(jp.push('41"},{"id":2,"trans":"第二')).toEqual([
+      { id: 101, trans: '你好\n世界A' },
+      { id: 102, trans: '第二', partial: true },
+    ]);
+    expect(jp.push('项"}]')).toEqual([{ id: 102, trans: '第二项' }]);
+    const jpDone = jp.finish();
+    expect(jpDone.newlyReady).toEqual([]);
+    expect(jpDone.allItems).toEqual([
+      { id: 101, trans: '你好\n世界A' },
+      { id: 102, trans: '第二项' },
+    ]);
+  });
+
+  it('expands {{threadContext}}, {{prevContext}}, {{thread_prompt}}, and {{context_window_prompt}} and prunes cleanly with zero orphan blank lines when omitted', () => {
+    const ast = BUILTIN_ASSISTANTS['builtin-yaml'];
+
+    const withContext = expandAssistantPrompts({
+      assistant: ast,
+      scene: 'webpage',
+      fromLang: 'en',
+      toLang: 'zh-CN',
+      items: [{ id: 1, text: 'Then we shipped it.' }],
+      context: {
+        url: 'https://x.com/dev/status/2',
+        domain: 'x.com',
+        threadContext: 'Margin v2.3.0 release thread',
+        prevContext: 'We fixed the streaming jitter first.',
+      },
+    });
+    expect(withContext.userPrompt).toContain(
+      'Thread / Post Topic (context only — do NOT translate): Margin v2.3.0 release thread',
+    );
+    expect(withContext.userPrompt).toContain(
+      'Preceding Context (for pronoun/tone continuity only — do NOT translate): We fixed the streaming jitter first.',
+    );
+
+    const withoutContext = expandAssistantPrompts({
+      assistant: ast,
+      scene: 'webpage',
+      fromLang: 'en',
+      toLang: 'zh-CN',
+      items: [{ id: 1, text: 'Plain sentence.' }],
+      context: {
+        url: 'https://example.com',
+        domain: 'example.com',
+        threadContext: '   ',
+        prevContext: '',
+      },
+    });
+    expect(withoutContext.userPrompt).not.toContain('Thread / Post Topic');
+    expect(withoutContext.userPrompt).not.toContain('Preceding Context');
+    expect(withoutContext.userPrompt).not.toContain('\n\n');
+    expect(withoutContext.userPrompt).toBe(
+      'Translate into Simplified Chinese:\n<yaml>\n- id: 1\n  src: |-\n    Plain sentence.\n</yaml>',
+    );
+
+    // Direct {{threadContext}} / {{prevContext}} variables in custom assistant templates also prune cleanly
+    const customDirect: AssistantConfig = {
+      ...structuredClone(ast),
+      id: 'direct-vars',
+      prompt: '{{thread_prompt}}{{context_window_prompt}}Text: {{yaml}}',
+      env: {
+        ...ast.env,
+        thread_prompt: 'Topic={{threadContext}}\n',
+        context_window_prompt: 'Prev={{prevContext}}\n',
+      },
+    };
+    const customEmpty = expandAssistantPrompts({
+      assistant: customDirect,
+      scene: 'webpage',
+      fromLang: 'en',
+      toLang: 'zh-CN',
+      items: [{ id: 1, text: 'Hi' }],
+    });
+    expect(customEmpty.userPrompt).toBe('Text: - id: 1\n  src: |-\n    Hi');
+    expect(customEmpty.userPrompt).not.toContain('Topic=');
+    expect(customEmpty.userPrompt).not.toContain('Prev=');
+
+    // Default json-batch codec (no assistant) also includes threadContext & prevContext when provided and omits when empty
+    const jsonWithCtx = jsonBatchCodec.encode({
+      scene: 'webpage',
+      fromLang: 'en',
+      toLang: 'zh-CN',
+      items: [{ id: 1, text: 'Hello' }],
+      context: {
+        url: 'https://x.com/a/1',
+        domain: 'x.com',
+        threadContext: 'AI Agents thread',
+        prevContext: 'Earlier tweet',
+      },
+    });
+    expect(jsonWithCtx.userPrompt).toContain('Thread / Post Topic');
+    expect(jsonWithCtx.userPrompt).toContain('AI Agents thread');
+    expect(jsonWithCtx.userPrompt).toContain('Preceding Context');
+    expect(jsonWithCtx.userPrompt).toContain('Earlier tweet');
+
+    const jsonWithoutCtx = jsonBatchCodec.encode({
+      scene: 'webpage',
+      fromLang: 'en',
+      toLang: 'zh-CN',
+      items: [{ id: 1, text: 'Hello' }],
+    });
+    expect(jsonWithoutCtx.userPrompt).toBe('[{"id":1,"src":"Hello"}]');
   });
 });

@@ -6,6 +6,7 @@ import type {
   GlossaryEntry,
   PageContextPayload,
   ProviderConfig,
+  RequestPriority,
   TranslationScene,
 } from '@shared/types';
 import type { ProviderExecutionPool } from './pool';
@@ -43,16 +44,19 @@ export interface ProviderRuntimeEnv {
   requestTimeoutMs?: number;
   streamIdleTimeoutMs?: number;
   signal?: AbortSignal;
+  priority?: RequestPriority;
 }
 
 export interface AiCompletionRequestParams {
   provider: ProviderConfig;
+  scene?: TranslationScene | 'service-test';
   endpoint: string;
   apiKey?: string;
   systemPrompt: string;
   userPrompt: string;
   imageDataUrl?: string;
   effectiveTemperature?: number;
+  omitReasoningEffort?: boolean;
   stream: boolean;
   onDelta?: (delta: string) => void;
   fetchImpl: typeof fetch;
