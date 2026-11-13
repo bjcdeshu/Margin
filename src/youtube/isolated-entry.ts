@@ -34,11 +34,13 @@ import {
   normalizeActiveCueState,
   normalizeBgOpacityOverride,
   normalizeSubtitleStylePreset,
+  normalizeSubtitleTargetLang,
   normalizeTranslationTint,
   PIP_CLEAR_DELAY_MS,
   readLocalYoutubeCaptionTheme,
   resolveEffectiveTranslationScale,
   resolveRenderedCueLines,
+  resolveSubtitleTargetDir,
   YOUTUBE_CAPTION_STORAGE_KEY,
   type YoutubeExtendedBridgeMessage,
 } from './shared';
@@ -134,6 +136,7 @@ export function createSubtitleIsolatedController(
     const transScale = resolveEffectiveTranslationScale(config.subtitles);
     return {
       mode: config.subtitles.displayMode,
+      targetLang: normalizeSubtitleTargetLang(config.targetLang || 'zh-CN'),
       fontSizePercent: config.subtitles.fontSizePercent ?? transScale,
       sourceScalePercent: clampFontSizePercent(
         config.subtitles.sourceScalePercent,
@@ -388,7 +391,7 @@ export function createSubtitleIsolatedController(
 
       const origLine = doc.createElement('div');
       origLine.id = 'margin-sub-original';
-      origLine.className = 'margin-sub-line margin-sub-original';
+      origLine.className = 'margin-sub-line margin-sub-original margin-sub-line--orig';
       origLine.hidden = true;
       const origSeg = doc.createElement('span');
       origSeg.className = 'margin-sub-seg';
@@ -396,7 +399,7 @@ export function createSubtitleIsolatedController(
 
       const transLine = doc.createElement('div');
       transLine.id = 'margin-sub-translated';
-      transLine.className = 'margin-sub-line margin-sub-translated';
+      transLine.className = 'margin-sub-line margin-sub-translated margin-sub-line--trans';
       transLine.hidden = true;
       const transSeg = doc.createElement('span');
       transSeg.className = 'margin-sub-seg';
@@ -480,6 +483,15 @@ export function createSubtitleIsolatedController(
     origSeg.textContent = originalLine;
     origEl.hidden = !originalLine;
 
+    const targetBcp47 = normalizeSubtitleTargetLang(cue.targetLang);
+    if (targetBcp47) {
+      transEl.setAttribute('lang', targetBcp47);
+      transEl.setAttribute('dir', resolveSubtitleTargetDir(targetBcp47));
+    } else {
+      transEl.removeAttribute('lang');
+      transEl.removeAttribute('dir');
+    }
+
     let transSeg = transEl.querySelector<HTMLElement>('.margin-sub-seg');
     if (!transSeg) {
       transSeg = doc.createElement('span');
@@ -511,6 +523,7 @@ export function createSubtitleIsolatedController(
       normalized.startMs !== activeCueState.startMs ||
       normalized.endMs !== activeCueState.endMs ||
       normalized.mode !== activeCueState.mode ||
+      normalized.targetLang !== activeCueState.targetLang ||
       normalized.fontSizePercent !== activeCueState.fontSizePercent ||
       normalized.sourceScalePercent !== activeCueState.sourceScalePercent ||
       normalized.translationScalePercent !== activeCueState.translationScalePercent ||
@@ -1025,7 +1038,11 @@ function buildInPlayerOverlayCss(): string {
       --margin-yt-bg: rgba(8, 8, 8, 0.75);
       --margin-yt-win-bg: rgba(8, 8, 8, 0);
       --margin-yt-shadow: none;
-      --margin-yt-font: "YouTube Noto", Roboto, Arial, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Noto Sans SC", sans-serif;
+      --margin-yt-font: "YouTube Noto", Roboto, Arial, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei UI", "Microsoft YaHei", "Noto Sans SC", sans-serif;
+      --margin-yt-font-family: "YouTube Noto", Roboto, Arial, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei UI", "Microsoft YaHei", "Noto Sans SC", sans-serif;
+      --margin-yt-trans-font: "YouTube Noto", Roboto, Arial, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei UI", "Microsoft YaHei", "Noto Sans SC", sans-serif;
+      --margin-yt-trans-font-family: "YouTube Noto", Roboto, Arial, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei UI", "Microsoft YaHei", "Noto Sans SC", sans-serif;
+      --margin-sub-trans-font-family: "YouTube Noto", Roboto, Arial, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei UI", "Microsoft YaHei", "Noto Sans SC", sans-serif;
       --margin-yt-variant: normal;
       --margin-yt-scale-mult: 1;
       position: absolute;
@@ -1039,7 +1056,7 @@ function buildInPlayerOverlayCss(): string {
       text-align: center;
       pointer-events: none;
       transition: bottom 180ms cubic-bezier(0.2, 0, 0, 1);
-      font-family: "YouTube Noto", Roboto, Arial, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Noto Sans SC", sans-serif;
+      font-family: "YouTube Noto", Roboto, Arial, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei UI", "Microsoft YaHei", "Noto Sans SC", sans-serif;
     }
     #margin-sub-wrap[data-position="top"] {
       bottom: auto;
@@ -1058,7 +1075,7 @@ function buildInPlayerOverlayCss(): string {
       display: none !important;
     }
     #margin-sub-wrap[data-style-preset="youtube-native"] {
-      font-family: var(--margin-yt-font);
+      font-family: var(--margin-yt-font-family, var(--margin-yt-font));
       font-variant: var(--margin-yt-variant, normal);
       background: var(--margin-yt-win-bg, transparent);
       width: fit-content;
@@ -1095,15 +1112,27 @@ function buildInPlayerOverlayCss(): string {
       box-decoration-break: clone;
       -webkit-box-decoration-break: clone;
     }
-    .margin-sub-original {
+    .margin-sub-original,
+    .margin-sub-line--orig {
       color: var(--margin-yt-fg, #ffffff);
       font-size: calc(var(--margin-sub-base-px, 18px) * var(--margin-sub-orig-scale, 1) * var(--margin-yt-scale-mult, 1));
       font-weight: 500;
     }
-    .margin-sub-translated {
+    #margin-sub-wrap[data-style-preset="youtube-native"] .margin-sub-original,
+    #margin-sub-wrap[data-style-preset="youtube-native"] .margin-sub-line--orig {
+      font-family: var(--margin-yt-font-family, var(--margin-yt-font));
+    }
+    .margin-sub-translated,
+    .margin-sub-line--trans {
       color: var(--margin-yt-trans-fg, rgba(255, 255, 255, 0.96));
+      font-family: var(--margin-sub-trans-font-family);
       font-size: calc(var(--margin-sub-base-px, 18px) * var(--margin-sub-trans-scale, 0.7) * var(--margin-yt-scale-mult, 1));
       font-weight: 500;
+      unicode-bidi: isolate;
+    }
+    #margin-sub-wrap[data-style-preset="youtube-native"] .margin-sub-translated,
+    #margin-sub-wrap[data-style-preset="youtube-native"] .margin-sub-line--trans {
+      font-family: var(--margin-yt-trans-font-family, var(--margin-yt-font-family));
     }
     .margin-sub-translated .margin-sub-seg {
       color: var(--margin-yt-trans-fg, rgba(255, 255, 255, 0.96));

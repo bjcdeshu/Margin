@@ -22,8 +22,11 @@ import {
   type PipCapableVideoElement,
 } from '../../src/youtube/pip-player';
 import {
+  normalizeSubtitleTargetLang,
   parseYoutubeNativeCaptionSettings,
   resolveEffectiveNativeThemeVariables,
+  resolveSubtitleCjkFallbackForLang,
+  resolveSubtitleTargetDir,
   YOUTUBE_CAPTION_STORAGE_KEY,
 } from '../../src/youtube/shared';
 
@@ -43,12 +46,16 @@ function createMockVideo(overrides: Partial<PipCapableVideoElement> = {}): PipCa
 describe('YouTube Bilingual Document PiP & Guardrail 2 Fallback', () => {
   beforeEach(() => {
     vi.useFakeTimers();
+    document.documentElement.removeAttribute('lang');
+    document.documentElement.removeAttribute('dir');
     document.body.innerHTML = '';
     delete window.documentPictureInPicture;
   });
 
   afterEach(() => {
     vi.useRealTimers();
+    document.documentElement.removeAttribute('lang');
+    document.documentElement.removeAttribute('dir');
     document.body.innerHTML = '';
     delete window.documentPictureInPicture;
   });
@@ -922,6 +929,265 @@ describe('YouTube Bilingual Document PiP & Guardrail 2 Fallback', () => {
     expect(mainCtrl.getPipPlayer().getCueState().nativeTheme?.textColorCss).toBe(
       'rgba(255, 255, 0, 1)',
     );
+
+    isolatedCtrl.destroy();
+    mainCtrl.destroy();
+  });
+
+  it('normalizes subtitle target locales, text direction, and locale-pure CJK font fallbacks without host Meiryo/Malgun contamination', () => {
+    expect(normalizeSubtitleTargetLang(undefined)).toBe('zh-CN');
+    expect(normalizeSubtitleTargetLang('zh_cn')).toBe('zh-CN');
+    expect(normalizeSubtitleTargetLang('zh-Hant')).toBe('zh-TW');
+    expect(normalizeSubtitleTargetLang('zh-HK')).toBe('zh-TW');
+    expect(normalizeSubtitleTargetLang('jp')).toBe('ja');
+    expect(normalizeSubtitleTargetLang('kr')).toBe('ko');
+    expect(normalizeSubtitleTargetLang('pt_br')).toBe('pt-BR');
+    expect(normalizeSubtitleTargetLang('auto')).toBe('');
+    expect(normalizeSubtitleTargetLang('')).toBe('');
+
+    expect(resolveSubtitleTargetDir('ar')).toBe('rtl');
+    expect(resolveSubtitleTargetDir('he-IL')).toBe('rtl');
+    expect(resolveSubtitleTargetDir('fa')).toBe('rtl');
+    expect(resolveSubtitleTargetDir('ur')).toBe('rtl');
+    expect(resolveSubtitleTargetDir('zh-CN')).toBe('ltr');
+    expect(resolveSubtitleTargetDir('ja')).toBe('ltr');
+
+    expect(resolveSubtitleCjkFallbackForLang('zh-CN')).toContain('"PingFang SC"');
+    expect(resolveSubtitleCjkFallbackForLang('zh-CN')).toContain('"Microsoft YaHei UI"');
+    expect(resolveSubtitleCjkFallbackForLang('zh-TW')).toContain('"PingFang TC"');
+    expect(resolveSubtitleCjkFallbackForLang('zh-TW')).toContain('"Microsoft JhengHei UI"');
+    expect(resolveSubtitleCjkFallbackForLang('ja')).toContain('"Hiragino Sans"');
+    expect(resolveSubtitleCjkFallbackForLang('ja')).toContain('"Meiryo"');
+    expect(resolveSubtitleCjkFallbackForLang('ko')).toContain('"Malgun Gothic"');
+
+    const jaDomTheme = parseYoutubeNativeCaptionSettings(null, {
+      fontFamily: '"YouTube Noto", Roboto, Meiryo, "メイリオ", "Malgun Gothic", sans-serif',
+    });
+
+    const scVars = resolveEffectiveNativeThemeVariables(jaDomTheme, null, 'zh-CN');
+    expect(scVars.fontCss).toContain('Meiryo');
+    expect(scVars.transFontCss).toContain('"PingFang SC"');
+    expect(scVars.transFontCss).toContain('"Microsoft YaHei"');
+    expect(scVars.transFontCss).not.toContain('Meiryo');
+    expect(scVars.transFontCss).not.toContain('メイリオ');
+    expect(scVars.transFontCss).not.toContain('Malgun Gothic');
+
+    const tcVars = resolveEffectiveNativeThemeVariables(jaDomTheme, null, 'zh-TW');
+    expect(tcVars.transFontCss).toContain('"PingFang TC"');
+    expect(tcVars.transFontCss).toContain('"Microsoft JhengHei"');
+    expect(tcVars.transFontCss).not.toContain('Meiryo');
+    expect(tcVars.transFontCss).not.toContain('Malgun Gothic');
+    expect(tcVars.transFontCss).not.toContain('Microsoft YaHei');
+  });
+
+  it('stamps target lang, dir, and locale-pure --margin-yt-trans-font-family on <html lang="ja"> watch page Shadow overlay and Document PiP across dynamic targetLang switches', async () => {
+    vi.useRealTimers();
+    document.documentElement.lang = 'ja';
+    window.localStorage.removeItem(YOUTUBE_CAPTION_STORAGE_KEY);
+
+    const happyWin = window as unknown as {
+      happyDOM?: { setURL: (url: string) => void };
+    };
+    if (happyWin.happyDOM?.setURL) {
+      happyWin.happyDOM.setURL('https://www.youtube.com/watch?v=jaCjkFix01');
+    } else {
+      window.location.href = 'https://www.youtube.com/watch?v=jaCjkFix01';
+    }
+
+    const playerEl = document.createElement('div');
+    playerEl.id = 'movie_player';
+    playerEl.className = 'html5-video-player';
+    const rightControls = document.createElement('div');
+    rightControls.className = 'ytp-right-controls';
+    const nativeCaptionSeg = document.createElement('span');
+    nativeCaptionSeg.className = 'ytp-caption-segment';
+    nativeCaptionSeg.style.fontFamily =
+      '"YouTube Noto", Roboto, Meiryo, "Malgun Gothic", sans-serif';
+
+    const mockTrack = {
+      stop: vi.fn(),
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+    };
+    const video = createMockVideo({
+      captureStream: () =>
+        ({
+          getVideoTracks: () => [mockTrack],
+          getTracks: () => [mockTrack],
+        }) as unknown as MediaStream,
+    });
+    video.currentTime = 1.0;
+    playerEl.append(video, nativeCaptionSeg, rightControls);
+    document.body.appendChild(playerEl);
+
+    const pipDoc = document.implementation.createHTMLDocument('pip-ja-cjk');
+    const pipWin = {
+      document: pipDoc,
+      closed: false,
+      close: vi.fn(function (this: { closed: boolean }) {
+        this.closed = true;
+      }),
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+    } as unknown as Window;
+    window.documentPictureInPicture = {
+      requestWindow: vi.fn().mockResolvedValue(pipWin),
+    };
+
+    window.fetch = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          events: [
+            {
+              tStartMs: 0,
+              dDurationMs: 4000,
+              segs: [{ utf8: '誰が今卒業論文を書いていますか' }],
+            },
+          ],
+        }),
+        { status: 200 },
+      ),
+    );
+
+    let currentCfg: MarginConfig = {
+      ...createDefaultMarginConfig(),
+      targetLang: 'zh-CN',
+    };
+    const cfgListeners: Array<(cfg: MarginConfig) => void> = [];
+
+    const translationsByLang: Record<string, string> = {
+      'zh-CN': '现在谁在写毕业论文',
+      'zh-TW': '現在誰在寫畢業論文',
+      ja: '今誰が卒業論文を書いていますか',
+      ar: 'من يكتب أطروحة التخرج الآن',
+    };
+
+    const mainCtrl = createYoutubeMainController();
+    const isolatedCtrl = createSubtitleIsolatedController({
+      loadConfig: async () => currentCfg,
+      subscribeConfig: (listener) => {
+        cfgListeners.push(listener);
+        return () => {
+          const idx = cfgListeners.indexOf(listener);
+          if (idx >= 0) cfgListeners.splice(idx, 1);
+        };
+      },
+      translateBatch: async (req) => ({
+        ok: true,
+        requestId: req.requestId,
+        providerId: 'mock',
+        model: 'mock',
+        items: req.items.map((it) => ({
+          id: it.id,
+          trans: translationsByLang[req.toLang] ?? '译文',
+        })),
+        diagnostic: {} as never,
+      }),
+    });
+
+    mainCtrl.start();
+    await isolatedCtrl.start();
+    await new Promise((r) => setTimeout(r, 25));
+
+    const pipMode = await mainCtrl.getPipPlayer().open();
+    expect(pipMode).toBe('document-pip-stream');
+
+    await window.fetch(
+      'https://www.youtube.com/api/timedtext?v=jaCjkFix01&lang=ja&fmt=json3',
+    );
+    window.postMessage(
+      {
+        source: BRAND.ytBridgeSourceMain,
+        type: 'playhead-tick',
+        videoId: 'jaCjkFix01',
+        currentTimeMs: 1000,
+        paused: false,
+      } satisfies YoutubeMainBridgeMessage,
+      '*',
+    );
+    await new Promise((r) => setTimeout(r, 50));
+
+    const overlayHost = document.getElementById(SUBTITLE_OVERLAY_HOST_ID)!;
+    const shadowWrap = overlayHost.shadowRoot!.getElementById('margin-sub-wrap')!;
+    const shadowTrans = overlayHost.shadowRoot!.querySelector<HTMLElement>(
+      '.margin-sub-line--trans',
+    )!;
+    const pipSubtitles = pipDoc.getElementById('margin-pip-subtitles')!;
+    const pipTrans = pipDoc.querySelector<HTMLElement>('.cue-trans')!;
+
+    expect(shadowTrans).not.toBeNull();
+    expect(pipTrans).not.toBeNull();
+    expect(shadowTrans.textContent).toBe('现在谁在写毕业论文');
+    expect(pipTrans.textContent).toBe('现在谁在写毕业论文');
+
+    // 1. Default zh-CN on <html lang="ja">: explicit lang="zh-CN" dir="ltr" + YaHei/PingFang SC without Meiryo
+    expect(shadowTrans.getAttribute('lang')).toBe('zh-CN');
+    expect(shadowTrans.getAttribute('dir')).toBe('ltr');
+    expect(pipTrans.getAttribute('lang')).toBe('zh-CN');
+    expect(pipTrans.getAttribute('dir')).toBe('ltr');
+
+    const scOverlayTransFont = shadowWrap.style.getPropertyValue(
+      '--margin-yt-trans-font-family',
+    );
+    const scPipTransFont = pipSubtitles.style.getPropertyValue(
+      '--margin-yt-trans-font-family',
+    );
+    expect(scOverlayTransFont).toContain('PingFang SC');
+    expect(scOverlayTransFont).toContain('Microsoft YaHei');
+    expect(scOverlayTransFont).not.toContain('Meiryo');
+    expect(scOverlayTransFont).not.toContain('Malgun Gothic');
+    expect(scPipTransFont).toBe(scOverlayTransFont);
+    expect(shadowWrap.style.getPropertyValue('--margin-yt-font-family')).toContain(
+      'Meiryo',
+    );
+
+    // 2. Dynamically switch config.targetLang -> 'zh-TW'
+    currentCfg = { ...currentCfg, targetLang: 'zh-TW' };
+    cfgListeners.forEach((fn) => fn(currentCfg));
+    await new Promise((r) => setTimeout(r, 50));
+
+    expect(shadowTrans.getAttribute('lang')).toBe('zh-TW');
+    expect(shadowTrans.getAttribute('dir')).toBe('ltr');
+    expect(pipTrans.getAttribute('lang')).toBe('zh-TW');
+    expect(pipTrans.getAttribute('dir')).toBe('ltr');
+    expect(shadowTrans.textContent).toBe('現在誰在寫畢業論文');
+    expect(pipTrans.textContent).toBe('現在誰在寫畢業論文');
+
+    const tcOverlayTransFont = shadowWrap.style.getPropertyValue(
+      '--margin-yt-trans-font-family',
+    );
+    expect(tcOverlayTransFont).toContain('PingFang TC');
+    expect(tcOverlayTransFont).toContain('Microsoft JhengHei');
+    expect(tcOverlayTransFont).not.toContain('Meiryo');
+    expect(tcOverlayTransFont).not.toContain('Microsoft YaHei');
+    expect(
+      pipSubtitles.style.getPropertyValue('--margin-yt-trans-font-family'),
+    ).toBe(tcOverlayTransFont);
+
+    // 3. Dynamically switch config.targetLang -> 'ja' (same as source cue text gets suppressed if identical, so use distinct text or check lang/font)
+    currentCfg = { ...currentCfg, targetLang: 'ja' };
+    cfgListeners.forEach((fn) => fn(currentCfg));
+    await new Promise((r) => setTimeout(r, 50));
+
+    expect(shadowTrans.getAttribute('lang')).toBe('ja');
+    expect(shadowTrans.getAttribute('dir')).toBe('ltr');
+    expect(pipTrans.getAttribute('lang')).toBe('ja');
+    expect(pipTrans.getAttribute('dir')).toBe('ltr');
+    const jaOverlayTransFont = shadowWrap.style.getPropertyValue(
+      '--margin-yt-trans-font-family',
+    );
+    expect(jaOverlayTransFont).toContain('Hiragino Sans');
+    expect(jaOverlayTransFont).toContain('Meiryo');
+
+    // 4. Dynamically switch config.targetLang -> 'ar' (RTL)
+    currentCfg = { ...currentCfg, targetLang: 'ar' };
+    cfgListeners.forEach((fn) => fn(currentCfg));
+    await new Promise((r) => setTimeout(r, 50));
+
+    expect(shadowTrans.getAttribute('lang')).toBe('ar');
+    expect(shadowTrans.getAttribute('dir')).toBe('rtl');
+    expect(pipTrans.getAttribute('lang')).toBe('ar');
+    expect(pipTrans.getAttribute('dir')).toBe('rtl');
 
     isolatedCtrl.destroy();
     mainCtrl.destroy();

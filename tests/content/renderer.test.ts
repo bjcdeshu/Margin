@@ -24,6 +24,7 @@ import {
   packIntoProgressiveBatches,
   stripPartialInlineMarkers,
 } from '../../src/content/renderer';
+import { SelectionPopover } from '../../src/content/selection-popover';
 import { initMarginImageTranslator } from '../../src/media/image-entry';
 import { createSubtitleIsolatedController } from '../../src/youtube/isolated-entry';
 
@@ -2072,5 +2073,229 @@ describe('renderer & content orchestrator: themes, reversible target-only, retry
     expect(throttledCtrl.renderer.isActive).toBe(true);
 
     throttledCtrl.destroy();
+  });
+
+  it('prevents CJK Han-Unification ransom-note glyph mixing and RTL inversion across X Japanese emoji tweets, Arabic RTL tweets, editorial serif articles, and SelectionPopover', async () => {
+    // 1. Verify WEBPAGE_INJECTED_CSS drops `font: inherit;` in favor of explicit typographic inheritance + target font rule
+    expect(WEBPAGE_INJECTED_CSS).not.toContain('font: inherit;');
+    expect(WEBPAGE_INJECTED_CSS).toContain('font-size: inherit;');
+    expect(WEBPAGE_INJECTED_CSS).toContain('font-weight: inherit;');
+    expect(WEBPAGE_INJECTED_CSS).toContain(
+      'font-family: var(--margin-target-font-family) !important;',
+    );
+    expect(WEBPAGE_INJECTED_CSS).toContain(
+      ':where(span, a, strong, b, em, i, u, s, mark, small, sub, sup, abbr, cite, q, time, del, ins, dfn, bdi, bdo):not(.katex):not(.katex *)',
+    );
+    // Ensure atomic inline tags (`code`, `kbd`, `samp`, `var`, `math`, `mjx-container`) are NOT inside `:where(...)`
+    const whereClauseMatch = WEBPAGE_INJECTED_CSS.match(/:where\(([^)]+)\)/);
+    expect(whereClauseMatch).not.toBeNull();
+    const whereTags = whereClauseMatch![1]
+      .split(',')
+      .map((t) => t.trim().toLowerCase());
+    expect(whereTags).toContain('span');
+    expect(whereTags).toContain('a');
+    for (const excludedAtomic of ['code', 'kbd', 'samp', 'var', 'math', 'mjx-container']) {
+      expect(whereTags).not.toContain(excludedAtomic);
+    }
+
+    // 2. Simulate X stylesheet setting Meiryo on `.r-1tl8opc`, a Japanese emoji tweet, an Arabic RTL tweet, and an editorial serif paragraph
+    const hostStyle = document.createElement('style');
+    hostStyle.textContent =
+      '.r-1tl8opc { font-family: "Segoe UI", Meiryo, system-ui, -apple-system, BlinkMacSystemFont, sans-serif; }';
+    document.head.appendChild(hostStyle);
+
+    document.body.innerHTML = `
+      <article>
+        <div id="ja-tweet" data-testid="tweetText" lang="ja" class="r-1tl8opc"><span lang="ja" class="css-1jxf684 r-1tl8opc">すみません</span><img alt="😭" src="https://abs-0.twimg.com/emoji/v2/svg/1f62d.svg"><span lang="ja" class="css-1jxf684 r-1tl8opc">卒論でWordを使ってる</span></div>
+      </article>
+      <article>
+        <div id="ar-tweet" data-testid="tweetText" lang="ar" dir="rtl"><span lang="ar" dir="rtl" class="css-1jxf684 r-1tl8opc">مرحبا بالعالم في هذا اليوم الجميل</span></div>
+      </article>
+      <article>
+        <p id="serif-para" style="font-family: Georgia, serif;">Long-form literary essay paragraph in Georgia serif typography.</p>
+      </article>
+    `;
+
+    const jaTweet = document.getElementById('ja-tweet')!;
+    const arTweet = document.getElementById('ar-tweet')!;
+    const serifPara = document.getElementById('serif-para')!;
+
+    const config = createDefaultMarginConfig();
+    config.targetLang = 'zh-CN';
+    config.providers['google-free'].stream = 'on';
+
+    let releaseFinal!: () => void;
+    const finalBarrier = new Promise<void>((resolve) => {
+      releaseFinal = resolve;
+    });
+
+    const renderer = new WebpageRenderer({
+      config,
+      getUrl: () => 'https://x.com/i/status/789',
+      transport: async (req, callbacks) => {
+        for (const it of req.items) {
+          if (it.text.includes('すみません')) {
+            callbacks.onItemReady?.({
+              id: it.id,
+              trans: '<m0>不好意思</m0>谁现在还在毕业论文',
+              partial: true,
+            });
+          } else if (it.text.includes('مرحبا')) {
+            callbacks.onItemReady?.({
+              id: it.id,
+              trans: '<m0>在这个美好的一天向世界问好',
+              partial: true,
+            });
+          }
+        }
+        await finalBarrier;
+        return {
+          ok: true,
+          requestId: req.requestId,
+          providerId: 'google-free',
+          model: 'gtx',
+          items: req.items.map((it) => {
+            if (it.text.includes('すみません')) {
+              return {
+                id: it.id,
+                trans:
+                  '<m0>不好意思</m0><m1/><m2>谁现在还在毕业论文里用Word写东西，连图都贴不好。</m2>',
+              };
+            }
+            if (it.text.includes('مرحبا')) {
+              return {
+                id: it.id,
+                trans: '<m0>在这个美好的一天向世界问好！</m0>',
+              };
+            }
+            return {
+              id: it.id,
+              trans: '采用衬线字体排版的深度文学随笔段落。',
+            };
+          }),
+          diagnostic: makeMockDiagnostic(),
+        };
+      },
+    });
+
+    const translatePromise = renderer.translateWholePage();
+
+    // Check streaming `partial: true` preview on BOTH Japanese tweet and Arabic RTL tweet!
+    await vi.waitFor(() => {
+      const jaStream = jaTweet.querySelector(
+        '.margin-trans-root[data-margin-streaming="1"]',
+      ) as HTMLElement | null;
+      const arStream = arTweet.querySelector(
+        '.margin-trans-root[data-margin-streaming="1"]',
+      ) as HTMLElement | null;
+      expect(jaStream).not.toBeNull();
+      expect(arStream).not.toBeNull();
+
+      for (const streamEl of [jaStream!, arStream!]) {
+        expect(streamEl.getAttribute('lang')).toBe('zh-CN');
+        expect(streamEl.getAttribute('dir')).toBe('ltr');
+        expect(streamEl.getAttribute('data-margin-has-target-font')).toBe('true');
+        const fontVar = streamEl.style.getPropertyValue(
+          '--margin-target-font-family',
+        );
+        expect(fontVar).toContain('PingFang SC');
+        expect(fontVar).toContain('Microsoft YaHei');
+        expect(fontVar).not.toContain('Meiryo');
+        expect(fontVar).not.toContain('Malgun Gothic');
+      }
+    });
+
+    // Release final rich DOM reconstruction
+    releaseFinal();
+    await translatePromise;
+
+    const jaFinal = jaTweet.querySelector(
+      '.margin-trans-root[data-margin-injected="true"]',
+    ) as HTMLElement;
+    const arFinal = arTweet.querySelector(
+      '.margin-trans-root[data-margin-injected="true"]',
+    ) as HTMLElement;
+    const serifFinal = serifPara.querySelector(
+      '.margin-trans-root[data-margin-injected="true"]',
+    ) as HTMLElement;
+
+    for (const finalEl of [jaFinal, arFinal]) {
+      expect(finalEl.getAttribute('lang')).toBe('zh-CN');
+      expect(finalEl.getAttribute('dir')).toBe('ltr');
+      expect(finalEl.getAttribute('data-margin-has-target-font')).toBe('true');
+      const fontVar = finalEl.style.getPropertyValue(
+        '--margin-target-font-family',
+      );
+      expect(fontVar).toContain('PingFang SC');
+      expect(fontVar).toContain('Microsoft YaHei');
+      expect(fontVar).not.toContain('Meiryo');
+      expect(fontVar).not.toContain('Malgun Gothic');
+    }
+
+    // Verify cloned inner spans stripped source `lang="ja"` / `lang="ar"` & `dir="rtl"` while keeping class and atomic emoji <img>
+    const jaInnerSpans = jaFinal.querySelectorAll('span.css-1jxf684.r-1tl8opc');
+    expect(jaInnerSpans).toHaveLength(2);
+    expect(jaInnerSpans[0]?.hasAttribute('lang')).toBe(false);
+    expect(jaInnerSpans[1]?.hasAttribute('lang')).toBe(false);
+    const jaEmoji = jaFinal.querySelector('img');
+    expect(jaEmoji?.getAttribute('alt')).toBe('😭');
+
+    const arInnerSpan = arFinal.querySelector('span.css-1jxf684.r-1tl8opc')!;
+    expect(arInnerSpan).not.toBeNull();
+    expect(arInnerSpan.hasAttribute('lang')).toBe(false);
+    expect(arInnerSpan.hasAttribute('dir')).toBe(false);
+    expect(arInnerSpan.textContent).toBe('在这个美好的一天向世界问好！');
+
+    // Editorial serif host resolves Songti SC / Noto Serif SC stack
+    expect(
+      serifFinal.style.getPropertyValue('--margin-target-font-family'),
+    ).toContain('Songti SC');
+
+    renderer.destroy();
+
+    // 3. SelectionPopover applies target lang, dir, and locale-pure font family on `.mp-sel-body`
+    const selCfg = createDefaultMarginConfig();
+    selCfg.selection.enabled = true;
+    selCfg.selection.triggerMode = 'instant';
+    selCfg.targetLang = 'zh-TW';
+
+    const popover = new SelectionPopover({
+      config: selCfg,
+      transport: async (req, callbacks) => {
+        callbacks.onItemReady?.({ id: 1, trans: '畢業論文排版', partial: true });
+        return {
+          ok: true,
+          requestId: req.requestId,
+          providerId: 'google-free',
+          model: 'gtx',
+          items: [{ id: 1, trans: '畢業論文排版測試' }],
+          diagnostic: makeMockDiagnostic(),
+        };
+      },
+    });
+    popover.mount();
+    popover.presentForSelection('卒論でWordを使ってる', { x: 40, y: 40 });
+    await new Promise((r) => setTimeout(r, 10));
+
+    const selBody = popover
+      .getShadowRoot()!
+      .querySelector('.mp-sel-body') as HTMLElement;
+    expect(selBody.getAttribute('lang')).toBe('zh-TW');
+    expect(selBody.getAttribute('dir')).toBe('ltr');
+    expect(
+      selBody.style.getPropertyValue('--margin-target-font-family'),
+    ).toContain('Microsoft JhengHei');
+    expect(
+      selBody.style.getPropertyValue('--margin-target-font-family'),
+    ).not.toContain('Meiryo');
+
+    // Live updateConfig to Arabic RTL updates `.mp-sel-body` lang="ar" and dir="rtl"
+    const arSelCfg = structuredClone(selCfg);
+    arSelCfg.targetLang = 'ar';
+    popover.updateConfig(arSelCfg);
+    expect(selBody.getAttribute('lang')).toBe('ar');
+    expect(selBody.getAttribute('dir')).toBe('rtl');
+
+    popover.destroy();
   });
 });

@@ -1,5 +1,10 @@
 import { resolveProviderIdForScene } from '@shared/constants';
 import {
+  normalizeTargetBcp47Lang,
+  resolveTargetFontFamilyCss,
+  resolveTargetTextDir,
+} from '@shared/locale-typography';
+import {
   isExtensionContextValid,
   requestBatchTranslation,
   streamBatchTranslation,
@@ -259,6 +264,7 @@ ${SHADOW_HOST_RESET_CSS}
   max-height: 248px;
   overflow-y: auto;
   padding: 12px 14px;
+  font-family: var(--margin-target-font-family, inherit);
   font-size: 14px;
   line-height: 22px;
   font-variant-numeric: tabular-nums;
@@ -424,6 +430,7 @@ ${SHADOW_HOST_RESET_CSS}
   min-width: 0px;
   height: 28px;
   padding: 0px 9px;
+  font-family: var(--margin-target-font-family, inherit);
   font-size: 12px;
   line-height: 18px;
   color: inherit;
@@ -741,6 +748,21 @@ export class SelectionPopover {
     );
   }
 
+  private applyTargetLocaleTypography(el: HTMLElement): void {
+    const bcp47 = normalizeTargetBcp47Lang(this.config.targetLang);
+    const dir = resolveTargetTextDir(bcp47);
+    if (bcp47) {
+      el.setAttribute('lang', bcp47);
+    } else {
+      el.removeAttribute('lang');
+    }
+    el.setAttribute('dir', dir ?? 'auto');
+    el.style.setProperty(
+      '--margin-target-font-family',
+      resolveTargetFontFamilyCss(bcp47),
+    );
+  }
+
   private evaluateBrowserSelection(ev: PointerEvent | MouseEvent): void {
     if (!this.isFeatureEnabled()) return;
 
@@ -981,6 +1003,7 @@ export class SelectionPopover {
     const body = this.doc.createElement('div');
     body.className = 'card-body mp-sel-body';
     body.setAttribute('data-part', 'card-body');
+    this.applyTargetLocaleTypography(body);
 
     const glossaryEditor = this.doc.createElement('div');
     glossaryEditor.className = 'glossary-editor';
@@ -1026,6 +1049,7 @@ export class SelectionPopover {
     targetInput.className = 'glossary-target-input';
     targetInput.setAttribute('data-part', 'glossary-target-input');
     targetInput.placeholder = '留空即保留原文不翻译';
+    this.applyTargetLocaleTypography(targetInput);
     targetInput.addEventListener('input', () => {
       this.glossaryTargetTouched = true;
       this.syncKeepOriginalPillState();
@@ -1206,6 +1230,10 @@ export class SelectionPopover {
 
     this.translatedText = '';
     this.resetGlossaryQuickCollectForSelection();
+    this.applyTargetLocaleTypography(this.bodyEl);
+    if (this.glossaryTargetInput) {
+      this.applyTargetLocaleTypography(this.glossaryTargetInput);
+    }
     this.bodyEl.setAttribute('data-status', 'loading');
     this.bodyEl.setAttribute('aria-busy', 'true');
     const shimmerLine1 = this.doc.createElement('span');
@@ -1296,6 +1324,7 @@ export class SelectionPopover {
     const paintPartialPreview = (text: string) => {
       if (controller.signal.aborted || !this.bodyEl) return;
       this.translatedText = text;
+      this.applyTargetLocaleTypography(this.bodyEl);
       this.bodyEl.setAttribute('data-status', 'streaming');
       this.bodyEl.setAttribute('aria-busy', 'true');
       if (!partialTextNode || partialTextNode.parentNode !== this.bodyEl) {
@@ -1314,6 +1343,7 @@ export class SelectionPopover {
       const finalText = stripPartialInlineMarkers(rawText).trim();
       if (!finalText) return;
       this.translatedText = finalText;
+      this.applyTargetLocaleTypography(this.bodyEl);
       this.bodyEl.setAttribute('data-status', 'ready');
       this.bodyEl.removeAttribute('aria-busy');
       if (partialTextNode && partialTextNode.parentNode === this.bodyEl) {
@@ -1614,6 +1644,12 @@ export class SelectionPopover {
     }
     if (this.langPillEl) {
       this.langPillEl.textContent = `→ ${nextConfig.targetLang}`;
+    }
+    if (this.bodyEl) {
+      this.applyTargetLocaleTypography(this.bodyEl);
+    }
+    if (this.glossaryTargetInput) {
+      this.applyTargetLocaleTypography(this.glossaryTargetInput);
     }
     if (!this.isFeatureEnabled() && !this.pinned) {
       this.close();

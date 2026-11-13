@@ -1,5 +1,11 @@
 import { resolveProviderIdForScene } from '@shared/constants';
 import {
+  isEditorialSerifFontFamily,
+  normalizeTargetBcp47Lang,
+  resolveTargetFontFamilyCss,
+  resolveTargetTextDir,
+} from '@shared/locale-typography';
+import {
   requestBatchTranslation,
   streamBatchTranslation,
   type StreamBatchCallbacks,
@@ -57,11 +63,30 @@ export const WEBPAGE_INJECTED_CSS = /* css */ `
 
 .margin-trans-root[data-margin-injected="true"],
 .margin-trans-block[data-margin-injected="true"] {
-  font: inherit;
-  color: inherit;
+  font-size: inherit;
+  font-weight: inherit;
+  font-style: inherit;
+  font-stretch: inherit;
+  font-variant: inherit;
   line-height: inherit;
   letter-spacing: inherit;
+  color: inherit;
   word-break: break-word;
+}
+
+.margin-trans-root[data-margin-injected="true"][dir="ltr"] {
+  direction: ltr;
+  unicode-bidi: isolate;
+}
+
+.margin-trans-root[data-margin-injected="true"][dir="rtl"] {
+  direction: rtl;
+  unicode-bidi: isolate;
+}
+
+.margin-trans-root[data-margin-injected="true"][data-margin-has-target-font="true"],
+.margin-trans-root[data-margin-injected="true"][data-margin-has-target-font="true"] :where(span, a, strong, b, em, i, u, s, mark, small, sub, sup, abbr, cite, q, time, del, ins, dfn, bdi, bdo):not(.katex):not(.katex *):not(code *):not(kbd *):not(samp *):not(var *):not(math *):not(mjx-container *) {
+  font-family: var(--margin-target-font-family) !important;
 }
 
 .margin-trans-root[data-margin-layout="inline"] {
@@ -991,6 +1016,44 @@ export class WebpageRenderer {
     );
   }
 
+  applyTargetLocaleTypography(
+    containerEl: HTMLElement,
+    hostBlockEl: HTMLElement,
+  ): void {
+    const bcp47 = normalizeTargetBcp47Lang(this.config.targetLang);
+    const dir = resolveTargetTextDir(bcp47);
+
+    if (bcp47) {
+      containerEl.setAttribute('lang', bcp47);
+    } else {
+      containerEl.removeAttribute('lang');
+    }
+
+    containerEl.setAttribute('dir', dir ?? 'auto');
+
+    let serif = false;
+    if (hostBlockEl.isConnected) {
+      const view =
+        hostBlockEl.ownerDocument?.defaultView ?? this.doc.defaultView;
+      if (view && typeof view.getComputedStyle === 'function') {
+        try {
+          const computedFontFamily =
+            view.getComputedStyle(hostBlockEl).fontFamily;
+          serif = isEditorialSerifFontFamily(computedFontFamily);
+        } catch {
+          serif = false;
+        }
+      }
+    }
+    if (!serif && hostBlockEl.style?.fontFamily) {
+      serif = isEditorialSerifFontFamily(hostBlockEl.style.fontFamily);
+    }
+
+    const fontStack = resolveTargetFontFamilyCss(bcp47, { serif });
+    containerEl.style.setProperty('--margin-target-font-family', fontStack);
+    containerEl.setAttribute('data-margin-has-target-font', 'true');
+  }
+
   private computeLayoutMode(
     blockEl: HTMLElement | null,
     plainTextLength: number,
@@ -1839,7 +1902,12 @@ export class WebpageRenderer {
       return { fallbackPlain: false };
     }
 
-    const reconstructed = reconstructRichDom(translatedText, tokenized, this.doc);
+    const reconstructed = reconstructRichDom(
+      translatedText,
+      tokenized,
+      this.doc,
+      { stripSourceLocaleAttrs: true },
+    );
     const theme = this.resolveEffectiveTheme();
     const layout = this.computeLayoutMode(
       blockEl,
@@ -1861,6 +1929,7 @@ export class WebpageRenderer {
       span.setAttribute('data-margin-injected', 'true');
       span.setAttribute('data-margin-theme', theme);
       span.setAttribute('data-margin-layout', layout);
+      this.applyTargetLocaleTypography(span, blockEl);
       if (reconstructed.fallbackPlain) {
         span.setAttribute('data-margin-fallback-plain', 'true');
       }
@@ -2177,6 +2246,7 @@ export class WebpageRenderer {
         container.setAttribute('data-margin-streaming', '1');
         container.setAttribute('data-margin-theme', theme);
         container.setAttribute('data-margin-layout', layout);
+        this.applyTargetLocaleTypography(container, task.block);
 
         const textNode = this.doc.createTextNode(previewText);
         container.replaceChildren(textNode);
@@ -3541,6 +3611,7 @@ export class WebpageRenderer {
     const prevSig = this.computeTranslationConfigSignature(this.config);
     const nextSig = this.computeTranslationConfigSignature(nextConfig);
     const prevDisplayMode = this.config.webpage.displayMode;
+    const prevTargetLang = this.config.targetLang;
     this.config = nextConfig;
 
     if (this.statusHost) {
@@ -3566,6 +3637,10 @@ export class WebpageRenderer {
         span.setAttribute('data-margin-theme', effectiveTheme);
         const parentBlock = span.parentElement;
         if (!parentBlock) continue;
+
+        if (prevTargetLang !== nextConfig.targetLang) {
+          this.applyTargetLocaleTypography(span, parentBlock);
+        }
 
         if (prevDisplayMode !== newDisplayMode) {
           if (newDisplayMode === 'target-only') {

@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it } from 'vitest';
 import {
+  cloneFormattingElementSafely,
   reconstructRichDom,
   stripResidualMarkers,
   tokenizeParagraph,
@@ -225,5 +226,67 @@ describe('rich-text: <mN> tokenizer, zero-innerHTML reconstructor & per-item fal
 
     expect(tokenizeParagraph(headingWithBtn).text).toBe('Architecture Overview');
     expect(tokenizeParagraph(nestedLi).text).toBe('Parent item title');
+  });
+
+  it('strips source lang and dir from cloned X Japanese/Arabic inline formatting spans when stripSourceLocaleAttrs is enabled while keeping backwards-compatible default', () => {
+    const rawAnchor = document.createElement('a');
+    rawAnchor.setAttribute('href', 'https://x.com/i/status/1');
+    rawAnchor.setAttribute('lang', 'en');
+    rawAnchor.setAttribute('dir', 'rtl');
+    rawAnchor.className = 'r-1tl8opc';
+
+    // Default (backwards-compatible): keeps safe lang and dir
+    const defaultClone = cloneFormattingElementSafely(rawAnchor);
+    expect(defaultClone.getAttribute('lang')).toBe('en');
+    expect(defaultClone.getAttribute('dir')).toBe('rtl');
+    expect(defaultClone.className).toBe('r-1tl8opc');
+
+    // stripSourceLocaleAttrs: true strips lang and dir while keeping href and class
+    const strippedClone = cloneFormattingElementSafely(rawAnchor, {
+      stripSourceLocaleAttrs: true,
+    });
+    expect(strippedClone.hasAttribute('lang')).toBe(false);
+    expect(strippedClone.hasAttribute('dir')).toBe(false);
+    expect(strippedClone.getAttribute('href')).toBe('https://x.com/i/status/1');
+    expect(strippedClone.className).toBe('r-1tl8opc');
+
+    // Simulate X Japanese tweet with emoji splitting text into <span lang="ja" class="css-1jxf684 r-1tl8opc">
+    const tweet = document.createElement('div');
+    tweet.setAttribute('data-testid', 'tweetText');
+    tweet.setAttribute('lang', 'ja');
+    tweet.className = 'r-1tl8opc';
+    tweet.innerHTML =
+      '<span lang="ja" dir="rtl" class="css-1jxf684 r-1tl8opc">すみません</span><img alt="😭" src="https://abs-0.twimg.com/emoji/v2/svg/1f62d.svg"><span lang="ja" class="css-1jxf684 r-1tl8opc">卒論でWordを使ってる</span>';
+    document.body.appendChild(tweet);
+
+    const tokenized = tokenizeParagraph(tweet);
+    expect(tokenized.text).toBe(
+      '<m0>すみません</m0><m1/><m2>卒論でWordを使ってる</m2>',
+    );
+
+    const reconstructed = reconstructRichDom(
+      '<m0>不好意思</m0><m1/><m2>谁现在还在毕业论文里用Word写东西</m2>',
+      tokenized,
+      document,
+      { stripSourceLocaleAttrs: true },
+    );
+    expect(reconstructed.fallbackPlain).toBe(false);
+
+    const out = document.createElement('div');
+    out.appendChild(reconstructed.fragment);
+
+    const spans = out.querySelectorAll('span.css-1jxf684.r-1tl8opc');
+    expect(spans).toHaveLength(2);
+    expect(spans[0]?.hasAttribute('lang')).toBe(false);
+    expect(spans[0]?.hasAttribute('dir')).toBe(false);
+    expect(spans[0]?.textContent).toBe('不好意思');
+    expect(spans[1]?.hasAttribute('lang')).toBe(false);
+    expect(spans[1]?.textContent).toBe('谁现在还在毕业论文里用Word写东西');
+
+    const emojiImg = out.querySelector('img');
+    expect(emojiImg?.getAttribute('alt')).toBe('😭');
+    expect(emojiImg?.getAttribute('src')).toBe(
+      'https://abs-0.twimg.com/emoji/v2/svg/1f62d.svg',
+    );
   });
 });

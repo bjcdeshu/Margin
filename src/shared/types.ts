@@ -399,6 +399,7 @@ export interface MarginActiveCueState {
   startMs: number | null;
   endMs: number | null;
   mode: 'bilingual' | 'target-only' | 'source-only';
+  targetLang?: string;
   fontSizePercent: number;
   sourceScalePercent?: number;
   translationScalePercent?: number;

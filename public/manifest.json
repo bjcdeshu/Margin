@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Margin",
-  "version": "2.3.1",
-  "version_name": "2.3.1",
+  "version": "2.3.2",
+  "version_name": "2.3.2",
   "description": "Quiet editorial AI translation for web pages, input boxes, YouTube bilingual PiP, PDFs, and images.",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAvKcQxx9iJR5rxocZ0vnHv7F8SXYZQc0GOREGtTOSqwX7WK3Y5Mr4GNWeTAcTGkesJWU2piQVvTvSoBM0sY+202E3/lbyPvpwY7i+8FraTRGfo5iRNrOQxVbxZmUEw7zw8yqOaWoAUBF1GII2YrxyDTHtr/B8amb9bitkscBoe5JZm8CButl/fcdYgSP3H3RlLIzIJBUUiKjR+DUNbPal9kgYXnMO7+94w15SwqHkOvCiixo0ez9MnfGB5Zmg65N5w5ADwlaRt2fpR5ne/PoLcluC4BbMXhtCpgj+QgSTBaJXA7TP7sZJv0yQH3HIqFh+TC9jFf+iJ905wV5vuAr0YQIDAQAB",
   "icons": {

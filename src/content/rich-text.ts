@@ -123,6 +123,10 @@ export interface ReconstructedRichDom {
   fallbackPlain: boolean;
 }
 
+export interface RichDomLocaleOptions {
+  stripSourceLocaleAttrs?: boolean;
+}
+
 function escapeLiteralMarkerInRawText(raw: string): string {
   return raw.replace(/<(\/?)m(?=\d)/gi, '<$1m\u200B');
 }
@@ -166,9 +170,14 @@ export function sanitizeSafeImageSrc(rawSrc: string): string | null {
 
 /**
  * Clones a formatting element shallowly via `cloneNode(false)` and retains ONLY
- * verified safe attributes (`href, target, rel, title, class, dir, lang`).
+ * verified safe attributes (`href, target, rel, title, class, dir, lang`),
+ * optionally stripping source `lang`/`dir` attributes when `stripSourceLocaleAttrs` is enabled.
  */
-export function cloneFormattingElementSafely(origEl: Element): Element {
+export function cloneFormattingElementSafely(
+  origEl: Element,
+  options?: RichDomLocaleOptions,
+): Element {
+  const stripLocaleAttrs = Boolean(options?.stripSourceLocaleAttrs);
   const clone = origEl.cloneNode(false) as Element;
   const attrNames: string[] = [];
   for (let i = 0; i < clone.attributes.length; i++) {
@@ -177,7 +186,11 @@ export function cloneFormattingElementSafely(origEl: Element): Element {
 
   for (const attrName of attrNames) {
     const lower = attrName.toLowerCase();
-    if (lower.startsWith('on') || !SAFE_FORMATTING_ATTRS.has(lower)) {
+    if (
+      lower.startsWith('on') ||
+      !SAFE_FORMATTING_ATTRS.has(lower) ||
+      (stripLocaleAttrs && (lower === 'lang' || lower === 'dir' || lower === 'xml:lang'))
+    ) {
       clone.removeAttribute(attrName);
       continue;
     }
@@ -485,6 +498,7 @@ export function reconstructRichDom(
   translatedText: string,
   tokenized: TokenizedParagraph,
   doc: Document = document,
+  options?: RichDomLocaleOptions,
 ): ReconstructedRichDom {
   if (!tokenized.hasRichTags || tokenized.tokens.size === 0) {
     if (/<\/?m\d+/i.test(translatedText)) {
@@ -584,7 +598,10 @@ export function reconstructRichDom(
       }
 
       usedIds.add(id);
-      const clonedFormatting = cloneFormattingElementSafely(descriptor.originalElement);
+      const clonedFormatting = cloneFormattingElementSafely(
+        descriptor.originalElement,
+        options,
+      );
       stack.push({ id, tagUpper, node: clonedFormatting });
       continue;
     }

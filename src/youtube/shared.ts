@@ -16,8 +16,170 @@ export const YOUTUBE_CAPTION_STORAGE_KEY = 'yt-player-caption-display-settings';
 export const PIP_CLEAR_DELAY_MS = 120;
 export const PIP_NOTICE_DURATION_MS = 4_200;
 
-const CJK_FONT_FALLBACK =
-  '"PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Noto Sans SC", sans-serif';
+const SUBTITLE_CJK_FALLBACK_SC =
+  '"PingFang SC", "Hiragino Sans GB", "Microsoft YaHei UI", "Microsoft YaHei", "Noto Sans SC", sans-serif';
+const SUBTITLE_CJK_FALLBACK_TC =
+  '"PingFang TC", "Heiti TC", "Microsoft JhengHei UI", "Microsoft JhengHei", "Noto Sans TC", sans-serif';
+const SUBTITLE_CJK_FALLBACK_JA =
+  '"Hiragino Sans", "Yu Gothic UI", "Yu Gothic", "Meiryo", "Noto Sans JP", sans-serif';
+const SUBTITLE_CJK_FALLBACK_KO =
+  '"Apple SD Gothic Neo", "Malgun Gothic", "Noto Sans KR", sans-serif';
+
+const CJK_FONT_FALLBACK = SUBTITLE_CJK_FALLBACK_SC;
+
+const RTL_SUBTITLE_PRIMARY_LANGS = new Set([
+  'ar',
+  'he',
+  'iw',
+  'fa',
+  'ur',
+  'ps',
+  'dv',
+  'yi',
+]);
+
+const LOCALE_SPECIFIC_CJK_FONT_RE =
+  /^(?:pingfang|hiragino|heiti|stheiti|stxihei|stsong|stkaiti|stfangsong|songti|kaiti|fangsong|yu gothic|yugothic|yu mincho|yumincho|meiryo|ms p?(?:gothic|mincho)|bizin|biz udp?(?:gothic|mincho)|osaka|malgun gothic|apple sd gothic|apple ligothic|lihei|dotum|gulim|batang|gungsuh|nanum|microsoft yahei|microsoft jhenghei|dengxian|simhei|simsun|nsimsun|pmingliu|mingliu|dfkai|wenquanyi|source han (?:sans|serif)|noto (?:sans|serif) (?:cjk|sc|tc|hk|jp|kr|mono cjk))\b/i;
+
+const NON_ASCII_CJK_FONT_NAME_RE =
+  /[\u3040-\u30ff\u3400-\u9fff\uac00-\ud7af\uff00-\uffef]/;
+
+/**
+ * Canonicalizes subtitle target language codes to clean BCP-47 tags
+ * (`'zh-CN'`, `'zh-TW'`, `'ja'`, `'ko'`, `'en'`, `'ar'`, etc.).
+ * Returns `''` for `'auto'` or empty strings; defaults to `'zh-CN'` when `undefined` / `null`.
+ */
+export function normalizeSubtitleTargetLang(raw: unknown): string {
+  if (raw === undefined || raw === null) {
+    return 'zh-CN';
+  }
+  if (typeof raw !== 'string') {
+    return '';
+  }
+  const cleaned = raw.trim().replace(/_/g, '-');
+  if (!cleaned) return '';
+
+  const lower = cleaned.toLowerCase();
+  if (lower === 'auto') return '';
+
+  if (
+    lower === 'zh' ||
+    lower === 'zh-cn' ||
+    lower === 'zh-sg' ||
+    lower === 'zh-my' ||
+    lower === 'zh-hans' ||
+    lower.startsWith('zh-hans-') ||
+    lower === 'cmn-hans'
+  ) {
+    return 'zh-CN';
+  }
+
+  if (
+    lower === 'zh-tw' ||
+    lower === 'zh-hk' ||
+    lower === 'zh-mo' ||
+    lower === 'zh-hant' ||
+    lower.startsWith('zh-hant-') ||
+    lower === 'cmn-hant'
+  ) {
+    return 'zh-TW';
+  }
+
+  if (lower === 'ja' || lower === 'jp' || lower === 'ja-jp') {
+    return 'ja';
+  }
+
+  if (lower === 'ko' || lower === 'kr' || lower === 'ko-kr') {
+    return 'ko';
+  }
+
+  if (!/^[a-z]{2,3}(?:-[a-z0-9]{2,8})*$/i.test(cleaned)) {
+    return '';
+  }
+
+  const parts = cleaned.split('-');
+  return parts
+    .map((part, idx) => {
+      if (idx === 0) return part.toLowerCase();
+      if (part.length === 4 && /^[a-z]+$/i.test(part)) {
+        return part[0].toUpperCase() + part.slice(1).toLowerCase();
+      }
+      if (
+        (part.length === 2 && /^[a-z]+$/i.test(part)) ||
+        (part.length === 3 && /^[0-9]+$/.test(part))
+      ) {
+        return part.toUpperCase();
+      }
+      return part.toLowerCase();
+    })
+    .join('-');
+}
+
+export function resolveSubtitleTargetDir(bcp47: string): 'rtl' | 'ltr' {
+  const primary = (bcp47 || '').trim().toLowerCase().split(/[-_]/)[0] || '';
+  return RTL_SUBTITLE_PRIMARY_LANGS.has(primary) ? 'rtl' : 'ltr';
+}
+
+export function resolveSubtitleCjkFallbackForLang(bcp47: string): string {
+  const canonical = normalizeSubtitleTargetLang(bcp47 || '');
+  const lower = (canonical || bcp47 || '').trim().toLowerCase();
+  if (
+    canonical === 'zh-TW' ||
+    lower.startsWith('zh-tw') ||
+    lower.startsWith('zh-hk') ||
+    lower.startsWith('zh-mo') ||
+    lower.includes('hant')
+  ) {
+    return SUBTITLE_CJK_FALLBACK_TC;
+  }
+  if (canonical === 'ja' || lower === 'jp' || lower.startsWith('ja-')) {
+    return SUBTITLE_CJK_FALLBACK_JA;
+  }
+  if (canonical === 'ko' || lower === 'kr' || lower.startsWith('ko-')) {
+    return SUBTITLE_CJK_FALLBACK_KO;
+  }
+  return SUBTITLE_CJK_FALLBACK_SC;
+}
+
+export function buildTranslatedSubtitleFontFamilyCss(
+  baseFontFamilyCss: string,
+  targetLang?: string,
+): string {
+  const normalizedLang = normalizeSubtitleTargetLang(targetLang);
+  const cjkTail = resolveSubtitleCjkFallbackForLang(normalizedLang);
+  const keptPrefix: string[] = [];
+  const seenLower = new Set<string>();
+
+  for (const rawToken of (baseFontFamilyCss || '').split(',')) {
+    const token = rawToken.trim();
+    if (!token) continue;
+    const unquoted = token
+      .replace(/^['"]+|['"]+$/g, '')
+      .trim()
+      .toLowerCase()
+      .replace(/\s+/g, ' ');
+    if (!unquoted) continue;
+    if (
+      unquoted === 'sans-serif' ||
+      unquoted === 'system-ui' ||
+      unquoted === 'ui-sans-serif' ||
+      LOCALE_SPECIFIC_CJK_FONT_RE.test(unquoted) ||
+      NON_ASCII_CJK_FONT_NAME_RE.test(unquoted)
+    ) {
+      continue;
+    }
+    if (!seenLower.has(unquoted)) {
+      seenLower.add(unquoted);
+      keptPrefix.push(token);
+    }
+  }
+
+  if (keptPrefix.length === 0) {
+    keptPrefix.push('"YouTube Noto"', 'Roboto', 'Arial');
+  }
+
+  return `${keptPrefix.join(', ')}, ${cjkTail}`;
+}
 
 export const DEFAULT_YOUTUBE_NATIVE_CAPTION_THEME: YoutubeNativeCaptionTheme = {
   textColorCss: 'rgba(255, 255, 255, 1)',
@@ -534,7 +696,9 @@ export function resolveEffectiveNativeThemeVariables(
   overrides?: {
     bgOpacityPercent?: number | null;
     translationTint?: SubtitleTranslationTint;
-  },
+    targetLang?: string;
+  } | null,
+  targetLang?: string,
 ): {
   fgCss: string;
   transFgCss: string;
@@ -542,6 +706,8 @@ export function resolveEffectiveNativeThemeVariables(
   winBgCss: string;
   shadowCss: string;
   fontCss: string;
+  transFontCss: string;
+  subTransFontCss: string;
   variantCss: string;
   scaleMult: number;
 } {
@@ -564,6 +730,14 @@ export function resolveEffectiveNativeThemeVariables(
     normalizeTranslationTint(overrides?.translationTint),
     fgCss,
   );
+  const effectiveTargetLang = normalizeSubtitleTargetLang(
+    targetLang !== undefined ? targetLang : overrides?.targetLang,
+  );
+  const transFontCss = buildTranslatedSubtitleFontFamilyCss(
+    base.fontFamilyCss,
+    effectiveTargetLang,
+  );
+  const subTransFontCss = `"YouTube Noto", Roboto, Arial, ${resolveSubtitleCjkFallbackForLang(effectiveTargetLang)}`;
 
   return {
     fgCss,
@@ -572,6 +746,8 @@ export function resolveEffectiveNativeThemeVariables(
     winBgCss: base.windowBgCss,
     shadowCss,
     fontCss: base.fontFamilyCss,
+    transFontCss,
+    subTransFontCss,
     variantCss: base.fontVariantCss,
     scaleMult: base.fontScaleMultiplier,
   };
@@ -581,19 +757,28 @@ export function applyNativeThemeVariablesToElement(
   el: HTMLElement,
   cue: Pick<
     MarginActiveCueState,
-    'nativeTheme' | 'bgOpacityPercent' | 'translationTint'
+    'nativeTheme' | 'bgOpacityPercent' | 'translationTint' | 'targetLang'
   >,
 ): void {
-  const vars = resolveEffectiveNativeThemeVariables(cue.nativeTheme, {
-    bgOpacityPercent: cue.bgOpacityPercent,
-    translationTint: cue.translationTint,
-  });
+  const vars = resolveEffectiveNativeThemeVariables(
+    cue.nativeTheme,
+    {
+      bgOpacityPercent: cue.bgOpacityPercent,
+      translationTint: cue.translationTint,
+      targetLang: cue.targetLang,
+    },
+    cue.targetLang,
+  );
   el.style.setProperty('--margin-yt-fg', vars.fgCss);
   el.style.setProperty('--margin-yt-trans-fg', vars.transFgCss);
   el.style.setProperty('--margin-yt-bg', vars.bgCss);
   el.style.setProperty('--margin-yt-win-bg', vars.winBgCss);
   el.style.setProperty('--margin-yt-shadow', vars.shadowCss);
   el.style.setProperty('--margin-yt-font', vars.fontCss);
+  el.style.setProperty('--margin-yt-font-family', vars.fontCss);
+  el.style.setProperty('--margin-yt-trans-font', vars.transFontCss);
+  el.style.setProperty('--margin-yt-trans-font-family', vars.transFontCss);
+  el.style.setProperty('--margin-sub-trans-font-family', vars.subTransFontCss);
   el.style.setProperty('--margin-yt-variant', vars.variantCss);
   el.style.setProperty('--margin-yt-scale-mult', vars.scaleMult.toFixed(3));
 }
@@ -697,6 +882,10 @@ export function normalizeActiveCueState(
   const stylePreset = normalizeSubtitleStylePreset(input?.stylePreset);
   const bgOpacityPercent = normalizeBgOpacityOverride(input?.bgOpacityPercent);
   const translationTint = normalizeTranslationTint(input?.translationTint);
+  const targetLang =
+    input?.targetLang === undefined
+      ? 'zh-CN'
+      : normalizeSubtitleTargetLang(input.targetLang);
   const nativeTheme = input?.nativeTheme
     ? normalizeYoutubeNativeCaptionTheme(input.nativeTheme)
     : undefined;
@@ -707,6 +896,7 @@ export function normalizeActiveCueState(
     startMs,
     endMs,
     mode,
+    targetLang,
     fontSizePercent,
     sourceScalePercent,
     translationScalePercent,

@@ -4,6 +4,7 @@ export * from './temperature';
 export * from './constants';
 export * from './url-match';
 export * from './page-language';
+export * from './locale-typography';
 export * from './storage';
 export * from './messaging';
 export * from './shadow-styles';

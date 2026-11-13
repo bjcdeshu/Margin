@@ -879,7 +879,7 @@ describe('Quiet Paper 6-Tab Settings Studio (OptionsApp)', () => {
     expect(container.querySelector('[data-testid="import-audit-summary"]')).not.toBeNull();
   });
 
-  it('renders v2.3.1 studio badge, triggers save on Ctrl+S, and keeps env macro disclosure collapsed by default in PromptsGlossaryTab', async () => {
+  it('renders v2.3.2 studio badge, triggers save on Ctrl+S, and keeps env macro disclosure collapsed by default in PromptsGlossaryTab', async () => {
     await saveMarginConfig(createDefaultMarginConfig());
 
     await act(async () => {
@@ -887,9 +887,9 @@ describe('Quiet Paper 6-Tab Settings Studio (OptionsApp)', () => {
     });
     await flushMicrotasks();
 
-    // 1. Studio footer displays v2.3.1 badge & keyboard shortcut hint
+    // 1. Studio footer displays v2.3.2 badge & keyboard shortcut hint
     const footerVersion = container.querySelector('.mp-nav-footer .mp-pill--mono');
-    expect(footerVersion?.textContent).toBe('v2.3.1');
+    expect(footerVersion?.textContent).toBe('v2.3.2');
     const saveBtn = container.querySelector(
       '[data-testid="options-save-btn"]',
     ) as HTMLButtonElement;
