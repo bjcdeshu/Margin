@@ -23,9 +23,11 @@ function runWithOptionalWebLock<T>(
   task: () => Promise<T>,
 ): Promise<T> {
   try {
-    const locks = globalThis.navigator?.locks;
-    if (locks && typeof locks.request === 'function') {
-      return locks.request(`margin:storage:${key}`, () => task()) as Promise<T>;
+    if (globalThis.location?.protocol === 'chrome-extension:') {
+      const locks = globalThis.navigator?.locks;
+      if (locks && typeof locks.request === 'function') {
+        return locks.request(`margin:storage:${key}`, () => task()) as Promise<T>;
+      }
     }
   } catch {
     // Fall back to in-process lock queue when Web Locks API is unavailable

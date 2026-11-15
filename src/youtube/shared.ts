@@ -2,6 +2,7 @@ import { BRAND } from '@shared/brand';
 import type {
   MarginActiveCueState,
   SubtitleCue,
+  SubtitleSettings,
   SubtitleStylePreset,
   SubtitleTranslationTint,
   YoutubeMainBridgeMessage,
@@ -200,8 +201,32 @@ export interface YoutubeDomSegmentStyle {
   fontVariant?: string;
 }
 
+export type YoutubeIsolatedToMainMessage =
+  | {
+      source: typeof BRAND.ytBridgeSourceIsolated;
+      type: 'active-cue-update';
+      cue: MarginActiveCueState;
+    }
+  | {
+      source: typeof BRAND.ytBridgeSourceIsolated;
+      type: 'subtitle-config-update';
+      settings: SubtitleSettings;
+      instanceId?: string;
+    }
+  | {
+      source: typeof BRAND.ytBridgeSourceIsolated;
+      type: 'request-active-captions';
+      videoId?: string;
+    }
+  | {
+      source: typeof BRAND.ytBridgeSourceIsolated;
+      type: 'isolated-context-invalidated';
+      instanceId?: string;
+    };
+
 export type YoutubeExtendedBridgeMessage =
   | (YoutubeMainBridgeMessage & { seeked?: boolean })
+  | YoutubeIsolatedToMainMessage
   | {
       source: typeof BRAND.ytBridgeSourceMain;
       type: 'subtitle-toggle-request';
@@ -211,6 +236,10 @@ export type YoutubeExtendedBridgeMessage =
       source: typeof BRAND.ytBridgeSourceMain;
       type: 'native-caption-style-update';
       theme: YoutubeNativeCaptionTheme;
+    }
+  | {
+      source: typeof BRAND.ytBridgeSourceMain;
+      type: 'main-controller-ready';
     };
 
 export function extractYoutubeVideoId(urlLike: string): string {

@@ -410,6 +410,29 @@ export interface MarginActiveCueState {
   position: 'bottom' | 'top';
 }
 
+export type YoutubeIsolatedToMainMessage =
+  | {
+      source: 'margin-yt-isolated';
+      type: 'active-cue-update';
+      cue: MarginActiveCueState;
+    }
+  | {
+      source: 'margin-yt-isolated';
+      type: 'subtitle-config-update';
+      settings: SubtitleSettings;
+      instanceId?: string;
+    }
+  | {
+      source: 'margin-yt-isolated';
+      type: 'request-active-captions';
+      videoId?: string;
+    }
+  | {
+      source: 'margin-yt-isolated';
+      type: 'isolated-context-invalidated';
+      instanceId?: string;
+    };
+
 export type YoutubeMainBridgeMessage =
   | {
       source: 'margin-yt-main';
@@ -426,16 +449,7 @@ export type YoutubeMainBridgeMessage =
       currentTimeMs: number;
       paused: boolean;
     }
-  | {
-      source: 'margin-yt-isolated';
-      type: 'active-cue-update';
-      cue: MarginActiveCueState;
-    }
-  | {
-      source: 'margin-yt-isolated';
-      type: 'subtitle-config-update';
-      settings: SubtitleSettings;
-    };
+  | YoutubeIsolatedToMainMessage;
 
 export interface LegacyImportAuditItem {
   level: 'info' | 'normalized' | 'ignored' | 'warning';

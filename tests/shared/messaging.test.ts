@@ -1,5 +1,9 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { streamBatchTranslation } from '@shared/messaging';
+import {
+  isYoutubeTabUrl,
+  sendTabCommand,
+  streamBatchTranslation,
+} from '@shared/messaging';
 import type {
   TranslateBatchRequest,
   TranslateBatchResponse,
@@ -156,5 +160,69 @@ describe('streamBatchTranslation abort listener cleanup (#127 #18)', () => {
     const countBeforeAbort = postMessages.length;
     sharedController.abort();
     expect(postMessages).toHaveLength(countBeforeAbort);
+  });
+
+  it('injects subtitles.js alongside content.js/image-translate.js and injects youtube-main.js (MAIN) on YouTube tabs in sendTabCommand (v2.3.5 Fix #4)', async () => {
+    expect(isYoutubeTabUrl('https://www.youtube.com/watch?v=KYHx0DI6mSo')).toBe(true);
+    expect(isYoutubeTabUrl('https://youtube.com/shorts/abc1234')).toBe(true);
+    expect(isYoutubeTabUrl('https://notyoutube.com/watch?v=1')).toBe(false);
+
+    const scriptCalls: Array<{
+      target: { tabId: number };
+      files: string[];
+      world?: string;
+    }> = [];
+    let ytSendAttempts = 0;
+
+    (globalThis as { chrome?: unknown }).chrome = {
+      tabs: {
+        get: vi.fn(async (tabId: number) => ({
+          id: tabId,
+          url:
+            tabId === 77
+              ? 'https://www.youtube.com/watch?v=KYHx0DI6mSo'
+              : 'https://example.org/article',
+        })),
+        sendMessage: vi.fn(async (tabId: number) => {
+          if (tabId === 77) {
+            ytSendAttempts += 1;
+            if (ytSendAttempts === 1) {
+              throw new Error('Receiving end does not exist.');
+            }
+            return { ok: true };
+          }
+          throw new Error('Receiving end does not exist.');
+        }),
+      },
+      scripting: {
+        executeScript: vi.fn(
+          async (opts: {
+            target: { tabId: number };
+            files: string[];
+            world?: string;
+          }) => {
+            scriptCalls.push(opts);
+            return [];
+          },
+        ),
+      },
+    };
+
+    const ytResult = await sendTabCommand(77, {
+      type: 'margin:cmd:toggle-page',
+    });
+    expect(ytResult.ok).toBe(true);
+    expect(ytResult.autoInjected).toBe(true);
+    expect(scriptCalls).toEqual([
+      {
+        target: { tabId: 77 },
+        files: ['content.js', 'subtitles.js', 'image-translate.js'],
+      },
+      {
+        target: { tabId: 77 },
+        world: 'MAIN',
+        files: ['youtube-main.js'],
+      },
+    ]);
   });
 });

@@ -1,4 +1,5 @@
 import { BRAND } from '@shared/brand';
+import { isYoutubeTabUrl } from '@shared/messaging';
 import { getMarginConfig } from '@shared/storage';
 import { sweepOrphanedDnrSessionRules } from './dnr-image';
 import {
@@ -47,6 +48,122 @@ export function resetBackgroundServiceWorkerForTests(): void {
   listenersInitialized = false;
 }
 
+const DEFAULT_REINJECT_PROBE_TIMEOUT_MS = 250;
+const DEFAULT_REINJECT_SCRIPT_TIMEOUT_MS = 2500;
+
+export interface ReinjectOpenTabsOptions {
+  probeTimeoutMs?: number;
+  scriptTimeoutMs?: number;
+}
+
+function withReinjectTimeout<T>(
+  promise: Promise<T>,
+  timeoutMs: number,
+): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      reject(new Error(`Reinject operation timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+  });
+  return Promise.race([promise, timeoutPromise]).finally(() => {
+    if (timer !== null) {
+      clearTimeout(timer);
+    }
+  });
+}
+
+async function isTabContentScriptAlive(
+  tabId: number,
+  timeoutMs: number,
+): Promise<boolean> {
+  if (typeof chrome.tabs?.sendMessage !== 'function') {
+    return false;
+  }
+  try {
+    const resp = await withReinjectTimeout(
+      Promise.resolve().then(() =>
+        chrome.tabs.sendMessage(tabId, {
+          type: 'margin:cmd:get-page-state',
+        }),
+      ),
+      timeoutMs,
+    );
+    return Boolean(
+      resp &&
+        typeof resp === 'object' &&
+        typeof (resp as { active?: unknown }).active === 'boolean',
+    );
+  } catch {
+    return false;
+  }
+}
+
+export async function reinjectContentScriptsIntoOpenTabs(
+  options: ReinjectOpenTabsOptions = {},
+): Promise<void> {
+  if (
+    typeof globalThis.chrome === 'undefined' ||
+    typeof chrome.tabs?.query !== 'function' ||
+    typeof chrome.scripting?.executeScript !== 'function'
+  ) {
+    return;
+  }
+
+  const probeTimeoutMs =
+    options.probeTimeoutMs ?? DEFAULT_REINJECT_PROBE_TIMEOUT_MS;
+  const scriptTimeoutMs =
+    options.scriptTimeoutMs ?? DEFAULT_REINJECT_SCRIPT_TIMEOUT_MS;
+
+  let openTabs: chrome.tabs.Tab[] = [];
+  try {
+    openTabs = await chrome.tabs.query({
+      url: ['http://*/*', 'https://*/*'],
+    });
+  } catch {
+    return;
+  }
+
+  const eligibleTabs = openTabs.filter(
+    (tab): tab is chrome.tabs.Tab & { id: number } =>
+      typeof tab?.id === 'number' &&
+      !tab.discarded &&
+      (tab.status as string | undefined) !== 'unloaded',
+  );
+
+  await Promise.allSettled(
+    eligibleTabs.map(async (tab) => {
+      const tabId = tab.id;
+      try {
+        if (await isTabContentScriptAlive(tabId, probeTimeoutMs)) {
+          return;
+        }
+        await withReinjectTimeout(
+          chrome.scripting.executeScript({
+            target: { tabId },
+            files: ['content.js', 'subtitles.js', 'image-translate.js'],
+            injectImmediately: true,
+          }),
+          scriptTimeoutMs,
+        );
+        if (isYoutubeTabUrl(tab.url)) {
+          await withReinjectTimeout(
+            chrome.scripting.executeScript({
+              target: { tabId },
+              world: 'MAIN',
+              files: ['youtube-main.js'],
+              injectImmediately: true,
+            }),
+            scriptTimeoutMs,
+          );
+        }
+      } catch {
+        // Ignore restricted, discarded, hung, or concurrently closed tabs
+      }
+    }),
+  );
+}
+
 export function initializeBackgroundServiceWorker(): void {
   if (listenersInitialized || typeof globalThis.chrome === 'undefined') {
     return;
@@ -56,14 +173,23 @@ export function initializeBackgroundServiceWorker(): void {
   void sweepOrphanedDnrSessionRules();
 
   if (chrome.runtime?.onInstalled) {
-    chrome.runtime.onInstalled.addListener(() => {
-      void getMarginConfig();
-      void sweepOrphanedDnrSessionRules();
-      registerContextMenus();
-      console.info(
-        `[${BRAND.name}] Service worker initialized (${BRAND.version})`,
-      );
-    });
+    chrome.runtime.onInstalled.addListener(
+      (details?: chrome.runtime.InstalledDetails) => {
+        void getMarginConfig();
+        void sweepOrphanedDnrSessionRules();
+        registerContextMenus();
+        if (
+          !details?.reason ||
+          details.reason === 'install' ||
+          details.reason === 'update'
+        ) {
+          void reinjectContentScriptsIntoOpenTabs();
+        }
+        console.info(
+          `[${BRAND.name}] Service worker initialized (${BRAND.version})`,
+        );
+      },
+    );
   }
 
   if (chrome.runtime?.onStartup) {

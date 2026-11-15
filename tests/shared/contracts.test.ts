@@ -45,7 +45,7 @@ describe('Margin shared contracts & temperature engine', () => {
   it('locks brand constants and Shadow DOM CSS reset invariants', () => {
     expect(BRAND.name).toBe('Margin');
     expect(BRAND.slug).toBe('margin');
-    expect(BRAND.version).toBe('2.3.4');
+    expect(BRAND.version).toBe('2.3.5');
     expect(BRAND.pinnedExtensionId).toMatch(/^[a-p]{32}$/);
     expect(SHADOW_HOST_RESET_CSS).toContain('all: initial !important');
     expect(SHADOW_HOST_RESET_CSS).toContain('font-size: 16px !important');
@@ -310,7 +310,11 @@ describe('Margin shared contracts & temperature engine', () => {
             throw new Error('Cannot access a chrome:// URL');
           }
           injectCalls += 1;
-          expect(opts.files).toEqual(['content.js', 'image-translate.js']);
+          expect(opts.files).toEqual([
+            'content.js',
+            'subtitles.js',
+            'image-translate.js',
+          ]);
           return [];
         },
       },

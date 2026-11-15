@@ -199,6 +199,20 @@ function isRestrictedBrowserPageError(message: string): boolean {
   );
 }
 
+export function isYoutubeTabUrl(rawUrl?: string): boolean {
+  if (!rawUrl) return false;
+  try {
+    const parsed = new URL(rawUrl);
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+      return false;
+    }
+    const host = parsed.hostname.toLowerCase();
+    return host === 'youtube.com' || host.endsWith('.youtube.com');
+  } catch {
+    return false;
+  }
+}
+
 export async function sendTabCommand(
   tabId: number,
   command: AnyTabMessage,
@@ -244,8 +258,28 @@ export async function sendTabCommand(
         try {
           await chrome.scripting.executeScript({
             target: { tabId },
-            files: ['content.js', 'image-translate.js'],
+            files: ['content.js', 'subtitles.js', 'image-translate.js'],
           });
+          let tabUrl = '';
+          if (typeof chrome.tabs?.get === 'function') {
+            try {
+              const tabInfo = await chrome.tabs.get(tabId);
+              tabUrl = tabInfo?.url ?? '';
+            } catch {
+              tabUrl = '';
+            }
+          }
+          if (isYoutubeTabUrl(tabUrl)) {
+            try {
+              await chrome.scripting.executeScript({
+                target: { tabId },
+                world: 'MAIN',
+                files: ['youtube-main.js'],
+              });
+            } catch {
+              // Best-effort MAIN world injection; do not block tab command retry
+            }
+          }
           const retryDelaysMs = [50, 120, 250];
           let lastRetryErr: unknown;
           for (const delayMs of retryDelaysMs) {

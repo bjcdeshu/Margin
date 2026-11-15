@@ -16,8 +16,8 @@ import type {
   SubtitleCue,
   TranslateBatchRequest,
   TranslateBatchResponse,
-  YoutubeMainBridgeMessage,
   YoutubeNativeCaptionTheme,
+  YoutubeRawJson3Event,
 } from '@shared/types';
 import { isUrlExcluded } from '@shared/url-match';
 import {
@@ -43,6 +43,7 @@ import {
   resolveSubtitleTargetDir,
   YOUTUBE_CAPTION_STORAGE_KEY,
   type YoutubeExtendedBridgeMessage,
+  type YoutubeIsolatedToMainMessage,
 } from './shared';
 import {
   extractTextTrackCues,
@@ -53,8 +54,25 @@ import {
 } from './timeline';
 
 export const SUBTITLE_OVERLAY_HOST_ID = `${BRAND.cssPrefix}-subtitle-overlay-host`;
-const NATIVE_YT_HIDE_STYLE_ID = `${BRAND.cssPrefix}-yt-native-caption-suppress`;
-const ISOLATED_CONTROLLER_KEY = '__marginSubtitleIsolatedControllerV2__';
+export const NATIVE_YT_HIDE_STYLE_ID = `${BRAND.cssPrefix}-yt-native-caption-suppress`;
+export const OVERLAY_OWNER_ATTR = `${BRAND.domAttrPrefix}-owner`;
+export const ISOLATED_CONTROLLER_KEY = '__marginSubtitleIsolatedControllerV2__';
+
+const MAX_STASHED_VIDEOS = 6;
+const MAX_STASHED_CAPTURES_PER_VIDEO = 8;
+
+interface StashedCaptionCapture {
+  videoId: string;
+  langCode: string;
+  trackUrl: string;
+  events: YoutubeRawJson3Event[];
+}
+
+let isolatedInstanceSeq = 0;
+function nextIsolatedInstanceId(): string {
+  isolatedInstanceSeq += 1;
+  return `margin-iso-${Date.now().toString(36)}-${isolatedInstanceSeq}-${Math.random().toString(36).slice(2, 8)}`;
+}
 
 function isYoutubeHostname(hostname: string): boolean {
   const lower = (hostname || '').toLowerCase();
@@ -84,6 +102,7 @@ export interface SubtitleIsolatedControllerOptions {
 export interface SubtitleIsolatedController {
   start(): Promise<void>;
   destroy(): void;
+  isDestroyed?(): boolean;
   getActiveCue(): MarginActiveCueState;
   getCues(): readonly SubtitleCue[];
 }
@@ -104,7 +123,9 @@ export function createSubtitleIsolatedController(
       return requestBatchTranslation(req);
     });
 
+  const instanceId = nextIsolatedInstanceId();
   let config: MarginConfig = createDefaultMarginConfig();
+  let configLoaded = false;
   let sessionEnabledOverride: boolean | null = null;
   let currentVideoKey = '';
   let activeSourceTrackFingerprint = '';
@@ -115,6 +136,7 @@ export function createSubtitleIsolatedController(
   let playheadPollTimer: ReturnType<typeof setInterval> | null = null;
   let unsubConfig: (() => void) | null = null;
   let domObserver: MutationObserver | null = null;
+  let watchFlexyObserver: MutationObserver | null = null;
   let playerResizeObserver: ResizeObserver | null = null;
   let observedPlayerContainer: HTMLElement | null = null;
   let playerClassObserver: MutationObserver | null = null;
@@ -127,6 +149,7 @@ export function createSubtitleIsolatedController(
   let detachHtml5Listeners: (() => void) | null = null;
   let hadRuntimeIdAtStart = false;
   let destroyed = false;
+  const stashedCapturesByVideoId = new Map<string, StashedCaptionCapture[]>();
 
   const isYoutube = isYoutubeHostname(win.location?.hostname ?? '');
   let hasReceivedMainThemeBridge = false;
@@ -191,7 +214,7 @@ export function createSubtitleIsolatedController(
     });
   }
 
-  function postToYoutubeMain(msg: YoutubeMainBridgeMessage): void {
+  function postToYoutubeMain(msg: YoutubeIsolatedToMainMessage): void {
     if (!isYoutube) return;
     try {
       win.postMessage(msg, '*');
@@ -205,6 +228,7 @@ export function createSubtitleIsolatedController(
     postToYoutubeMain({
       source: BRAND.ytBridgeSourceIsolated,
       type: 'subtitle-config-update',
+      instanceId,
       settings: {
         ...config.subtitles,
         youtubeAutoEnable: isSubtitlesEnabledForSite(),
@@ -374,6 +398,10 @@ export function createSubtitleIsolatedController(
     if (!container) return null;
 
     let host = doc.getElementById(SUBTITLE_OVERLAY_HOST_ID) as HTMLElement | null;
+    if (host && host.getAttribute(OVERLAY_OWNER_ATTR) !== instanceId) {
+      host.remove();
+      host = null;
+    }
     if (!host) {
       host = doc.createElement('div');
       host.id = SUBTITLE_OVERLAY_HOST_ID;
@@ -409,8 +437,10 @@ export function createSubtitleIsolatedController(
 
       wrapper.append(origLine, transLine);
       shadow.append(style, wrapper);
-      ownedOverlayHost = host;
     }
+
+    host.setAttribute(OVERLAY_OWNER_ATTR, instanceId);
+    ownedOverlayHost = host;
 
     if (host.parentElement !== container) {
       container.appendChild(host);
@@ -436,30 +466,56 @@ export function createSubtitleIsolatedController(
     playerClassObserver?.disconnect();
     playerClassObserver = null;
     observedClassContainer = null;
-    const existingHost = doc.getElementById(SUBTITLE_OVERLAY_HOST_ID);
-    if (!options.contextInvalidated || (ownedOverlayHost && existingHost === ownedOverlayHost)) {
-      existingHost?.remove();
-      setNativeYoutubeCaptionSuppression(false);
+
+    const ownedOwner = ownedOverlayHost?.getAttribute(OVERLAY_OWNER_ATTR) ?? '';
+    if (
+      ownedOverlayHost &&
+      (!options.contextInvalidated || !ownedOwner || ownedOwner === instanceId)
+    ) {
+      ownedOverlayHost.remove();
     }
     ownedOverlayHost = null;
+
+    const existingHost = doc.getElementById(SUBTITLE_OVERLAY_HOST_ID);
+    const existingOwner = existingHost?.getAttribute(OVERLAY_OWNER_ATTR) ?? '';
+    const ownedByOtherInstance = Boolean(
+      existingHost && existingOwner && existingOwner !== instanceId,
+    );
+    if (!options.contextInvalidated || !ownedByOtherInstance) {
+      existingHost?.remove();
+    }
+
+    const remainingHost = doc.getElementById(SUBTITLE_OVERLAY_HOST_ID);
+    const remainingOwner = remainingHost?.getAttribute(OVERLAY_OWNER_ATTR) ?? '';
+    const hasOtherMountedOwner = Boolean(
+      remainingHost?.isConnected &&
+        remainingOwner &&
+        remainingOwner !== instanceId,
+    );
+    if (!hasOtherMountedOwner) {
+      setNativeYoutubeCaptionSuppression(false);
+    }
   }
 
   function applyOverlayDom(cue: MarginActiveCueState): void {
-    renderedCueState = cue;
-
     if (!isSubtitlesEnabledForSite() || scheduler.getCues().length === 0) {
+      renderedCueState = cue;
       removeOverlayHost();
       return;
     }
 
-    setNativeYoutubeCaptionSuppression(true);
     const shadow = ensureOverlayShadowRoot();
-    if (!shadow) return;
+    const wrapper = shadow?.getElementById('margin-sub-wrap');
+    const origEl = shadow?.getElementById('margin-sub-original');
+    const transEl = shadow?.getElementById('margin-sub-translated');
+    if (!shadow || !wrapper || !origEl || !transEl) {
+      renderedCueState = normalizeActiveCueState(buildConfiguredCueDefaults());
+      setNativeYoutubeCaptionSuppression(false);
+      return;
+    }
 
-    const wrapper = shadow.getElementById('margin-sub-wrap');
-    const origEl = shadow.getElementById('margin-sub-original');
-    const transEl = shadow.getElementById('margin-sub-translated');
-    if (!wrapper || !origEl || !transEl) return;
+    renderedCueState = cue;
+    setNativeYoutubeCaptionSuppression(true);
 
     const origPct = clampFontSizePercent(cue.sourceScalePercent, 100);
     const transPct = clampFontSizePercent(
@@ -609,6 +665,146 @@ export function createSubtitleIsolatedController(
     }
   }
 
+  function resolveActiveYoutubePageVideoId(): string {
+    return (
+      extractYoutubeVideoId(win.location?.href ?? '') ||
+      doc.querySelector('ytd-watch-flexy')?.getAttribute('video-id') ||
+      ''
+    );
+  }
+
+  function stashCapturedTrackForVideo(item: StashedCaptionCapture): void {
+    const existingList = stashedCapturesByVideoId.get(item.videoId);
+    let list: StashedCaptionCapture[];
+    if (existingList) {
+      stashedCapturesByVideoId.delete(item.videoId);
+      list = existingList.filter((entry) => entry.trackUrl !== item.trackUrl);
+    } else {
+      if (stashedCapturesByVideoId.size >= MAX_STASHED_VIDEOS) {
+        const oldestKey = stashedCapturesByVideoId.keys().next().value;
+        if (oldestKey !== undefined) {
+          stashedCapturesByVideoId.delete(oldestKey);
+        }
+      }
+      list = [];
+    }
+    if (list.length >= MAX_STASHED_CAPTURES_PER_VIDEO) {
+      list.shift();
+    }
+    list.push(item);
+    stashedCapturesByVideoId.set(item.videoId, list);
+  }
+
+  function processCapturedCaptionTrack(capture: StashedCaptionCapture): void {
+    const { videoId, langCode, trackUrl, events } = capture;
+    const normalized = normalizeYoutubeEvents(events);
+    if (normalized.length === 0) return;
+
+    const tlang = isTranslatedYoutubeTrackUrl(trackUrl);
+    const existingCues = scheduler.getCues();
+
+    // Only merge YouTube `tlang` tracks into `cue.trans` when normalized `tlang` matches `config.targetLang`
+    if (tlang) {
+      const normalizedTlang = normalizeSubtitleTargetLang(tlang);
+      const normalizedTarget = normalizeSubtitleTargetLang(
+        config.targetLang || 'zh-CN',
+      );
+      if (
+        normalizedTlang &&
+        normalizedTarget &&
+        normalizedTlang === normalizedTarget &&
+        currentVideoKey === videoId &&
+        existingCues.length > 0
+      ) {
+        const merged = mergeAlignedSubtitleTrack(existingCues, normalized);
+        if (merged.applied) {
+          scheduler.loadCues(videoId, merged.cues, currentPlayheadMs);
+          refreshActiveCueFromPlayhead();
+        }
+      }
+      return;
+    }
+
+    const nextFingerprint = buildSourceTrackFingerprint(
+      videoId,
+      langCode || 'auto',
+      normalized,
+      trackUrl,
+    );
+
+    // Idempotent replay guard: preserve existing `cue.trans` & in-flight batches on config/toggle sync
+    if (
+      currentVideoKey === videoId &&
+      activeSourceTrackFingerprint === nextFingerprint &&
+      existingCues.length > 0
+    ) {
+      if (isSubtitlesEnabledForSite()) {
+        syncSchedulerConfig();
+        scheduler.updatePlayhead(currentPlayheadMs);
+      } else {
+        scheduler.cancelAll();
+      }
+      refreshActiveCueFromPlayhead();
+      return;
+    }
+
+    if (currentVideoKey !== videoId) {
+      activeSourceTrackFingerprint = '';
+    }
+    currentVideoKey = videoId;
+    if (isSubtitlesEnabledForSite()) {
+      syncSchedulerConfig();
+      activeSourceTrackFingerprint = nextFingerprint;
+      scheduler.loadCues(videoId, normalized, currentPlayheadMs);
+    } else {
+      scheduler.cancelAll();
+    }
+    refreshActiveCueFromPlayhead();
+  }
+
+  function drainStashedCapturesForVideo(videoId: string): boolean {
+    const stashed = stashedCapturesByVideoId.get(videoId);
+    if (!stashed || stashed.length === 0) return false;
+    stashedCapturesByVideoId.delete(videoId);
+    for (const item of stashed) {
+      processCapturedCaptionTrack(item);
+    }
+    return true;
+  }
+
+  function syncYoutubePageVideoTransition(requestMissingFromMain = false): void {
+    if (destroyed || !isYoutube) return;
+    const activePageVideoId = resolveActiveYoutubePageVideoId();
+    if (!activePageVideoId) return;
+    if (currentVideoKey && currentVideoKey !== activePageVideoId) {
+      currentVideoKey = activePageVideoId;
+      activeSourceTrackFingerprint = '';
+      const video = doc.querySelector<HTMLVideoElement>('video.html5-main-video');
+      currentPlayheadMs = video
+        ? Math.max(0, Math.round((video.currentTime || 0) * 1000))
+        : 0;
+      scheduler.loadCues(activePageVideoId, [], currentPlayheadMs);
+      refreshActiveCueFromPlayhead();
+    }
+    const drained = drainStashedCapturesForVideo(activePageVideoId);
+    if (!drained && requestMissingFromMain && scheduler.getCues().length === 0) {
+      postToYoutubeMain({
+        source: BRAND.ytBridgeSourceIsolated,
+        type: 'request-active-captions',
+        videoId: activePageVideoId,
+      });
+    }
+  }
+
+  function handleYoutubeNavigation(): void {
+    if (destroyed || !isYoutube) return;
+    if (!isExtensionContextValid(hadRuntimeIdAtStart)) {
+      destroy({ contextInvalidated: true });
+      return;
+    }
+    syncYoutubePageVideoTransition(true);
+  }
+
   function handleYoutubeBridgeMessage(event: MessageEvent): void {
     if (destroyed || !isYoutube || !isSameWindowMessage(event)) return;
     if (!isExtensionContextValid(hadRuntimeIdAtStart)) {
@@ -617,6 +813,13 @@ export function createSubtitleIsolatedController(
     }
     const msg = event.data as Partial<YoutubeExtendedBridgeMessage> | null;
     if (!msg || typeof msg !== 'object' || msg.source !== BRAND.ytBridgeSourceMain) {
+      return;
+    }
+
+    if (msg.type === 'main-controller-ready') {
+      if (configLoaded) {
+        broadcastSubtitleConfig();
+      }
       return;
     }
 
@@ -642,18 +845,21 @@ export function createSubtitleIsolatedController(
         refreshActiveCueFromPlayhead();
       } else {
         syncSchedulerConfig();
+        const activeVid = resolveActiveYoutubePageVideoId();
+        if (activeVid && stashedCapturesByVideoId.has(activeVid)) {
+          drainStashedCapturesForVideo(activeVid);
+        }
+        if (scheduler.getCues().length === 0 && activeVid) {
+          postToYoutubeMain({
+            source: BRAND.ytBridgeSourceIsolated,
+            type: 'request-active-captions',
+            videoId: activeVid,
+          });
+        }
         scheduler.updatePlayhead(currentPlayheadMs);
         refreshActiveCueFromPlayhead();
       }
       return;
-    }
-
-    function resolveActiveYoutubePageVideoId(): string {
-      return (
-        extractYoutubeVideoId(win.location?.href ?? '') ||
-        doc.querySelector('ytd-watch-flexy')?.getAttribute('video-id') ||
-        ''
-      );
     }
 
     if (msg.type === 'playhead-tick') {
@@ -662,19 +868,25 @@ export function createSubtitleIsolatedController(
       if (msg.videoId && activePageVideoId && msg.videoId !== activePageVideoId) {
         return;
       }
-      if (msg.videoId && currentVideoKey && msg.videoId !== currentVideoKey) {
-        currentVideoKey = msg.videoId;
-        activeSourceTrackFingerprint = '';
-        scheduler.loadCues(msg.videoId, [], msg.currentTimeMs);
-      }
+      const targetVideoId = msg.videoId || activePageVideoId;
       currentPlayheadMs = msg.currentTimeMs;
-      if (isSubtitlesEnabledForSite()) {
+      if (targetVideoId && currentVideoKey && targetVideoId !== currentVideoKey) {
+        currentVideoKey = targetVideoId;
+        activeSourceTrackFingerprint = '';
+        scheduler.loadCues(targetVideoId, [], msg.currentTimeMs);
+      }
+      if (configLoaded && targetVideoId && stashedCapturesByVideoId.has(targetVideoId)) {
+        drainStashedCapturesForVideo(targetVideoId);
+      }
+      if (configLoaded && isSubtitlesEnabledForSite()) {
         scheduler.updatePlayhead(
           currentPlayheadMs,
           msg.seeked ? { seek: true } : undefined,
         );
       }
-      refreshActiveCueFromPlayhead();
+      if (configLoaded) {
+        refreshActiveCueFromPlayhead();
+      }
       return;
     }
 
@@ -684,78 +896,26 @@ export function createSubtitleIsolatedController(
       const videoId = trackUrlVideoId || msg.videoId || activePageVideoId;
       if (!videoId) return;
 
-      // Guard against late/stale previous-video timedtext responses after SPA navigation
-      if (
-        activePageVideoId &&
-        (videoId !== activePageVideoId ||
-          (msg.videoId && msg.videoId !== activePageVideoId))
-      ) {
-        return;
-      }
-
-      const normalized = normalizeYoutubeEvents(msg.events);
-      if (normalized.length === 0) return;
-
-      const tlang = isTranslatedYoutubeTrackUrl(msg.trackUrl ?? '');
-      const existingCues = scheduler.getCues();
-
-      // Only merge YouTube `tlang` tracks into `cue.trans` when normalized `tlang` matches `config.targetLang`
-      if (tlang) {
-        const normalizedTlang = normalizeSubtitleTargetLang(tlang);
-        const normalizedTarget = normalizeSubtitleTargetLang(
-          config.targetLang || 'zh-CN',
-        );
-        if (
-          normalizedTlang &&
-          normalizedTarget &&
-          normalizedTlang === normalizedTarget &&
-          currentVideoKey === videoId &&
-          existingCues.length > 0
-        ) {
-          const merged = mergeAlignedSubtitleTrack(existingCues, normalized);
-          if (merged.applied) {
-            scheduler.loadCues(videoId, merged.cues, currentPlayheadMs);
-            refreshActiveCueFromPlayhead();
-          }
+      // Defer processing until initial config loads from storage, or when SPA timedtext arrives before URL updates
+      if (!configLoaded || (activePageVideoId && videoId !== activePageVideoId)) {
+        if (msg.events.length > 0) {
+          stashCapturedTrackForVideo({
+            videoId,
+            langCode: msg.langCode ?? 'auto',
+            trackUrl: msg.trackUrl ?? '',
+            events: msg.events,
+          });
         }
         return;
       }
 
-      const nextFingerprint = buildSourceTrackFingerprint(
+      drainStashedCapturesForVideo(videoId);
+      processCapturedCaptionTrack({
         videoId,
-        msg.langCode ?? 'auto',
-        normalized,
-        msg.trackUrl,
-      );
-
-      // Idempotent replay guard: preserve existing `cue.trans` & in-flight batches on config/toggle sync
-      if (
-        currentVideoKey === videoId &&
-        activeSourceTrackFingerprint === nextFingerprint &&
-        existingCues.length > 0
-      ) {
-        if (isSubtitlesEnabledForSite()) {
-          syncSchedulerConfig();
-          scheduler.updatePlayhead(currentPlayheadMs);
-        } else {
-          scheduler.cancelAll();
-        }
-        refreshActiveCueFromPlayhead();
-        return;
-      }
-
-      if (currentVideoKey !== videoId) {
-        activeSourceTrackFingerprint = '';
-      }
-      currentVideoKey = videoId;
-      if (isSubtitlesEnabledForSite()) {
-        syncSchedulerConfig();
-        activeSourceTrackFingerprint = nextFingerprint;
-        scheduler.loadCues(videoId, normalized, currentPlayheadMs);
-      } else {
-        scheduler.cancelAll();
-      }
-      refreshActiveCueFromPlayhead();
+        langCode: msg.langCode ?? 'auto',
+        trackUrl: msg.trackUrl ?? '',
+        events: msg.events,
+      });
     }
   }
 
@@ -957,6 +1117,12 @@ export function createSubtitleIsolatedController(
       destroy({ contextInvalidated: true });
       return;
     }
+    if (isYoutube) {
+      const activePageVideoId = resolveActiveYoutubePageVideoId();
+      if (activePageVideoId && stashedCapturesByVideoId.has(activePageVideoId)) {
+        syncYoutubePageVideoTransition(false);
+      }
+    }
     if (!isSubtitlesEnabledForSite()) return;
     const video = isYoutube
       ? doc.querySelector<HTMLVideoElement>('video.html5-main-video')
@@ -1001,6 +1167,11 @@ export function createSubtitleIsolatedController(
   }
 
   function handleStorageEvent(event: StorageEvent): void {
+    if (destroyed || !isYoutube) return;
+    if (!isExtensionContextValid(hadRuntimeIdAtStart)) {
+      destroy({ contextInvalidated: true });
+      return;
+    }
     if (!event.key || event.key === YOUTUBE_CAPTION_STORAGE_KEY) {
       syncLocalCaptionThemeFromStorage(true);
     }
@@ -1008,6 +1179,10 @@ export function createSubtitleIsolatedController(
 
   function handlePlayerMenuInteraction(event: Event): void {
     if (destroyed || !isYoutube) return;
+    if (!isExtensionContextValid(hadRuntimeIdAtStart)) {
+      destroy({ contextInvalidated: true });
+      return;
+    }
     const target = event.target as HTMLElement | null;
     if (
       target &&
@@ -1033,14 +1208,54 @@ export function createSubtitleIsolatedController(
 
   async function start(): Promise<void> {
     if (destroyed) return;
+    const winRecord = win as unknown as Record<
+      string,
+      SubtitleIsolatedController | undefined
+    >;
+    const prevController = winRecord[ISOLATED_CONTROLLER_KEY];
+    if (prevController && prevController !== controllerApi) {
+      try {
+        prevController.destroy();
+      } catch {
+        // Ignore teardown errors on previous controller in same isolated world
+      }
+    }
+
     hadRuntimeIdAtStart = Boolean(globalThis.chrome?.runtime?.id);
 
     if (isYoutube) {
+      if (scheduler.getCues().length === 0) {
+        const existingHost = doc.getElementById(SUBTITLE_OVERLAY_HOST_ID);
+        const existingOwner = existingHost?.getAttribute(OVERLAY_OWNER_ATTR) ?? '';
+        const hasLiveHost = Boolean(existingHost?.isConnected && existingOwner);
+        if (!hasLiveHost) {
+          setNativeYoutubeCaptionSuppression(false);
+        }
+      }
+
       currentNativeTheme = readLocalYoutubeCaptionTheme(win, doc);
       win.addEventListener('message', handleYoutubeBridgeMessage);
       win.addEventListener('storage', handleStorageEvent);
+      win.addEventListener('yt-navigate-finish', handleYoutubeNavigation);
+      win.addEventListener('yt-page-data-updated', handleYoutubeNavigation);
+      win.addEventListener('popstate', handleYoutubeNavigation);
       doc.addEventListener('click', handlePlayerMenuInteraction, true);
       doc.addEventListener('keyup', handlePlayerMenuInteraction, true);
+
+      if (typeof MutationObserver !== 'undefined' && doc.documentElement) {
+        watchFlexyObserver = new MutationObserver(() => {
+          if (destroyed) return;
+          const activeVid = resolveActiveYoutubePageVideoId();
+          if (activeVid && stashedCapturesByVideoId.has(activeVid)) {
+            syncYoutubePageVideoTransition(false);
+          }
+        });
+        watchFlexyObserver.observe(doc.documentElement, {
+          subtree: true,
+          attributes: true,
+          attributeFilter: ['video-id'],
+        });
+      }
     }
     doc.addEventListener('fullscreenchange', handleFullscreenChange);
 
@@ -1050,8 +1265,19 @@ export function createSubtitleIsolatedController(
       config = createDefaultMarginConfig();
     }
     if (destroyed) return;
+    configLoaded = true;
 
     syncSchedulerConfig();
+    if (isYoutube) {
+      const video = doc.querySelector<HTMLVideoElement>('video.html5-main-video');
+      if (video && Number.isFinite(video.currentTime) && video.currentTime > 0) {
+        currentPlayheadMs = Math.max(0, Math.round(video.currentTime * 1000));
+      }
+      const activeVid = resolveActiveYoutubePageVideoId();
+      if (activeVid && stashedCapturesByVideoId.has(activeVid)) {
+        drainStashedCapturesForVideo(activeVid);
+      }
+    }
     broadcastSubtitleConfig();
 
     unsubConfig = subscribeConfig((nextCfg) => {
@@ -1114,9 +1340,15 @@ export function createSubtitleIsolatedController(
     if (isYoutube) {
       win.removeEventListener('message', handleYoutubeBridgeMessage);
       win.removeEventListener('storage', handleStorageEvent);
+      win.removeEventListener('yt-navigate-finish', handleYoutubeNavigation);
+      win.removeEventListener('yt-page-data-updated', handleYoutubeNavigation);
+      win.removeEventListener('popstate', handleYoutubeNavigation);
       doc.removeEventListener('click', handlePlayerMenuInteraction, true);
       doc.removeEventListener('keyup', handlePlayerMenuInteraction, true);
     }
+    watchFlexyObserver?.disconnect();
+    watchFlexyObserver = null;
+    stashedCapturesByVideoId.clear();
     doc.removeEventListener('fullscreenchange', handleFullscreenChange);
     try {
       unsubConfig?.();
@@ -1132,6 +1364,14 @@ export function createSubtitleIsolatedController(
     scheduler.cancelAll();
     removeOverlayHost(cleanupOptions);
 
+    if (isYoutube) {
+      postToYoutubeMain({
+        source: BRAND.ytBridgeSourceIsolated,
+        type: 'isolated-context-invalidated',
+        instanceId,
+      });
+    }
+
     const winRecord = win as unknown as Record<string, unknown>;
     if (winRecord[ISOLATED_CONTROLLER_KEY] === controllerApi) {
       delete winRecord[ISOLATED_CONTROLLER_KEY];
@@ -1141,6 +1381,7 @@ export function createSubtitleIsolatedController(
   const controllerApi: SubtitleIsolatedController = {
     start,
     destroy: () => destroy(),
+    isDestroyed: () => destroyed,
     getActiveCue: () => ({ ...activeCueState }),
     getCues: () => scheduler.getCues(),
   };
@@ -1319,18 +1560,47 @@ function shouldAutoBootIsolatedEntry(): boolean {
   );
 }
 
-if (shouldAutoBootIsolatedEntry()) {
-  const winRecord = window as unknown as Record<
+export function bootSubtitleIsolatedEntry(
+  win: Window = window,
+  options?: SubtitleIsolatedControllerOptions,
+): SubtitleIsolatedController {
+  const winRecord = win as unknown as Record<
     string,
     SubtitleIsolatedController | undefined
   >;
-  if (!winRecord[ISOLATED_CONTROLLER_KEY]) {
-    const controller = createSubtitleIsolatedController();
-    Object.defineProperty(window, ISOLATED_CONTROLLER_KEY, {
-      configurable: true,
-      enumerable: false,
-      value: controller,
-    });
-    void controller.start();
+  const existing = winRecord[ISOLATED_CONTROLLER_KEY];
+  if (
+    !options &&
+    existing &&
+    !existing.isDestroyed?.() &&
+    Boolean(
+      typeof globalThis.chrome !== 'undefined' && globalThis.chrome?.runtime?.id,
+    )
+  ) {
+    return existing;
   }
+  if (existing) {
+    try {
+      existing.destroy();
+    } catch {
+      // Ignore teardown errors on stale controller
+    }
+  }
+  const controller = createSubtitleIsolatedController({
+    hostWindow: win,
+    hostDocument: win.document,
+    ...options,
+  });
+  Object.defineProperty(win, ISOLATED_CONTROLLER_KEY, {
+    configurable: true,
+    enumerable: false,
+    writable: true,
+    value: controller,
+  });
+  void controller.start();
+  return controller;
+}
+
+if (shouldAutoBootIsolatedEntry()) {
+  bootSubtitleIsolatedEntry(window);
 }

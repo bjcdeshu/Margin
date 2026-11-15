@@ -172,4 +172,60 @@ describe('Per-Key Storage Mutex Serialization & Quota Resilience (#127 #9)', () 
       }),
     ).rejects.toThrow(/QUOTA_BYTES/);
   });
+
+  it('scopes navigator.locks.request strictly to chrome-extension: pages and never shares Web Locks with https: host pages (v2.3.5 Fix #5)', async () => {
+    const originalLocation = globalThis.location;
+    const originalNavigatorDesc = Object.getOwnPropertyDescriptor(
+      globalThis,
+      'navigator',
+    );
+    const lockNames: string[] = [];
+    const mockLocksRequest = async <T>(
+      name: string,
+      cb: () => Promise<T>,
+    ): Promise<T> => {
+      lockNames.push(name);
+      return cb();
+    };
+
+    Object.defineProperty(globalThis, 'navigator', {
+      value: {
+        ...(globalThis.navigator ?? {}),
+        locks: { request: mockLocksRequest },
+      },
+      configurable: true,
+    });
+
+    try {
+      // 1. Content script on https://www.youtube.com -> MUST NOT touch host-origin navigator.locks!
+      Object.defineProperty(globalThis, 'location', {
+        value: new URL('https://www.youtube.com/watch?v=KYHx0DI6mSo'),
+        configurable: true,
+      });
+      await updateMarginConfig((draft) => {
+        draft.subtitles.youtubeAutoEnable = true;
+      });
+      expect(lockNames).toEqual([]);
+
+      // 2. Extension page on chrome-extension:// -> DOES coordinate via Web Locks!
+      Object.defineProperty(globalThis, 'location', {
+        value: new URL(
+          `chrome-extension://${BRAND.pinnedExtensionId}/options.html`,
+        ),
+        configurable: true,
+      });
+      await updateMarginConfig((draft) => {
+        draft.targetLang = 'ko';
+      });
+      expect(lockNames).toEqual([`margin:storage:${BRAND.storageKeyConfig}`]);
+    } finally {
+      Object.defineProperty(globalThis, 'location', {
+        value: originalLocation,
+        configurable: true,
+      });
+      if (originalNavigatorDesc) {
+        Object.defineProperty(globalThis, 'navigator', originalNavigatorDesc);
+      }
+    }
+  });
 });
