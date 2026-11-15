@@ -143,6 +143,44 @@ describe('P0-2 independent subtitle batching & id anti-spillover lock', () => {
       '第四条字幕',
     ]);
   });
+
+  it('strips LLM-echoed subtitle markup (<b>, <font>, <br>, ASS) in applySubtitleBatchResponse while preserving code angle brackets', () => {
+    const cues: SubtitleCue[] = [
+      { tStartMs: 0, dDurationMs: 2000, text: 'We were wrong, not a little' },
+      { tStartMs: 2000, dDurationMs: 2000, text: 'Hello World' },
+      { tStartMs: 4000, dDurationMs: 2000, text: 'vector<int> && a < b && c > d' },
+      { tStartMs: 6000, dDurationMs: 2000, text: 'Untouched when tag-only' },
+    ];
+
+    const idToCueIndex = new Map<number, number>([
+      [1, 0],
+      [2, 1],
+      [3, 2],
+      [4, 3],
+    ]);
+
+    const updated = applySubtitleBatchResponse(
+      cues,
+      {
+        ok: true,
+        items: [
+          { id: 1, trans: '<b>结果我们错了，而且错得</b>' },
+          { id: 2, trans: '{\\an8}<font color="#ff0">你好</font><br>世界' },
+          { id: 3, trans: '<i>使用</i> vector<int> 且满足 a < b && c > d' },
+          { id: 4, trans: '<b>   </b>' },
+        ],
+      },
+      idToCueIndex,
+    );
+
+    expect(updated).toEqual([0, 1, 2]);
+    expect(cues.map((c) => c.trans)).toEqual([
+      '结果我们错了，而且错得',
+      '你好 世界',
+      '使用 vector<int> 且满足 a < b && c > d',
+      undefined,
+    ]);
+  });
 });
 
 describe('SubtitleBatchScheduler playhead priority & navigation cancellation', () => {
@@ -253,5 +291,78 @@ describe('SubtitleBatchScheduler playhead priority & navigation cancellation', (
     await Promise.resolve();
 
     expect(scheduler.getCues()[0]?.trans).toBeUndefined();
+  });
+
+  it('retries failed cues on explicit seek and cancelAll up to bounded maxCueRetries without spinning on linear ticks (Finding #14)', async () => {
+    let attempts = 0;
+    let shouldFail = true;
+
+    const scheduler = new SubtitleBatchScheduler({
+      maxCueRetries: 2,
+      translateBatch: async (req) => {
+        attempts += 1;
+        if (shouldFail) {
+          throw new Error('Transient network error');
+        }
+        return {
+          ok: true,
+          requestId: req.requestId,
+          providerId: 'openai-bytb6BIB',
+          model: 'gpt-6-luna',
+          items: req.items.map((item) => ({ id: item.id, trans: `恢复:${item.text}` })),
+          diagnostic: makeMockDiagnostic(),
+        };
+      },
+    });
+
+    // 1. Initial load fails -> attempt #1
+    scheduler.loadCues(
+      'retry-video',
+      [{ tStartMs: 0, dDurationMs: 5000, text: 'Hello retry' }],
+      100,
+    );
+    await scheduler.waitForIdle();
+    expect(attempts).toBe(1);
+    expect(scheduler.getCues()[0]?.trans).toBeUndefined();
+
+    // Linear playback tick (+250ms < 1500ms) does NOT burn retry budget
+    scheduler.updatePlayhead(350);
+    await scheduler.waitForIdle();
+    expect(attempts).toBe(1);
+
+    // 2. Explicit seek (+2000ms >= 1500ms) retries -> attempt #2 (retry #1, still failing)
+    scheduler.updatePlayhead(2500);
+    await scheduler.waitForIdle();
+    expect(attempts).toBe(2);
+
+    // 3. Disable/re-enable via cancelAll() + updatePlayhead retries -> attempt #3 (retry #2, still failing)
+    scheduler.cancelAll();
+    scheduler.updatePlayhead(2600);
+    await scheduler.waitForIdle();
+    expect(attempts).toBe(3);
+
+    // 4. Retry cap (maxCueRetries=2 -> 3 total attempts) reached -> further seeks/cancelAll do NOT spin!
+    shouldFail = false;
+    scheduler.updatePlayhead(0);
+    await scheduler.waitForIdle();
+    expect(attempts).toBe(3);
+    expect(scheduler.getCues()[0]?.trans).toBeUndefined();
+
+    // 5. Fresh track load resets failure counter and recovers on explicit backward seek after 1 blip
+    attempts = 0;
+    shouldFail = true;
+    scheduler.loadCues(
+      'retry-video-2',
+      [{ tStartMs: 0, dDurationMs: 5000, text: 'Recover cue' }],
+      2000,
+    );
+    await scheduler.waitForIdle();
+    expect(attempts).toBe(1);
+
+    shouldFail = false;
+    scheduler.updatePlayhead(500); // backward seek -> retries and succeeds!
+    await scheduler.waitForIdle();
+    expect(attempts).toBe(2);
+    expect(scheduler.getCues()[0]?.trans).toBe('恢复:Recover cue');
   });
 });

@@ -122,6 +122,8 @@ export function createSubtitleIsolatedController(
   let pendingCaptionSyncTimer: ReturnType<typeof setTimeout> | null = null;
   let ownedOverlayHost: HTMLElement | null = null;
   let boundHtml5Video: HTMLVideoElement | null = null;
+  let activeHtml5VideoSrc = '';
+  let html5TrackLoadGen = 0;
   let detachHtml5Listeners: (() => void) | null = null;
   let hadRuntimeIdAtStart = false;
   let destroyed = false;
@@ -646,8 +648,20 @@ export function createSubtitleIsolatedController(
       return;
     }
 
+    function resolveActiveYoutubePageVideoId(): string {
+      return (
+        extractYoutubeVideoId(win.location?.href ?? '') ||
+        doc.querySelector('ytd-watch-flexy')?.getAttribute('video-id') ||
+        ''
+      );
+    }
+
     if (msg.type === 'playhead-tick') {
       if (typeof msg.currentTimeMs !== 'number') return;
+      const activePageVideoId = resolveActiveYoutubePageVideoId();
+      if (msg.videoId && activePageVideoId && msg.videoId !== activePageVideoId) {
+        return;
+      }
       if (msg.videoId && currentVideoKey && msg.videoId !== currentVideoKey) {
         currentVideoKey = msg.videoId;
         activeSourceTrackFingerprint = '';
@@ -655,16 +669,29 @@ export function createSubtitleIsolatedController(
       }
       currentPlayheadMs = msg.currentTimeMs;
       if (isSubtitlesEnabledForSite()) {
-        scheduler.updatePlayhead(currentPlayheadMs);
+        scheduler.updatePlayhead(
+          currentPlayheadMs,
+          msg.seeked ? { seek: true } : undefined,
+        );
       }
       refreshActiveCueFromPlayhead();
       return;
     }
 
     if (msg.type === 'caption-track-captured' && Array.isArray(msg.events)) {
-      const videoId =
-        msg.videoId || extractYoutubeVideoId(win.location?.href ?? '');
+      const activePageVideoId = resolveActiveYoutubePageVideoId();
+      const trackUrlVideoId = extractYoutubeVideoId(msg.trackUrl ?? '');
+      const videoId = trackUrlVideoId || msg.videoId || activePageVideoId;
       if (!videoId) return;
+
+      // Guard against late/stale previous-video timedtext responses after SPA navigation
+      if (
+        activePageVideoId &&
+        (videoId !== activePageVideoId ||
+          (msg.videoId && msg.videoId !== activePageVideoId))
+      ) {
+        return;
+      }
 
       const normalized = normalizeYoutubeEvents(msg.events);
       if (normalized.length === 0) return;
@@ -672,12 +699,24 @@ export function createSubtitleIsolatedController(
       const tlang = isTranslatedYoutubeTrackUrl(msg.trackUrl ?? '');
       const existingCues = scheduler.getCues();
 
-      // If YouTube emitted a `tlang` translated track for the active video, align by ±1000ms (>= 0.6 ratio)
-      if (tlang && currentVideoKey === videoId && existingCues.length > 0) {
-        const merged = mergeAlignedSubtitleTrack(existingCues, normalized);
-        if (merged.applied) {
-          scheduler.loadCues(videoId, merged.cues, currentPlayheadMs);
-          refreshActiveCueFromPlayhead();
+      // Only merge YouTube `tlang` tracks into `cue.trans` when normalized `tlang` matches `config.targetLang`
+      if (tlang) {
+        const normalizedTlang = normalizeSubtitleTargetLang(tlang);
+        const normalizedTarget = normalizeSubtitleTargetLang(
+          config.targetLang || 'zh-CN',
+        );
+        if (
+          normalizedTlang &&
+          normalizedTarget &&
+          normalizedTlang === normalizedTarget &&
+          currentVideoKey === videoId &&
+          existingCues.length > 0
+        ) {
+          const merged = mergeAlignedSubtitleTrack(existingCues, normalized);
+          if (merged.applied) {
+            scheduler.loadCues(videoId, merged.cues, currentPlayheadMs);
+            refreshActiveCueFromPlayhead();
+          }
         }
         return;
       }
@@ -686,6 +725,7 @@ export function createSubtitleIsolatedController(
         videoId,
         msg.langCode ?? 'auto',
         normalized,
+        msg.trackUrl,
       );
 
       // Idempotent replay guard: preserve existing `cue.trans` & in-flight batches on config/toggle sync
@@ -721,15 +761,60 @@ export function createSubtitleIsolatedController(
 
   async function tryLoadHtml5VideoTracks(video: HTMLVideoElement): Promise<void> {
     if (destroyed || isYoutube || !isSubtitlesEnabledForSite()) return;
+    const loadGen = ++html5TrackLoadGen;
 
-    // 1. Check populated TextTrackCueList first
+    const videoSrcId =
+      video.currentSrc ||
+      video.getAttribute('src') ||
+      win.location?.href ||
+      'video';
+
+    if (activeHtml5VideoSrc && activeHtml5VideoSrc !== videoSrcId) {
+      currentVideoKey = '';
+      currentPlayheadMs = Math.max(0, Math.round((video.currentTime || 0) * 1000));
+      scheduler.loadCues('', [], currentPlayheadMs);
+      refreshActiveCueFromPlayhead();
+    }
+    activeHtml5VideoSrc = videoSrcId;
+
+    const trackEls = Array.from(
+      video.querySelectorAll<HTMLTrackElement>(
+        'track[kind="subtitles"], track[kind="captions"], track:not([kind])',
+      ),
+    );
+    const defaultTrackEl = trackEls.find((el) => el.default);
+
+    // 1. Check populated TextTrackCueList first, preferring `showing` over `hidden` without forcing unrelated `disabled` tracks
     const textTracks = Array.from(video.textTracks ?? []).filter(
       (t) => t.kind === 'subtitles' || t.kind === 'captions',
     );
-    for (const track of textTracks) {
-      if (track.mode === 'disabled') {
-        track.mode = 'hidden';
+    const showingTracks = textTracks.filter((t) => t.mode === 'showing');
+    const hiddenTracks = textTracks.filter((t) => t.mode === 'hidden');
+
+    let candidateTracks: TextTrack[];
+    if (showingTracks.length > 0) {
+      candidateTracks = showingTracks;
+    } else if (hiddenTracks.length > 0) {
+      candidateTracks = hiddenTracks;
+    } else if (textTracks.length > 0) {
+      const fallbackDisabled =
+        (defaultTrackEl
+          ? textTracks.find(
+              (t) =>
+                (defaultTrackEl.srclang &&
+                  t.language === defaultTrackEl.srclang) ||
+                (defaultTrackEl.label && t.label === defaultTrackEl.label),
+            )
+          : undefined) ?? textTracks[0];
+      if (fallbackDisabled && fallbackDisabled.mode === 'disabled') {
+        fallbackDisabled.mode = 'hidden';
       }
+      candidateTracks = fallbackDisabled ? [fallbackDisabled] : [];
+    } else {
+      candidateTracks = [];
+    }
+
+    for (const track of candidateTracks) {
       const extracted = extractTextTrackCues(
         track.cues as unknown as ArrayLike<{
           startTime: number;
@@ -738,7 +823,20 @@ export function createSubtitleIsolatedController(
         }>,
       );
       if (extracted.length > 0) {
-        const key = `html5:${video.currentSrc || win.location?.href || 'video'}`;
+        const trackIdx = textTracks.indexOf(track);
+        const trackIdentity = [
+          (track as TextTrack & { id?: string }).id || '',
+          track.language || '',
+          track.label || '',
+          track.kind || '',
+          String(trackIdx),
+        ].join('|');
+        const fp = buildSourceTrackFingerprint(
+          videoSrcId,
+          track.language || 'auto',
+          extracted,
+        );
+        const key = `html5:${videoSrcId}::${trackIdentity}::${fp}`;
         if (currentVideoKey !== key || scheduler.getCues().length === 0) {
           currentVideoKey = key;
           currentPlayheadMs = Math.max(0, Math.round((video.currentTime || 0) * 1000));
@@ -750,17 +848,21 @@ export function createSubtitleIsolatedController(
       }
     }
 
-    // 2. Fallback: fetch `<track src="...vtt">` directly
-    const trackEls = Array.from(
-      video.querySelectorAll<HTMLTrackElement>(
-        'track[kind="subtitles"], track[kind="captions"], track:not([kind])',
-      ),
-    );
+    // 2. Fallback: fetch `<track src="...vtt">` directly (preferring active `showing` track match, then `default`)
+    const activeShowing = showingTracks[0];
     const primaryTrackEl =
-      trackEls.find((el) => el.default) ?? trackEls[0];
+      (activeShowing
+        ? trackEls.find(
+            (el) =>
+              (activeShowing.language && el.srclang === activeShowing.language) ||
+              (activeShowing.label && el.label === activeShowing.label),
+          )
+        : undefined) ??
+      defaultTrackEl ??
+      trackEls[0];
     if (!primaryTrackEl?.src) return;
 
-    const key = `html5-vtt:${primaryTrackEl.src}`;
+    const key = `html5-vtt:${videoSrcId}::${primaryTrackEl.src}::${primaryTrackEl.srclang || ''}::${primaryTrackEl.label || ''}`;
     if (currentVideoKey === key && scheduler.getCues().length > 0) return;
 
     try {
@@ -768,7 +870,15 @@ export function createSubtitleIsolatedController(
       if (!res.ok) return;
       const vttText = await res.text();
       const parsed = parseWebVtt(vttText);
-      if (parsed.length === 0 || destroyed) return;
+      if (
+        parsed.length === 0 ||
+        destroyed ||
+        loadGen !== html5TrackLoadGen ||
+        boundHtml5Video !== video ||
+        !isSubtitlesEnabledForSite()
+      ) {
+        return;
+      }
 
       currentVideoKey = key;
       currentPlayheadMs = Math.max(0, Math.round((video.currentTime || 0) * 1000));
@@ -789,31 +899,51 @@ export function createSubtitleIsolatedController(
     if (!candidate || candidate === boundHtml5Video) return;
 
     detachHtml5Listeners?.();
+    html5TrackLoadGen += 1;
     boundHtml5Video = candidate;
+    activeHtml5VideoSrc = '';
 
-    const onSync = () => {
+    const onSync = (seek = false) => {
       currentPlayheadMs = Math.max(0, Math.round((candidate.currentTime || 0) * 1000));
       if (isSubtitlesEnabledForSite()) {
-        scheduler.updatePlayhead(currentPlayheadMs);
+        scheduler.updatePlayhead(
+          currentPlayheadMs,
+          seek ? { seek: true } : undefined,
+        );
       }
       refreshActiveCueFromPlayhead();
     };
 
+    const onPlaybackTick = () => onSync(false);
+    const onExplicitSeek = () => onSync(true);
     const onTrackReady = () => {
       void tryLoadHtml5VideoTracks(candidate);
     };
+    const onMetadataLoaded = () => {
+      onSync(false);
+      onTrackReady();
+    };
 
-    const events = ['timeupdate', 'seeking', 'seeked', 'play', 'loadedmetadata'];
-    for (const evt of events) {
-      candidate.addEventListener(evt, onSync);
+    const playbackEvents = ['timeupdate', 'play'];
+    const seekEvents = ['seeking', 'seeked'];
+    for (const evt of playbackEvents) {
+      candidate.addEventListener(evt, onPlaybackTick);
     }
+    for (const evt of seekEvents) {
+      candidate.addEventListener(evt, onExplicitSeek);
+    }
+    candidate.addEventListener('loadedmetadata', onMetadataLoaded);
     candidate.textTracks?.addEventListener?.('change', onTrackReady);
     candidate.textTracks?.addEventListener?.('addtrack', onTrackReady);
 
     detachHtml5Listeners = () => {
-      for (const evt of events) {
-        candidate.removeEventListener(evt, onSync);
+      for (const evt of playbackEvents) {
+        candidate.removeEventListener(evt, onPlaybackTick);
       }
+      for (const evt of seekEvents) {
+        candidate.removeEventListener(evt, onExplicitSeek);
+      }
+      candidate.removeEventListener('loadedmetadata', onMetadataLoaded);
       candidate.textTracks?.removeEventListener?.('change', onTrackReady);
       candidate.textTracks?.removeEventListener?.('addtrack', onTrackReady);
     };
@@ -930,6 +1060,7 @@ export function createSubtitleIsolatedController(
       if (isSubtitlesEnabledForSite()) {
         syncSchedulerConfig();
       } else {
+        html5TrackLoadGen += 1;
         scheduler.cancelAll();
       }
       broadcastSubtitleConfig();
@@ -970,6 +1101,7 @@ export function createSubtitleIsolatedController(
   function destroy(cleanupOptions: { contextInvalidated?: boolean } = {}): void {
     if (destroyed) return;
     destroyed = true;
+    html5TrackLoadGen += 1;
     cancelClearTimer();
     if (playheadPollTimer !== null) {
       clearInterval(playheadPollTimer);

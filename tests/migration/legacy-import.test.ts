@@ -654,4 +654,54 @@ describe('exportMarginConfig & Margin v2 round-trip', () => {
       redactProviderUrl('https://deeplx.example.test/api/v2/translate', true),
     ).toBe('https://deeplx.example.test/api/v2/translate');
   });
+
+  it('redacts remaining credentials even when <REDACTED> already appears in part of a URL', () => {
+    expect(
+      redactProviderUrl(
+        'https://user:REAL_PASSWORD_SECRET@api.deeplx.org/<REDACTED>/translate?api_key=REAL_QUERY_SECRET&lang=zh',
+        true,
+      ),
+    ).toBe(
+      'https://<REDACTED>@api.deeplx.org/<REDACTED>/translate?api_key=<REDACTED>&lang=zh',
+    );
+
+    expect(
+      redactProviderUrl(
+        'https://<REDACTED>@deeplx.example.test/v1/SECOND_PATH_SECRET/translate?token=THIRD_QUERY_SECRET',
+        true,
+      ),
+    ).toBe(
+      'https://<REDACTED>@deeplx.example.test/v1/<REDACTED>/translate?token=<REDACTED>',
+    );
+  });
+
+  it('preserves subtitles.bgOpacityPercent (including 0) and subtitles.translationTint in Margin v2 import', () => {
+    const v2ZeroOpacity = createDefaultMarginConfig();
+    v2ZeroOpacity.subtitles.bgOpacityPercent = 0;
+    v2ZeroOpacity.subtitles.translationTint = 'amber';
+
+    const importedZero = importLegacyConfig(JSON.stringify(v2ZeroOpacity));
+    expect(importedZero.config.subtitles.bgOpacityPercent).toBe(0);
+    expect(importedZero.config.subtitles.translationTint).toBe('amber');
+
+    const v2CustomOpacity = createDefaultMarginConfig();
+    v2CustomOpacity.subtitles.bgOpacityPercent = 65;
+    v2CustomOpacity.subtitles.translationTint = 'cyan';
+
+    const importedCustom = importLegacyConfig(JSON.stringify(v2CustomOpacity));
+    expect(importedCustom.config.subtitles.bgOpacityPercent).toBe(65);
+    expect(importedCustom.config.subtitles.translationTint).toBe('cyan');
+
+    // Out-of-range opacity clamps cleanly; invalid tint falls back to base ('follow')
+    const rawClamped = JSON.parse(JSON.stringify(v2CustomOpacity)) as Record<
+      string,
+      unknown
+    >;
+    (rawClamped.subtitles as Record<string, unknown>).bgOpacityPercent = 180;
+    (rawClamped.subtitles as Record<string, unknown>).translationTint =
+      'neon-pink';
+    const importedClamped = importLegacyConfig(JSON.stringify(rawClamped));
+    expect(importedClamped.config.subtitles.bgOpacityPercent).toBe(100);
+    expect(importedClamped.config.subtitles.translationTint).toBe('follow');
+  });
 });

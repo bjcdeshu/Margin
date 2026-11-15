@@ -89,7 +89,7 @@ describe('Quiet Paper Popup Sheet (PopupApp — 3-Tier Editorial Hierarchy)', ()
 
       // Tier 1 Hero + Tier 2 Reading Controls + Tier 3 Channel/Quick/Site bar
       expect(container.textContent).toContain('Margin');
-      expect(container.querySelector('.mp-popup-version')?.textContent).toBe('v2.3.3');
+      expect(container.querySelector('.mp-popup-version')?.textContent).toBe('v2.3.4');
       const heroBtn = container.querySelector(
         '[data-testid="popup-toggle-page"]',
       ) as HTMLButtonElement;
@@ -158,6 +158,7 @@ describe('Quiet Paper Popup Sheet (PopupApp — 3-Tier Editorial Hierarchy)', ()
       expect(alwaysBtn.getAttribute('aria-checked')).toBe('true');
       expect(sendTabSpy).toHaveBeenCalledWith(42, {
         type: 'margin:cmd:toggle-page',
+        targetActive: true,
       });
       expect(heroBtn.textContent).toContain('还原网页原文');
 
@@ -183,6 +184,7 @@ describe('Quiet Paper Popup Sheet (PopupApp — 3-Tier Editorial Hierarchy)', ()
       expect(neverBtn.getAttribute('aria-checked')).toBe('true');
       expect(sendTabSpy).toHaveBeenCalledWith(42, {
         type: 'margin:cmd:toggle-page',
+        targetActive: false,
       });
       expect(heroBtn.textContent).toContain('翻译当前页面');
 
@@ -275,5 +277,189 @@ describe('Quiet Paper Popup Sheet (PopupApp — 3-Tier Editorial Hierarchy)', ()
 
     const badge = container.querySelector('[data-testid="popup-page-badge"]');
     expect(badge?.textContent).toBe('翻译异常');
+  });
+
+  it('ignores stale storage.onChanged while a newer toggle is saving and skips double-toggle when storage.onChanged already updated tab active state', async () => {
+    const origChrome = (globalThis as Record<string, unknown>).chrome;
+    const storageListeners = new Set<
+      (changes: Record<string, { newValue?: unknown }>, areaName: string) => void
+    >();
+    let storedCfg = createDefaultMarginConfig();
+    const pendingWrites: Array<() => void> = [];
+    let holdWrites = false;
+
+    // Simulate real live tab whose active state already responds to storage.onChanged!
+    let liveTabActive = false;
+    const sendTabSpy = vi.fn(async (_tabId: number, msg: { type: string }) => {
+      if (msg.type === 'margin:cmd:toggle-page') {
+        liveTabActive = !liveTabActive;
+      }
+      return {
+        active: liveTabActive,
+        inFlightBlocks: 0,
+        translatedBlocks: liveTabActive ? 5 : 0,
+        maskRevealed: false,
+      };
+    });
+
+    (globalThis as Record<string, unknown>).chrome = {
+      storage: {
+        local: {
+          get: async (key: string) => ({ [key]: structuredClone(storedCfg) }),
+          set: (items: Record<string, unknown>) =>
+            new Promise<void>((resolve) => {
+              const commit = () => {
+                const next = Object.values(items)[0] as typeof storedCfg;
+                storedCfg = structuredClone(next);
+                // Live content script reacts to Always/Never rule before Popup post-save resume
+                if (storedCfg.urlRules.includeMatches.includes('*://arxiv.org/*')) {
+                  liveTabActive = true;
+                } else if (storedCfg.urlRules.excludeMatches.includes('*://arxiv.org/*')) {
+                  liveTabActive = false;
+                }
+                for (const fn of storageListeners) {
+                  fn(
+                    { margin_config_v2: { newValue: structuredClone(storedCfg) } },
+                    'local',
+                  );
+                }
+                resolve();
+              };
+              if (holdWrites) {
+                pendingWrites.push(commit);
+              } else {
+                commit();
+              }
+            }),
+        },
+        onChanged: {
+          addListener: (
+            fn: (
+              changes: Record<string, { newValue?: unknown }>,
+              areaName: string,
+            ) => void,
+          ) => storageListeners.add(fn),
+          removeListener: (
+            fn: (
+              changes: Record<string, { newValue?: unknown }>,
+              areaName: string,
+            ) => void,
+          ) => storageListeners.delete(fn),
+        },
+      },
+      tabs: {
+        sendMessage: sendTabSpy,
+      },
+    };
+
+    try {
+      await act(async () => {
+        render(
+          <PopupApp
+            initialActiveTab={{ id: 88, url: 'https://arxiv.org/abs/2501.00001' }}
+            initialPageState={{
+              active: false,
+              inFlightBlocks: 0,
+              translatedBlocks: 0,
+              maskRevealed: false,
+            }}
+          />,
+          container,
+        );
+      });
+      await flushMicrotasks();
+
+      // Part A: Rapid toggles (`selection` OFF -> `hover` OFF) while write #1 is in-flight
+      holdWrites = true;
+      const selectionToggle = container.querySelector(
+        '[data-testid="popup-toggle-selection"]',
+      ) as HTMLButtonElement;
+      const hoverToggle = container.querySelector(
+        '[data-testid="popup-toggle-hover"]',
+      ) as HTMLButtonElement;
+      const themeBtn = container.querySelector(
+        '[data-testid="popup-theme-cycle"]',
+      ) as HTMLButtonElement;
+
+      await act(async () => {
+        selectionToggle.click(); // snap1: selection=false, hover=true
+        hoverToggle.click(); // snap2: selection=false, hover=false (queued behind storage mutex)
+      });
+      await flushMicrotasks();
+      expect(pendingWrites).toHaveLength(1);
+
+      // Flush ONLY write #1 (snap1) -> storage.onChanged(snap1) fires while snap2 is still saving,
+      // and storage mutex dispatches write #2 (snap2) into pendingWrites!
+      await act(async () => {
+        pendingWrites.shift()!();
+      });
+      await flushMicrotasks();
+      expect(pendingWrites).toHaveLength(1);
+
+      // UI and configRef MUST NOT roll back hoverToggle to true!
+      expect(hoverToggle.getAttribute('aria-pressed')).toBe('false');
+
+      // 3rd toggle (theme cycle) clones configRef -> MUST preserve hover=false from snap2!
+      await act(async () => {
+        themeBtn.click();
+      });
+      holdWrites = false;
+      while (pendingWrites.length > 0) {
+        await act(async () => {
+          pendingWrites.shift()!();
+        });
+        await flushMicrotasks();
+      }
+      await flushMicrotasks();
+
+      expect(storedCfg.selection.enabled).toBe(false);
+      expect(storedCfg.hover.enabled).toBe(false);
+      expect(storedCfg.uiColorMode).toBe('night');
+
+      // Part B: Always / Never site rules query fresh get-page-state and NEVER double-toggle!
+      const alwaysBtn = container.querySelector(
+        '[data-testid="popup-site-rule-always"]',
+      ) as HTMLButtonElement;
+      const neverBtn = container.querySelector(
+        '[data-testid="popup-site-rule-never"]',
+      ) as HTMLButtonElement;
+      const heroBtn = container.querySelector(
+        '[data-testid="popup-toggle-page"]',
+      ) as HTMLButtonElement;
+
+      sendTabSpy.mockClear();
+      await act(async () => {
+        alwaysBtn.click();
+      });
+      await flushMicrotasks();
+
+      expect(liveTabActive).toBe(true);
+      expect(sendTabSpy).toHaveBeenCalledWith(88, {
+        type: 'margin:cmd:get-page-state',
+      });
+      expect(sendTabSpy).not.toHaveBeenCalledWith(
+        88,
+        expect.objectContaining({ type: 'margin:cmd:toggle-page' }),
+      );
+      expect(heroBtn.textContent).toContain('还原网页原文');
+
+      sendTabSpy.mockClear();
+      await act(async () => {
+        neverBtn.click();
+      });
+      await flushMicrotasks();
+
+      expect(liveTabActive).toBe(false);
+      expect(sendTabSpy).toHaveBeenCalledWith(88, {
+        type: 'margin:cmd:get-page-state',
+      });
+      expect(sendTabSpy).not.toHaveBeenCalledWith(
+        88,
+        expect.objectContaining({ type: 'margin:cmd:toggle-page' }),
+      );
+      expect(heroBtn.textContent).toContain('翻译当前页面');
+    } finally {
+      (globalThis as Record<string, unknown>).chrome = origChrome;
+    }
   });
 });

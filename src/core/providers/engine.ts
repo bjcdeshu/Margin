@@ -49,6 +49,7 @@ import {
   type ExecuteVisionResult,
   ProviderHttpError,
   type ProviderRuntimeEnv,
+  ProviderTruncatedResponseError,
 } from './types';
 
 const TRANSIENT_HTTP_STATUSES = new Set([408, 429, 500, 502, 503, 504]);
@@ -264,6 +265,30 @@ async function runSelfHealingAiCompletion(
       if (err instanceof ProviderHttpError) {
         const status = err.status;
 
+        // Defense 4b: Evaluate `reasoning_effort` strip-and-retry FIRST so HTTP 400/422s
+        // naming `reasoning_effort` never poison `supportsTemperature: false`.
+        if (
+          !strippedReasoningEffort &&
+          shouldStripReasoningEffortAndRetry(
+            status,
+            err.bodyText,
+            sentReasoningEffort,
+          )
+        ) {
+          strippedReasoningEffort = true;
+          omitReasoningEffort = true;
+          recoveredFromUnsupportedParam = true;
+
+          await recordModelCapability(capabilityKey, {
+            supportsReasoningEffort: false,
+            learnedFromStatus: status,
+            updatedAt: Date.now(),
+          });
+
+          // 1 immediate transparent retry without `reasoning_effort`
+          continue;
+        }
+
         // Defense 4a: Automatic HTTP 400/422 unsupported `temperature` strip-and-retry + capability cache!
         if (
           !strippedTemperature &&
@@ -285,29 +310,6 @@ async function runSelfHealingAiCompletion(
           });
 
           // 1 immediate transparent retry without `temperature`
-          continue;
-        }
-
-        // Defense 4b: Automatic HTTP 400/422 unsupported `reasoning_effort` strip-and-retry + capability cache!
-        if (
-          !strippedReasoningEffort &&
-          shouldStripReasoningEffortAndRetry(
-            status,
-            err.bodyText,
-            sentReasoningEffort,
-          )
-        ) {
-          strippedReasoningEffort = true;
-          omitReasoningEffort = true;
-          recoveredFromUnsupportedParam = true;
-
-          await recordModelCapability(capabilityKey, {
-            supportsReasoningEffort: false,
-            learnedFromStatus: status,
-            updatedAt: Date.now(),
-          });
-
-          // 1 immediate transparent retry without `reasoning_effort`
           continue;
         }
 
@@ -343,6 +345,37 @@ async function runSelfHealingAiCompletion(
           recoveredFromUnsupportedParam,
           retryable: isTransientStatus(status),
           rawError: err,
+        };
+      }
+
+      if (err instanceof ProviderTruncatedResponseError) {
+        if (
+          err.reason === 'premature-eof' &&
+          transientRetriesUsed < MAX_TRANSIENT_RETRIES &&
+          deltasEmittedThisAttempt === 0
+        ) {
+          transientRetriesUsed++;
+          const waitMs = computeBackoffDelayMs(
+            transientRetriesUsed,
+            retryBaseDelayMs,
+          );
+          await abortableSleep(waitMs, signal);
+          continue;
+        }
+
+        return {
+          ok: false,
+          content: '',
+          httpStatus: err.httpStatus,
+          attempts,
+          latencyMs: Date.now() - t0,
+          resolvedEndpoint,
+          temperatureTrace: currentTrace,
+          temperatureSent: currentTemperature,
+          recoveredFromUnsupportedParam,
+          retryable: err.retryable,
+          rawError: err,
+          isNetworkError: err.reason === 'premature-eof',
         };
       }
 
@@ -509,12 +542,14 @@ export async function executeBatchWithProvider(
           effectivePriority,
         );
 
+        if (mtResult.translations.length !== items.length) {
+          throw new Error(
+            `Invalid MT response segment count (expected=${items.length}, actual=${mtResult.translations.length})`,
+          );
+        }
+
         const outputs: BatchItemOutput[] = [];
-        for (
-          let i = 0;
-          i < Math.min(items.length, mtResult.translations.length);
-          i++
-        ) {
+        for (let i = 0; i < items.length; i++) {
           const restored = restoreGlossaryTokens(
             mtResult.translations[i] ?? '',
             placeholderMap,
@@ -647,7 +682,9 @@ export async function executeBatchWithProvider(
 
         const isParseFailure =
           err instanceof Error &&
-          /Invalid JSON|Unexpected Google|missing translated/i.test(err.message);
+          /Invalid JSON|Unexpected Google|missing translated|Invalid MT response/i.test(
+            err.message,
+          );
         const kind = classifyDiagnosticKind({
           ok: false,
           isNetworkError: !isParseFailure,
@@ -780,14 +817,21 @@ export async function executeBatchWithProvider(
   });
 
   if (!execOut.ok) {
+    const isTruncated =
+      execOut.rawError instanceof ProviderTruncatedResponseError;
+    const isTruncatedInvalid =
+      isTruncated &&
+      (execOut.rawError as ProviderTruncatedResponseError).reason !==
+        'premature-eof';
     const isParseFailure =
+      !isTruncated &&
       execOut.rawError instanceof Error &&
       /Invalid JSON/i.test(execOut.rawError.message);
     const kind = classifyDiagnosticKind({
       ok: false,
       httpStatus: execOut.httpStatus,
-      isNetworkError: execOut.isNetworkError && !isParseFailure,
-      isInvalidResponse: isParseFailure,
+      isNetworkError: execOut.isNetworkError && !isParseFailure && !isTruncatedInvalid,
+      isInvalidResponse: isParseFailure || isTruncatedInvalid,
     });
     const diagnostic = buildDiagnosticSnapshot({
       scene,
@@ -819,11 +863,13 @@ export async function executeBatchWithProvider(
       items: [],
       diagnostic,
       error: {
-        code: execOut.httpStatus
-          ? `HTTP_${execOut.httpStatus}`
+        code: isTruncated
+          ? 'TRUNCATED_RESPONSE'
           : isParseFailure
             ? 'INVALID_RESPONSE'
-            : 'NETWORK_ERROR',
+            : execOut.httpStatus
+              ? `HTTP_${execOut.httpStatus}`
+              : 'NETWORK_ERROR',
         message: diagnostic.sanitizedError || 'Upstream provider request failed.',
         retryable: execOut.retryable,
       },
@@ -856,6 +902,18 @@ export async function executeBatchWithProvider(
   // If input had non-empty items and LLM returned 0 parseable items, surface invalid-response
   const hasNonEmptyInput = items.some((it) => it.text.trim() !== '');
   if (hasNonEmptyInput && decodedItems.length === 0) {
+    const markers = [
+      /<\/?yaml>/i.test(execOut.content) ? 'yaml-tag' : null,
+      execOut.content.includes('```') ? 'code-fence' : null,
+      execOut.content.includes('[') && execOut.content.includes(']')
+        ? 'json-array'
+        : null,
+      execOut.content.includes('{') && execOut.content.includes('}')
+        ? 'json-object'
+        : null,
+      execOut.content.includes('%%') ? 'delimiter-%%' : null,
+      /<\/?think>/i.test(execOut.content) ? 'think-tag' : null,
+    ].filter(Boolean);
     const diagnostic = buildDiagnosticSnapshot({
       scene,
       codec: codecId,
@@ -877,7 +935,7 @@ export async function executeBatchWithProvider(
       retryable: true,
       attempts: execOut.attempts,
       latencyMs: execOut.latencyMs,
-      rawError: `Failed to parse ${codecId} output from model response: ${execOut.content.slice(0, 180)}`,
+      rawError: `Failed to parse ${codecId} output from ${provider.protocol} response (chars=${execOut.content.length}, markers=${markers.length > 0 ? markers.join(',') : 'none'})`,
       knownSecrets,
     });
 
@@ -1017,10 +1075,21 @@ export async function executeVisionWithProvider(
   });
 
   if (!execOut.ok) {
+    const isTruncated =
+      execOut.rawError instanceof ProviderTruncatedResponseError;
+    const isTruncatedInvalid =
+      isTruncated &&
+      (execOut.rawError as ProviderTruncatedResponseError).reason !==
+        'premature-eof';
+    const isParseFailure =
+      !isTruncated &&
+      execOut.rawError instanceof Error &&
+      /Invalid JSON/i.test(execOut.rawError.message);
     const kind = classifyDiagnosticKind({
       ok: false,
       httpStatus: execOut.httpStatus,
-      isNetworkError: execOut.isNetworkError,
+      isNetworkError: execOut.isNetworkError && !isParseFailure && !isTruncatedInvalid,
+      isInvalidResponse: isParseFailure || isTruncatedInvalid,
     });
     const diagnostic = buildDiagnosticSnapshot({
       scene: 'image',
@@ -1052,7 +1121,13 @@ export async function executeVisionWithProvider(
       rawText: '',
       diagnostic,
       error: {
-        code: execOut.httpStatus ? `HTTP_${execOut.httpStatus}` : 'NETWORK_ERROR',
+        code: isTruncated
+          ? 'TRUNCATED_RESPONSE'
+          : isParseFailure
+            ? 'INVALID_RESPONSE'
+            : execOut.httpStatus
+              ? `HTTP_${execOut.httpStatus}`
+              : 'NETWORK_ERROR',
         message: diagnostic.sanitizedError || 'Vision translation request failed.',
         retryable: execOut.retryable,
       },

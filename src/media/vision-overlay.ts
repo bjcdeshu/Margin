@@ -480,9 +480,19 @@ export function mountVisionImageOverlay(
   shadowRoot.appendChild(root);
   doc.body.appendChild(host);
 
+  const win = doc.defaultView || window;
+  let destroyed = false;
+  let resizeObserver: ResizeObserver | null = null;
+  let removalObserver: MutationObserver | null = null;
+
   const updatePosition = () => {
+    if (destroyed) return;
+    if (!targetImg.isConnected) {
+      destroy();
+      return;
+    }
+
     const rect = targetImg.getBoundingClientRect();
-    const win = doc.defaultView || window;
     const width = rect.width || targetImg.width || targetImg.naturalWidth || 320;
     const height = rect.height || targetImg.height || targetImg.naturalHeight || 240;
 
@@ -509,29 +519,44 @@ export function mountVisionImageOverlay(
     }
   };
 
-  updatePosition();
-
-  const win = doc.defaultView || window;
   const onViewportChange = () => updatePosition();
-  win.addEventListener('resize', onViewportChange, { passive: true });
-  win.addEventListener('scroll', onViewportChange, { passive: true });
 
-  let resizeObserver: ResizeObserver | null = null;
-  if (typeof ResizeObserver !== 'undefined') {
-    resizeObserver = new ResizeObserver(() => updatePosition());
-    resizeObserver.observe(targetImg);
-  }
-
-  let destroyed = false;
-  const destroy = () => {
+  function destroy() {
     if (destroyed) return;
     destroyed = true;
     win.removeEventListener('resize', onViewportChange);
-    win.removeEventListener('scroll', onViewportChange);
+    win.removeEventListener('scroll', onViewportChange, true);
     resizeObserver?.disconnect();
+    resizeObserver = null;
+    removalObserver?.disconnect();
+    removalObserver = null;
     host.remove();
     onClose?.();
-  };
+  }
+
+  updatePosition();
+
+  if (!destroyed) {
+    win.addEventListener('resize', onViewportChange, { passive: true });
+    win.addEventListener('scroll', onViewportChange, {
+      capture: true,
+      passive: true,
+    });
+
+    if (typeof ResizeObserver !== 'undefined') {
+      resizeObserver = new ResizeObserver(() => updatePosition());
+      resizeObserver.observe(targetImg);
+    }
+
+    if (typeof MutationObserver !== 'undefined' && doc.body) {
+      removalObserver = new MutationObserver(() => {
+        if (!targetImg.isConnected) {
+          destroy();
+        }
+      });
+      removalObserver.observe(doc.body, { childList: true, subtree: true });
+    }
+  }
 
   btnClose.addEventListener('click', (e) => {
     e.stopPropagation();

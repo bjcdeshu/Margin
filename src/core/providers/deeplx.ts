@@ -3,7 +3,7 @@ import {
   DEFAULT_MT_REQUEST_TIMEOUT_MS,
   createLinkedTimeoutScope,
 } from './timeout';
-import { ProviderHttpError } from './types';
+import { ProviderHttpError, describeBodyMetadata } from './types';
 
 const DEEPLX_LANG_MAP: Readonly<Record<string, string>> = {
   auto: 'auto',
@@ -63,69 +63,52 @@ export function splitMtBatchChunk(
 
   if (mode === 'indexed-marker') {
     const out = new Array<string>(expectedCount).fill('');
+    const seenIndices = new Set<number>();
     const markerRe = /\[\[#(\d+)\]\]\s*([\s\S]*?)(?=\[\[#\d+\]\]|$)/g;
-    let matchedCount = 0;
     let m: RegExpExecArray | null;
     while ((m = markerRe.exec(translated)) !== null) {
       const idx = Number.parseInt(m[1], 10) - 1;
-      if (idx >= 0 && idx < expectedCount) {
+      if (idx >= 0 && idx < expectedCount && !seenIndices.has(idx)) {
         out[idx] = m[2].trim();
-        matchedCount++;
+        seenIndices.add(idx);
       }
     }
-    if (matchedCount > 0) {
+    if (seenIndices.size === expectedCount) {
       return out;
     }
+    return Array.from(seenIndices).map((idx) => out[idx]);
   }
 
   const parts = translated.split(/\r?\n\s*\r?\n/).map((s) => s.trim());
   if (parts.length === expectedCount) {
     return parts;
   }
-  if (parts.length > expectedCount) {
-    return [
-      ...parts.slice(0, expectedCount - 1),
-      parts.slice(expectedCount - 1).join('\n\n'),
-    ];
-  }
-
-  // Fallback if MT collapsed double-newlines to single newlines
-  const singleLineParts = translated.split(/\r?\n/).map((s) => s.trim());
-  if (singleLineParts.length === expectedCount) {
-    return singleLineParts;
-  }
 
   return parts;
 }
 
-export async function executeDeepLXCall(params: {
+async function fetchSingleDeepLXPayload(params: {
   provider: ProviderConfig;
   endpoint: string;
   apiKey?: string;
-  texts: readonly string[];
+  payloadText: string;
   fromLang: string;
   toLang: string;
   fetchImpl: typeof fetch;
   signal?: AbortSignal;
-  requestTimeoutMs?: number;
-}): Promise<{ translations: string[]; httpStatus: number }> {
+  requestTimeoutMs: number;
+}): Promise<{ translatedText: string; httpStatus: number }> {
   const {
     provider,
     endpoint,
     apiKey,
-    texts,
+    payloadText,
     fromLang,
     toLang,
     fetchImpl,
     signal,
-    requestTimeoutMs = DEFAULT_MT_REQUEST_TIMEOUT_MS,
+    requestTimeoutMs,
   } = params;
-
-  if (texts.length === 0) {
-    return { translations: [], httpStatus: 200 };
-  }
-
-  const { payloadText, mode } = joinMtBatchChunk(texts);
 
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
@@ -171,7 +154,9 @@ export async function executeDeepLXCall(params: {
   try {
     json = JSON.parse(rawBody) as Record<string, unknown>;
   } catch {
-    throw new Error(`Invalid JSON from DeepLX endpoint: ${rawBody.slice(0, 200)}`);
+    throw new Error(
+      `Invalid JSON from DeepLX endpoint (${describeBodyMetadata(rawBody, response)})`,
+    );
   }
 
   if (typeof json.code === 'number' && json.code >= 400) {
@@ -203,14 +188,95 @@ export async function executeDeepLXCall(params: {
   } else if (payloadText.trim() === '') {
     translatedText = '';
   } else {
+    const topKeys = Object.keys(json).slice(0, 8).join(',') || 'none';
     throw new Error(
-      `DeepLX response missing translated data field: ${rawBody.slice(0, 200)}`,
+      `DeepLX response missing translated data field (chars=${rawBody.length}, keys=${topKeys})`,
     );
   }
 
-  const translations = splitMtBatchChunk(translatedText, texts.length, mode);
   return {
-    translations,
+    translatedText,
     httpStatus: response.status,
+  };
+}
+
+export async function executeDeepLXCall(params: {
+  provider: ProviderConfig;
+  endpoint: string;
+  apiKey?: string;
+  texts: readonly string[];
+  fromLang: string;
+  toLang: string;
+  fetchImpl: typeof fetch;
+  signal?: AbortSignal;
+  requestTimeoutMs?: number;
+}): Promise<{ translations: string[]; httpStatus: number }> {
+  const {
+    provider,
+    endpoint,
+    apiKey,
+    texts,
+    fromLang,
+    toLang,
+    fetchImpl,
+    signal,
+    requestTimeoutMs = DEFAULT_MT_REQUEST_TIMEOUT_MS,
+  } = params;
+
+  if (texts.length === 0) {
+    return { translations: [], httpStatus: 200 };
+  }
+
+  const { payloadText, mode } = joinMtBatchChunk(texts);
+  const batchRes = await fetchSingleDeepLXPayload({
+    provider,
+    endpoint,
+    apiKey,
+    payloadText,
+    fromLang,
+    toLang,
+    fetchImpl,
+    signal,
+    requestTimeoutMs,
+  });
+
+  const splitItems = splitMtBatchChunk(
+    batchRes.translatedText,
+    texts.length,
+    mode,
+  );
+  if (splitItems.length === texts.length) {
+    return {
+      translations: splitItems,
+      httpStatus: batchRes.httpStatus,
+    };
+  }
+
+  // Fallback to exact 1-to-1 per-item calls when MT under/over-splits batch delimiters
+  const fallbackTranslations: string[] = [];
+  let lastStatus = batchRes.httpStatus;
+  for (const singleText of texts) {
+    if (singleText.trim() === '') {
+      fallbackTranslations.push('');
+      continue;
+    }
+    const singleRes = await fetchSingleDeepLXPayload({
+      provider,
+      endpoint,
+      apiKey,
+      payloadText: singleText,
+      fromLang,
+      toLang,
+      fetchImpl,
+      signal,
+      requestTimeoutMs,
+    });
+    lastStatus = singleRes.httpStatus;
+    fallbackTranslations.push(singleRes.translatedText.trim());
+  }
+
+  return {
+    translations: fallbackTranslations,
+    httpStatus: lastStatus,
   };
 }

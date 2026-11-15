@@ -1638,6 +1638,10 @@ export class SelectionPopover {
   }
 
   updateConfig(nextConfig: MarginConfig): void {
+    const prevConfig = this.config;
+    const langChanged =
+      prevConfig.sourceLang !== nextConfig.sourceLang ||
+      prevConfig.targetLang !== nextConfig.targetLang;
     this.config = nextConfig;
     if (this.hostEl) {
       this.hostEl.setAttribute('data-display-mode', nextConfig.uiColorMode);
@@ -1653,6 +1657,14 @@ export class SelectionPopover {
     }
     if (!this.isFeatureEnabled() && !this.pinned) {
       this.close();
+      return;
+    }
+    if (
+      langChanged &&
+      this.uiState === 'card' &&
+      this.selectedSourceText.trim().length > 0
+    ) {
+      void this.openCardAndTranslate({ x: 0, y: 0 }, true);
     }
   }
 

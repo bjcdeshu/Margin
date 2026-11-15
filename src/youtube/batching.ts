@@ -10,11 +10,14 @@ import type {
   TranslateBatchRequest,
   TranslateBatchResponse,
 } from '@shared/types';
+import { sanitizeSubtitleMarkup } from './shared';
 
 export const DEFAULT_SUBTITLE_BATCH_COUNT = 17;
 export const DEFAULT_SUBTITLE_MAX_CHARS = 4_096;
 export const SUBTITLE_IMMEDIATE_LOOKBEHIND_MS = 2_000;
 export const SUBTITLE_IMMEDIATE_LOOKAHEAD_MS = 35_000;
+export const SUBTITLE_SEEK_JUMP_THRESHOLD_MS = 1_500;
+export const MAX_SUBTITLE_CUE_RETRIES = 3;
 
 export const SUBTITLE_ANTI_SPILLOVER_STYLE_GUIDE =
   'Video subtitle translation mode: Keep each translation strictly inside its matching cue `id`. Never merge adjacent cues, never split a single cue, and never let trailing or leading clause words spill into neighboring cue IDs.';
@@ -69,6 +72,7 @@ export interface SubtitleBatchSchedulerOptions {
   onCuesUpdated?: (updatedIndices: number[], cues: readonly SubtitleCue[]) => void;
   onBatchError?: (error: unknown, cueIndices: number[]) => void;
   maxImmediateConcurrency?: number;
+  maxCueRetries?: number;
 }
 
 function toPositiveInt(value: unknown): number | null {
@@ -238,12 +242,8 @@ export function buildSubtitleBatchRequest(
   };
 }
 
-function cleanTranslatedCueText(raw: string): string {
-  return String(raw ?? '')
-    .replace(/[\u200B-\u200D\uFEFF]/g, '')
-    .replace(/\r?\n/g, ' ')
-    .replace(/[\t\f\v ]+/g, ' ')
-    .trim();
+export function cleanTranslatedCueText(raw: string): string {
+  return sanitizeSubtitleMarkup(raw);
 }
 
 /**
@@ -360,6 +360,7 @@ export class SubtitleBatchScheduler {
   private readonly onCuesUpdated?: SubtitleBatchSchedulerOptions['onCuesUpdated'];
   private readonly onBatchError?: SubtitleBatchSchedulerOptions['onBatchError'];
   private readonly maxImmediateConcurrency: number;
+  private readonly maxCueRetries: number;
 
   private config: SubtitleSchedulerConfig = {
     fromLang: 'auto',
@@ -373,6 +374,7 @@ export class SubtitleBatchScheduler {
   private videoKey = '';
   private cues: SubtitleCue[] = [];
   private statuses: CueDispatchStatus[] = [];
+  private failureCounts: number[] = [];
   private playheadMs = 0;
   private abortController: AbortController = new AbortController();
   private inflightImmediate = 0;
@@ -384,6 +386,12 @@ export class SubtitleBatchScheduler {
     this.onCuesUpdated = options.onCuesUpdated;
     this.onBatchError = options.onBatchError;
     this.maxImmediateConcurrency = Math.max(1, options.maxImmediateConcurrency ?? 2);
+    this.maxCueRetries =
+      options.maxCueRetries !== undefined &&
+      Number.isFinite(options.maxCueRetries) &&
+      options.maxCueRetries >= 0
+        ? Math.floor(options.maxCueRetries)
+        : MAX_SUBTITLE_CUE_RETRIES;
   }
 
   public configure(next: Partial<SubtitleSchedulerConfig>): void {
@@ -423,14 +431,37 @@ export class SubtitleBatchScheduler {
     this.videoKey = videoKey;
     this.cues = cues.map((c) => ({ ...c }));
     this.statuses = this.cues.map((c) => (c.trans ? 'done' : 'pending'));
+    this.failureCounts = this.cues.map(() => 0);
     this.playheadMs = Math.max(0, Number.isFinite(initialTimeMs) ? initialTimeMs : 0);
     this.pump();
   }
 
-  public updatePlayhead(currentTimeMs: number): void {
+  public updatePlayhead(
+    currentTimeMs: number,
+    options?: { seek?: boolean },
+  ): void {
     if (!Number.isFinite(currentTimeMs) || currentTimeMs < 0) return;
+    const delta = currentTimeMs - this.playheadMs;
+    const isExplicitSeek =
+      Boolean(options?.seek) ||
+      delta <= 0 ||
+      delta >= SUBTITLE_SEEK_JUMP_THRESHOLD_MS;
     this.playheadMs = currentTimeMs;
-    // Allow previously failed cues inside the immediate playhead window to retry on explicit seek
+
+    if (isExplicitSeek) {
+      for (let i = 0; i < this.statuses.length; i += 1) {
+        const cue = this.cues[i];
+        if (
+          this.statuses[i] === 'failed' &&
+          cue &&
+          !cue.trans &&
+          (this.failureCounts[i] ?? 0) <= this.maxCueRetries &&
+          isCueInImmediateWindow(cue, currentTimeMs)
+        ) {
+          this.statuses[i] = 'pending';
+        }
+      }
+    }
     this.pump();
   }
 
@@ -443,6 +474,12 @@ export class SubtitleBatchScheduler {
     for (let i = 0; i < this.statuses.length; i += 1) {
       if (this.statuses[i] === 'inflight') {
         this.statuses[i] = this.cues[i]?.trans ? 'done' : 'pending';
+      } else if (
+        this.statuses[i] === 'failed' &&
+        !this.cues[i]?.trans &&
+        (this.failureCounts[i] ?? 0) <= this.maxCueRetries
+      ) {
+        this.statuses[i] = 'pending';
       }
     }
     this.checkIdle();
@@ -578,9 +615,11 @@ export class SubtitleBatchScheduler {
 
         for (const idx of built.cueIndices) {
           if (updatedSet.has(idx) || this.cues[idx]?.trans) {
+            this.failureCounts[idx] = 0;
             this.statuses[idx] = 'done';
           } else {
-            // Prevent infinite spin on permanently empty/rejected cue slots
+            // Track bounded per-cue failure count; stays failed until seek/cancelAll up to maxCueRetries
+            this.failureCounts[idx] = (this.failureCounts[idx] ?? 0) + 1;
             this.statuses[idx] = 'failed';
           }
         }
@@ -597,6 +636,7 @@ export class SubtitleBatchScheduler {
       .catch((err: unknown) => {
         if (activeSession !== this.sessionId || signal.aborted) return;
         for (const idx of built.cueIndices) {
+          this.failureCounts[idx] = (this.failureCounts[idx] ?? 0) + 1;
           this.statuses[idx] = 'failed';
         }
         this.onBatchError?.(err, built.cueIndices);

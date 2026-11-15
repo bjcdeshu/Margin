@@ -121,7 +121,24 @@ export function streamBatchTranslation(
     const port = chrome.runtime.connect({ name: BRAND.streamPortName });
     let settled = false;
 
+    const onAbort = () => {
+      if (settled) return;
+      settled = true;
+      try {
+        const msg: TranslateStreamPortMessage = {
+          type: 'cancel',
+          requestId: payload.requestId,
+        };
+        port.postMessage(msg);
+      } catch {
+        // Ignore post after disconnect
+      }
+      cleanup();
+      reject(new DOMException('Aborted', 'AbortError'));
+    };
+
     const cleanup = () => {
+      signal?.removeEventListener('abort', onAbort);
       try {
         port.disconnect();
       } catch {
@@ -135,25 +152,7 @@ export function streamBatchTranslation(
         reject(new DOMException('Aborted', 'AbortError'));
         return;
       }
-      signal.addEventListener(
-        'abort',
-        () => {
-          if (settled) return;
-          settled = true;
-          try {
-            const msg: TranslateStreamPortMessage = {
-              type: 'cancel',
-              requestId: payload.requestId,
-            };
-            port.postMessage(msg);
-          } catch {
-            // Ignore post after disconnect
-          }
-          cleanup();
-          reject(new DOMException('Aborted', 'AbortError'));
-        },
-        { once: true },
-      );
+      signal.addEventListener('abort', onAbort, { once: true });
     }
 
     port.onMessage.addListener((raw: unknown) => {
@@ -177,6 +176,7 @@ export function streamBatchTranslation(
     port.onDisconnect.addListener(() => {
       if (!settled) {
         settled = true;
+        signal?.removeEventListener('abort', onAbort);
         const lastErr = chrome.runtime.lastError?.message;
         reject(new Error(lastErr || 'Translation stream port closed unexpectedly.'));
       }

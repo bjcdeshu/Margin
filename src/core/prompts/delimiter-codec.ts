@@ -82,28 +82,45 @@ export function splitDelimiterSegments(
   cleanedText: string,
   expectedCount: number,
   assistant?: AssistantConfig,
+  allowEmptyFirstSegment = false,
 ): string[] {
   if (!cleanedText.trim() || expectedCount <= 0) return [];
 
   const { joinSeparator, lineSplitRegex, inlineFallbackRegex } =
     resolveSeparatorToken(assistant);
   const coreToken = joinSeparator.trim() || '%%';
+  const escapedCore = escapeRegExp(coreToken);
 
   if (expectedCount === 1) {
     return [cleanOuterDelimiterArtifacts(cleanedText, coreToken)];
   }
 
-  let segments = cleanedText.split(lineSplitRegex).map((s) => s.trim());
+  let normalized = cleanedText;
+  const leadingLineDelimRe = new RegExp(`^(?:\\s*${escapedCore}[ \\t]*\\r?\\n)+`);
+  const trailingLineDelimRe = new RegExp(`(?:\\r?\\n[ \\t]*${escapedCore}\\s*)+$`);
+  if (!allowEmptyFirstSegment) {
+    normalized = normalized.replace(leadingLineDelimRe, '');
+  }
+  normalized = normalized.replace(trailingLineDelimRe, '');
+  if (!normalized.trim()) return [];
+
+  lineSplitRegex.lastIndex = 0;
+  let segments = normalized.split(lineSplitRegex).map((s) => s.trim());
 
   // Tolerant fallback if LLM omitted surrounding newlines (e.g. `译文A %% 译文B`)
-  if (segments.length === 1 && inlineFallbackRegex.test(cleanedText)) {
+  if (segments.length === 1 && inlineFallbackRegex.test(normalized)) {
     inlineFallbackRegex.lastIndex = 0;
-    segments = cleanedText.split(inlineFallbackRegex).map((s) => s.trim());
+    segments = normalized.split(inlineFallbackRegex).map((s) => s.trim());
   }
 
-  // Trim accidental empty leading/trailing segments caused by leading/trailing `%%`
-  while (segments.length > expectedCount && segments[0] === '') {
-    segments.shift();
+  if (!allowEmptyFirstSegment) {
+    while (segments.length > 1 && segments[0] === '') {
+      segments.shift();
+    }
+  } else {
+    while (segments.length > expectedCount && segments[0] === '') {
+      segments.shift();
+    }
   }
   while (
     segments.length > expectedCount &&
@@ -162,18 +179,20 @@ export class DelimiterPromptCodec implements PromptCodec {
     const stripped = stripThinkingBlocks(rawOutput);
     if (!stripped || items.length === 0) return [];
 
+    const allowEmptyFirstSegment = items[0].text.trim() === '';
     const segments = splitDelimiterSegments(
       stripped,
       items.length,
       options?.assistant,
+      allowEmptyFirstSegment,
     );
 
     const outputs: BatchItemOutput[] = [];
     for (let i = 0; i < Math.min(items.length, segments.length); i++) {
       const seg = segments[i];
       if (seg === undefined) continue;
-      // If LLM under-produced segments and left an empty tail slot, omit rather than wiping original text
-      if (seg === '' && items[i].text.trim() !== '' && segments.length < items.length) {
+      // Omit empty segment when source item had non-empty text rather than wiping original text
+      if (seg === '' && items[i].text.trim() !== '') {
         continue;
       }
       outputs.push({
@@ -194,10 +213,16 @@ export class DelimiterPromptCodec implements PromptCodec {
   ): CodecStreamParser {
     let buffer = '';
     let nextEmitIndex = 0;
+    const emittedIds = new Set<number>();
     const lastEmittedPartialById = new Map<number, string>();
     const { joinSeparator, lineSplitRegex, inlineFallbackRegex } =
       resolveSeparatorToken(options?.assistant);
     const coreToken = joinSeparator.trim() || '%%';
+    const escapedCore = escapeRegExp(coreToken);
+    const leadingLineDelimRe = new RegExp(
+      `^(?:\\s*${escapedCore}[ \\t]*\\r?\\n)+`,
+    );
+    const bareLeadingDelimOnlyRe = new RegExp(`^\\s*${escapedCore}\\s*$`);
 
     return {
       push: (delta: string): BatchItemOutput[] => {
@@ -229,11 +254,26 @@ export class DelimiterPromptCodec implements PromptCodec {
           return newlyReady;
         }
 
+        const firstItemNonEmpty = items[0].text.trim() !== '';
+        let visibleForSplit = visible;
+        if (firstItemNonEmpty) {
+          visibleForSplit = visibleForSplit.replace(leadingLineDelimRe, '');
+          if (!visibleForSplit || bareLeadingDelimOnlyRe.test(visibleForSplit)) {
+            return [];
+          }
+        }
+
         lineSplitRegex.lastIndex = 0;
-        let parts = visible.split(lineSplitRegex);
+        let parts = visibleForSplit.split(lineSplitRegex);
         if (parts.length <= 1) {
           inlineFallbackRegex.lastIndex = 0;
-          parts = visible.split(inlineFallbackRegex);
+          parts = visibleForSplit.split(inlineFallbackRegex);
+        }
+
+        if (firstItemNonEmpty) {
+          while (parts.length > 1 && parts[0].trim() === '') {
+            parts.shift();
+          }
         }
 
         // 1. Every segment strictly BEFORE the last segment has already seen its closing `%%` delimiter!
@@ -243,6 +283,7 @@ export class DelimiterPromptCodec implements PromptCodec {
           const inputItem = items[nextEmitIndex];
           nextEmitIndex++;
           if (trans !== '' || inputItem.text.trim() === '') {
+            emittedIds.add(inputItem.id);
             newlyReady.push({
               id: inputItem.id,
               trans,
@@ -280,10 +321,10 @@ export class DelimiterPromptCodec implements PromptCodec {
 
       finish: () => {
         const allItems = this.decode(buffer, items, options);
-        const emittedIds = new Set(
-          items.slice(0, nextEmitIndex).map((it) => it.id),
-        );
         const newlyReady = allItems.filter((it) => !emittedIds.has(it.id));
+        for (const it of newlyReady) {
+          emittedIds.add(it.id);
+        }
         nextEmitIndex = items.length;
         return { allItems, newlyReady };
       },

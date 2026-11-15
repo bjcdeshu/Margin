@@ -8,6 +8,18 @@ export interface SseEventFrame {
   data: string;
 }
 
+export interface SseStreamSummary {
+  sawDone: boolean;
+  stoppedByCallback: boolean;
+}
+
+interface SseParseState {
+  buffer: string;
+  pendingCr: boolean;
+  sawDone: boolean;
+  stoppedByCallback: boolean;
+}
+
 function toUint8Array(chunk: unknown): Uint8Array {
   if (chunk instanceof Uint8Array) {
     return chunk;
@@ -36,25 +48,34 @@ async function readChunkWithIdleGuard(
 
   let timer: ReturnType<typeof setTimeout> | null = null;
   let onAbort: (() => void) | null = null;
+  let guardError: Error | null = null;
 
   const guardPromise = new Promise<never>((_, reject) => {
     if (signal) {
       onAbort = () => {
+        const err = new DOMException('The operation was aborted.', 'AbortError');
+        guardError = err;
+        reject(err);
         void reader.cancel().catch(() => undefined);
-        reject(new DOMException('The operation was aborted.', 'AbortError'));
       };
       signal.addEventListener('abort', onAbort, { once: true });
     }
     if (Number.isFinite(idleTimeoutMs) && idleTimeoutMs > 0) {
       timer = setTimeout(() => {
+        const err = new ProviderTimeoutError(idleTimeoutMs, 'stream-idle');
+        guardError = err;
+        reject(err);
         void reader.cancel().catch(() => undefined);
-        reject(new ProviderTimeoutError(idleTimeoutMs, 'stream-idle'));
       }, idleTimeoutMs);
     }
   });
 
   try {
-    return await Promise.race([reader.read(), guardPromise]);
+    const result = await Promise.race([reader.read(), guardPromise]);
+    if (guardError) {
+      throw guardError;
+    }
+    return result;
   } finally {
     if (timer !== null) {
       clearTimeout(timer);
@@ -75,17 +96,32 @@ export async function readSseStream(
   onEvent: (frame: SseEventFrame) => void | 'stop',
   signal?: AbortSignal,
   idleTimeoutMs = DEFAULT_SSE_IDLE_TIMEOUT_MS,
-): Promise<void> {
+): Promise<SseStreamSummary> {
   if (!response.body) {
     // Fallback if test mock omitted ReadableStream body
     const text = new TextDecoder('utf-8').decode(await response.arrayBuffer());
-    parseSseTextChunk(text + '\n\n', { buffer: '' }, onEvent);
-    return;
+    const state: SseParseState = {
+      buffer: '',
+      pendingCr: false,
+      sawDone: false,
+      stoppedByCallback: false,
+    };
+    parseSseTextChunk(text + '\n\n', state, onEvent);
+    return {
+      sawDone: state.sawDone,
+      stoppedByCallback: state.stoppedByCallback,
+    };
   }
 
   const reader = response.body.getReader();
   const decoder = new TextDecoder('utf-8');
-  const state = { buffer: '' };
+  const state: SseParseState = {
+    buffer: '',
+    pendingCr: false,
+    sawDone: false,
+    stoppedByCallback: false,
+  };
+  let reachedNaturalEof = false;
 
   try {
     while (true) {
@@ -95,9 +131,16 @@ export async function readSseStream(
         idleTimeoutMs,
       );
       if (done) {
+        reachedNaturalEof = true;
         const trailing = decoder.decode();
         if (trailing) {
-          state.buffer += trailing;
+          const stopped = parseSseTextChunk(trailing, state, onEvent);
+          if (stopped) break;
+        }
+        if (state.pendingCr) {
+          state.pendingCr = false;
+          const stopped = parseSseTextChunk('\n', state, onEvent);
+          if (stopped) break;
         }
         if (state.buffer.trim() !== '') {
           parseSseTextChunk('\n\n', state, onEvent);
@@ -109,11 +152,17 @@ export async function readSseStream(
       const decodedText = decoder.decode(bytes, { stream: true });
       const shouldStop = parseSseTextChunk(decodedText, state, onEvent);
       if (shouldStop) {
-        void reader.cancel().catch(() => undefined);
         break;
       }
     }
+    return {
+      sawDone: state.sawDone,
+      stoppedByCallback: state.stoppedByCallback,
+    };
   } finally {
+    if (!reachedNaturalEof) {
+      void reader.cancel().catch(() => undefined);
+    }
     try {
       reader.releaseLock();
     } catch {
@@ -124,10 +173,26 @@ export async function readSseStream(
 
 function parseSseTextChunk(
   chunkText: string,
-  state: { buffer: string },
+  state: SseParseState,
   onEvent: (frame: SseEventFrame) => void | 'stop',
 ): boolean {
-  state.buffer += chunkText.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+  if (chunkText.length === 0) {
+    return false;
+  }
+
+  let text = chunkText;
+  if (state.pendingCr) {
+    state.pendingCr = false;
+    if (!text.startsWith('\n')) {
+      text = `\n${text}`;
+    }
+  }
+  if (text.endsWith('\r')) {
+    state.pendingCr = true;
+    text = text.slice(0, -1);
+  }
+
+  state.buffer += text.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
 
   let boundaryIdx: number;
   while ((boundaryIdx = state.buffer.indexOf('\n\n')) !== -1) {
@@ -161,6 +226,7 @@ function parseSseTextChunk(
 
     const data = dataLines.join('\n');
     if (data.trim() === '[DONE]') {
+      state.sawDone = true;
       return true;
     }
 
@@ -169,6 +235,7 @@ function parseSseTextChunk(
       data,
     });
     if (action === 'stop') {
+      state.stoppedByCallback = true;
       return true;
     }
   }

@@ -879,7 +879,7 @@ describe('Quiet Paper 6-Tab Settings Studio (OptionsApp)', () => {
     expect(container.querySelector('[data-testid="import-audit-summary"]')).not.toBeNull();
   });
 
-  it('renders v2.3.3 studio badge, triggers save on Ctrl+S, and keeps env macro disclosure collapsed by default in PromptsGlossaryTab', async () => {
+  it('renders v2.3.4 studio badge, triggers save on Ctrl+S, and keeps env macro disclosure collapsed by default in PromptsGlossaryTab', async () => {
     await saveMarginConfig(createDefaultMarginConfig());
 
     await act(async () => {
@@ -887,9 +887,9 @@ describe('Quiet Paper 6-Tab Settings Studio (OptionsApp)', () => {
     });
     await flushMicrotasks();
 
-    // 1. Studio footer displays v2.3.3 badge & keyboard shortcut hint
+    // 1. Studio footer displays v2.3.4 badge & keyboard shortcut hint
     const footerVersion = container.querySelector('.mp-nav-footer .mp-pill--mono');
-    expect(footerVersion?.textContent).toBe('v2.3.3');
+    expect(footerVersion?.textContent).toBe('v2.3.4');
     const saveBtn = container.querySelector(
       '[data-testid="options-save-btn"]',
     ) as HTMLButtonElement;
@@ -936,5 +936,291 @@ describe('Quiet Paper 6-Tab Settings Studio (OptionsApp)', () => {
     expect(persisted.assistants['builtin-yaml'].prompt).toContain(
       '# v2.3.0 shortcut edit',
     );
+  });
+
+  it('preserves concurrent draft typing during an in-flight save on PromptsGlossaryTab without clobbering newer edits', async () => {
+    const origChrome = (globalThis as Record<string, unknown>).chrome;
+    const storageListeners = new Set<
+      (changes: Record<string, { newValue?: unknown }>, areaName: string) => void
+    >();
+    let storedCfg = createDefaultMarginConfig();
+
+    let blockNextSet = false;
+    const blockedSet: {
+      release: (() => void) | null;
+      settled: Promise<void> | null;
+    } = { release: null, settled: null };
+
+    (globalThis as Record<string, unknown>).chrome = {
+      storage: {
+        local: {
+          get: async (key: string) =>
+            key === 'margin:config:v2'
+              ? { [key]: structuredClone(storedCfg) }
+              : {},
+          set: (items: Record<string, unknown>) => {
+            const writePromise = new Promise<void>((resolve) => {
+              const finish = () => {
+                if ('margin:config:v2' in items) {
+                  storedCfg = structuredClone(
+                    items['margin:config:v2'] as typeof storedCfg,
+                  );
+                  for (const fn of storageListeners) {
+                    fn(
+                      {
+                        'margin:config:v2': {
+                          newValue: structuredClone(storedCfg),
+                        },
+                      },
+                      'local',
+                    );
+                  }
+                }
+                resolve();
+              };
+              if (blockNextSet && 'margin:config:v2' in items) {
+                blockNextSet = false;
+                blockedSet.release = finish;
+              } else {
+                finish();
+              }
+            });
+            if (blockedSet.release) {
+              blockedSet.settled = writePromise;
+            }
+            return writePromise;
+          },
+        },
+        onChanged: {
+          addListener: (
+            fn: (
+              changes: Record<string, { newValue?: unknown }>,
+              areaName: string,
+            ) => void,
+          ) => storageListeners.add(fn),
+          removeListener: (
+            fn: (
+              changes: Record<string, { newValue?: unknown }>,
+              areaName: string,
+            ) => void,
+          ) => storageListeners.delete(fn),
+        },
+      },
+      runtime: {
+        sendMessage: async () => ({ ok: true }),
+      },
+    };
+
+    try {
+      await act(async () => {
+        render(<OptionsApp initialTab="prompts" />, container);
+      });
+      await flushMicrotasks();
+
+      // 1. Edit prompt (snapA), click Save while write is held in-flight, then type newer edit (snapB)
+      const promptTa = container.querySelector(
+        '[data-testid="assistant-prompt-textarea"]',
+      ) as HTMLTextAreaElement;
+      await act(async () => {
+        promptTa.value = 'Prompt revision A\n{{yaml}}';
+        promptTa.dispatchEvent(new Event('input', { bubbles: true }));
+      });
+
+      blockNextSet = true;
+      const saveBtn = container.querySelector(
+        '[data-testid="options-save-btn"]',
+      ) as HTMLButtonElement;
+      await act(async () => {
+        saveBtn.click();
+      });
+      await flushMicrotasks();
+      expect(blockedSet.release).not.toBeNull();
+
+      // User keeps typing while snapA is still saving
+      await act(async () => {
+        promptTa.value = 'Prompt revision B typed mid-save\n{{yaml}}';
+        promptTa.dispatchEvent(new Event('input', { bubbles: true }));
+      });
+
+      // Release snapA write and await full save/readback completion
+      const release = blockedSet.release;
+      const settled = blockedSet.settled;
+      blockedSet.release = null;
+      blockedSet.settled = null;
+      await act(async () => {
+        release?.();
+        await settled;
+      });
+      await flushMicrotasks();
+
+      // MUST NOT overwrite snapB in textarea, and unsaved pill MUST stay visible!
+      expect(promptTa.value).toBe('Prompt revision B typed mid-save\n{{yaml}}');
+      expect(storedCfg.assistants['builtin-yaml'].prompt).toBe(
+        'Prompt revision A\n{{yaml}}',
+      );
+      expect(
+        container.querySelector('[data-testid="options-unsaved-pill"]')?.textContent,
+      ).toBe('有未保存更改');
+      expect(saveBtn.disabled).toBe(false);
+
+      // Saving again persists snapB cleanly
+      await act(async () => {
+        saveBtn.click();
+      });
+      await flushMicrotasks();
+
+      expect(storedCfg.assistants['builtin-yaml'].prompt).toBe(
+        'Prompt revision B typed mid-save\n{{yaml}}',
+      );
+      expect(
+        container.querySelector('[data-testid="options-save-status"]')?.textContent,
+      ).toBe('已保存');
+    } finally {
+      (globalThis as Record<string, unknown>).chrome = origChrome;
+    }
+  });
+
+  it('blocks importApplied and surfaces save error when storage write rejects on MigrationDiagnosticsTab', async () => {
+    const origChrome = (globalThis as Record<string, unknown>).chrome;
+    const storedCfg = createDefaultMarginConfig();
+
+    (globalThis as Record<string, unknown>).chrome = {
+      storage: {
+        local: {
+          get: async (key: string) =>
+            key === 'margin:config:v2'
+              ? { [key]: structuredClone(storedCfg) }
+              : {},
+          set: async () => {
+            throw new Error('QUOTA_BYTES quota exceeded');
+          },
+        },
+        onChanged: {
+          addListener: () => {},
+          removeListener: () => {},
+        },
+      },
+      runtime: {
+        sendMessage: async () => ({ ok: true }),
+      },
+    };
+
+    try {
+      await act(async () => {
+        render(<OptionsApp initialTab="migration" />, container);
+      });
+      await flushMicrotasks();
+
+      const jsonTa = container.querySelector(
+        '[data-testid="legacy-json-textarea"]',
+      ) as HTMLTextAreaElement;
+      const parseBtn = container.querySelector(
+        '[data-testid="parse-legacy-json-btn"]',
+      ) as HTMLButtonElement;
+      await act(async () => {
+        jsonTa.value = JSON.stringify({ translationService: 'deeplx' });
+        jsonTa.dispatchEvent(new Event('input', { bubbles: true }));
+      });
+      await act(async () => {
+        parseBtn.click();
+      });
+
+      const applyBtn = container.querySelector(
+        '[data-testid="apply-import-btn"]',
+      ) as HTMLButtonElement;
+      await act(async () => {
+        applyBtn.click();
+      });
+      await flushMicrotasks();
+
+      const auditSummary = container.querySelector('[data-testid="import-audit-summary"]');
+      expect(auditSummary?.getAttribute('data-state')).toBe('pending');
+      expect(auditSummary?.textContent).not.toContain('已正式应用');
+      expect(container.querySelector('[data-testid="import-pending-warning"]')).not.toBeNull();
+      expect(
+        container.querySelector('[data-testid="options-save-status"]')?.textContent,
+      ).toContain('保存失败');
+    } finally {
+      (globalThis as Record<string, unknown>).chrome = origChrome;
+    }
+  });
+
+  it('blocks requestProviderTest when pre-test channel save rejects on ProvidersTab', async () => {
+    const origChrome = (globalThis as Record<string, unknown>).chrome;
+    const storedCfg = createDefaultMarginConfig();
+    storedCfg.providers['openai-race'] = {
+      ...storedCfg.providers['google-free'],
+      id: 'openai-race',
+      name: 'OpenAI Race',
+      preset: 'openai',
+      protocol: 'openai-chat',
+      baseUrl: 'https://api.openai.com/v1/chat/completions',
+      apiKeys: ['sk-init'],
+      model: 'gpt-6-luna',
+      models: ['gpt-6-luna'],
+      assistantId: 'builtin-yaml',
+    };
+    storedCfg.providerOrder = ['openai-race'];
+    storedCfg.routing.webpage = 'openai-race';
+
+    const runtimeSendSpy = vi.fn(async () => ({ ok: true }));
+
+    (globalThis as Record<string, unknown>).chrome = {
+      storage: {
+        local: {
+          get: async (key: string) =>
+            key === 'margin:config:v2'
+              ? { [key]: structuredClone(storedCfg) }
+              : {},
+          set: async () => {
+            throw new Error('QUOTA_BYTES quota exceeded');
+          },
+        },
+        onChanged: {
+          addListener: () => {},
+          removeListener: () => {},
+        },
+      },
+      runtime: {
+        sendMessage: runtimeSendSpy,
+      },
+    };
+
+    try {
+      await act(async () => {
+        render(<OptionsApp initialTab="providers" />, container);
+      });
+      await flushMicrotasks();
+
+      // Make provider dirty so onEnsureSavedBeforeTest runs commitConfigSave (which rejects)
+      const modelInput = container.querySelector(
+        'input.mp-model-main',
+      ) as HTMLInputElement;
+      await act(async () => {
+        modelInput.value = 'gpt-6-luna-v2';
+        modelInput.dispatchEvent(new Event('input', { bubbles: true }));
+      });
+      runtimeSendSpy.mockClear();
+
+      const testBtn = container.querySelector(
+        '[data-testid="provider-test-btn"]',
+      ) as HTMLButtonElement;
+      await act(async () => {
+        testBtn.click();
+      });
+      await flushMicrotasks();
+
+      expect(runtimeSendSpy).not.toHaveBeenCalledWith(
+        expect.objectContaining({ type: 'margin:test-provider' }),
+      );
+      expect(
+        container.querySelector('[data-testid="provider-test-result"]')?.textContent,
+      ).toContain('无法在连通测试前保存渠道配置');
+      expect(
+        container.querySelector('[data-testid="options-save-status"]')?.textContent,
+      ).toContain('保存失败');
+    } finally {
+      (globalThis as Record<string, unknown>).chrome = origChrome;
+    }
   });
 });

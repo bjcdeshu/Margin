@@ -12,6 +12,7 @@ import {
   makeCapabilityKey,
   normalizeTemperaturePolicy,
   resolveEffectiveTemperature,
+  shouldStripTemperatureAndRetry,
 } from '@shared/temperature';
 import type { AssistantConfig, ProviderConfig } from '@shared/types';
 
@@ -438,7 +439,112 @@ describe('4-Defense Temperature Engine & All 5 Legacy Bug Scenarios', () => {
     );
     expect(capturedHeaders['anthropic-version']).toBe('2023-06-01');
     expect(typeof capturedAnthropicBody.system).toBe('string');
-    expect(capturedAnthropicBody.max_tokens).toBe(4096);
+    expect(capturedAnthropicBody.max_tokens).toBe(8192);
     expect(capturedAnthropicBody.temperature).toBe(0.2);
+  });
+
+  it('does NOT misclassify reasoning_effort / thinking unsupported_parameter 400s as temperature errors or poison supportsTemperature', async () => {
+    expect(
+      shouldStripTemperatureAndRetry(
+        400,
+        JSON.stringify({
+          error: {
+            code: 'unsupported_parameter',
+            param: 'reasoning_effort',
+            message:
+              "Unsupported parameter: 'reasoning_effort' is not supported with this model.",
+          },
+        }),
+        true,
+      ),
+    ).toBe(false);
+    expect(
+      shouldStripTemperatureAndRetry(
+        400,
+        JSON.stringify({
+          error: {
+            code: 'unsupported_value',
+            param: 'thinking',
+            message: "Unsupported value for 'thinking'.",
+          },
+        }),
+        true,
+      ),
+    ).toBe(false);
+    expect(
+      shouldStripTemperatureAndRetry(
+        400,
+        JSON.stringify({
+          error: {
+            code: 'unsupported_value',
+            param: 'temperature',
+            message:
+              "Unsupported value: 'temperature' does not support 0.3 with this model. Only the default (1) value is supported.",
+          },
+        }),
+        true,
+      ),
+    ).toBe(true);
+
+    const capturedBodies: Array<Record<string, unknown>> = [];
+    const fetchMock = vi.fn(async (_u: RequestInfo | URL, init?: RequestInit) => {
+      const parsed = JSON.parse(String(init?.body ?? '{}')) as Record<
+        string,
+        unknown
+      >;
+      capturedBodies.push(parsed);
+      if (capturedBodies.length === 1) {
+        return jsonResponse(
+          {
+            error: {
+              code: 'unsupported_parameter',
+              param: 'reasoning_effort',
+              message:
+                "Unsupported parameter: 'reasoning_effort' is not supported with this gateway model.",
+            },
+          },
+          400,
+        );
+      }
+      return jsonResponse({
+        choices: [
+          {
+            finish_reason: 'stop',
+            message: { content: '<yaml>\n- id: 1\n  trans: 保持温度参数\n</yaml>' },
+          },
+        ],
+      });
+    });
+
+    const provider = createMockOpenAiProvider({
+      model: 'gpt-6-luna',
+      temperaturePolicy: { mode: 'custom', value: 0.3, forceOnReasoning: true },
+      thinkingPolicy: { mode: 'enabled' },
+    });
+
+    const res = await executeBatchWithProvider({
+      scene: 'webpage',
+      provider,
+      assistant: aloxafAssistant,
+      fromLang: 'en',
+      toLang: 'zh-CN',
+      items: [{ id: 1, text: 'Keep temperature intact' }],
+      fetchImpl: fetchMock as unknown as typeof fetch,
+      pool: new ProviderExecutionPool(),
+    });
+
+    expect(res.ok).toBe(true);
+    expect(capturedBodies).toHaveLength(2);
+    expect(capturedBodies[0]).toMatchObject({
+      temperature: 0.3,
+      reasoning_effort: 'medium',
+    });
+    expect(capturedBodies[1].temperature).toBe(0.3);
+    expect(capturedBodies[1]).not.toHaveProperty('reasoning_effort');
+
+    const cache = await getCapabilityCache();
+    const capKey = makeCapabilityKey(provider.baseUrl, provider.model);
+    expect(cache[capKey]?.supportsReasoningEffort).toBe(false);
+    expect(cache[capKey]?.supportsTemperature).toBeUndefined();
   });
 });

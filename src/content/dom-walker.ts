@@ -328,11 +328,36 @@ export interface ExtractBlocksOptions {
  * (unwrapping Margin's reversible target-only source wrapper when active).
  */
 export function getBlockSourceContainer(blockEl: Element): Element {
-  for (let i = 0; i < blockEl.children.length; i++) {
-    const child = blockEl.children[i];
-    if (child.getAttribute('data-margin-orig-wrap') === 'true') {
-      return child;
+  let wrapperChild: Element | null = null;
+  let wrapperCount = 0;
+  let hasOtherSourceNode = false;
+  for (let i = 0; i < blockEl.childNodes.length; i++) {
+    const node = blockEl.childNodes[i];
+    if (node.nodeType === 3 /* Node.TEXT_NODE */) {
+      if ((node.nodeValue ?? '').trim().length > 0) {
+        hasOtherSourceNode = true;
+      }
+      continue;
     }
+    if (node.nodeType !== 1 /* Node.ELEMENT_NODE */) {
+      continue;
+    }
+    const child = node as Element;
+    if (child.getAttribute('data-margin-orig-wrap') === 'true') {
+      wrapperChild = child;
+      wrapperCount += 1;
+      continue;
+    }
+    if (
+      child.hasAttribute('data-margin-injected') ||
+      child.hasAttribute('data-margin-host')
+    ) {
+      continue;
+    }
+    hasOtherSourceNode = true;
+  }
+  if (wrapperCount === 1 && !hasOtherSourceNode && wrapperChild) {
+    return wrapperChild;
   }
   return blockEl;
 }
@@ -737,9 +762,14 @@ export function hasNestedBlockChildren(el: Element): boolean {
       const child = parent.children[i];
       if (
         child.hasAttribute('data-margin-injected') ||
-        child.hasAttribute('data-margin-host') ||
-        child.getAttribute('data-margin-orig-wrap') === 'true'
+        child.hasAttribute('data-margin-host')
       ) {
+        continue;
+      }
+      if (child.getAttribute('data-margin-orig-wrap') === 'true') {
+        if (inspectChildren(child)) {
+          return true;
+        }
         continue;
       }
       if (isAtomicInlineElement(child, { insideParagraph: true })) {
@@ -811,6 +841,12 @@ export function collectTranslatableProse(el: Element): string {
       elem.hasAttribute('data-margin-injected') ||
       elem.hasAttribute('data-margin-host')
     ) {
+      return;
+    }
+    if (!isRoot && elem.getAttribute('data-margin-orig-wrap') === 'true') {
+      for (let i = 0; i < elem.childNodes.length; i++) {
+        walk(elem.childNodes[i], false);
+      }
       return;
     }
     if (!isRoot) {
@@ -888,6 +924,17 @@ function hasDirectBareNonWhitespaceText(el: Element): boolean {
     if (node.nodeType === Node.TEXT_NODE && node.nodeValue?.trim()) {
       return true;
     }
+    if (
+      node.nodeType === Node.ELEMENT_NODE &&
+      (node as Element).getAttribute('data-margin-orig-wrap') === 'true'
+    ) {
+      for (let j = 0; j < node.childNodes.length; j++) {
+        const inner = node.childNodes[j];
+        if (inner.nodeType === Node.TEXT_NODE && inner.nodeValue?.trim()) {
+          return true;
+        }
+      }
+    }
   }
   return false;
 }
@@ -902,14 +949,18 @@ function inspectDirectInlineChildren(el: Element): DirectInlineChildSummary {
   let nonMarginElementCount = 0;
   const inlineProseChildren: Element[] = [];
 
-  for (let i = 0; i < sourceContainer.children.length; i++) {
-    const child = sourceContainer.children[i];
+  const inspectChild = (child: Element): void => {
     if (
       child.hasAttribute('data-margin-injected') ||
-      child.hasAttribute('data-margin-host') ||
-      child.getAttribute('data-margin-orig-wrap') === 'true'
+      child.hasAttribute('data-margin-host')
     ) {
-      continue;
+      return;
+    }
+    if (child.getAttribute('data-margin-orig-wrap') === 'true') {
+      for (let j = 0; j < child.children.length; j++) {
+        inspectChild(child.children[j]);
+      }
+      return;
     }
     nonMarginElementCount += 1;
 
@@ -917,12 +968,16 @@ function inspectDirectInlineChildren(el: Element): DirectInlineChildSummary {
       isExcludedElement(child) ||
       isAtomicInlineElement(child, { insideParagraph: false })
     ) {
-      continue;
+      return;
     }
     const childTag = child.tagName.toUpperCase();
     if (!BLOCK_BOUNDARY_TAGS.has(childTag) && !hasNestedBlockChildren(child)) {
       inlineProseChildren.push(child);
     }
+  };
+
+  for (let i = 0; i < sourceContainer.children.length; i++) {
+    inspectChild(sourceContainer.children[i]);
   }
 
   return { nonMarginElementCount, inlineProseChildren };

@@ -1,5 +1,6 @@
 import { BRAND } from '@shared/brand';
 import { getMarginConfig } from '@shared/storage';
+import { sweepOrphanedDnrSessionRules } from './dnr-image';
 import {
   attachStreamTranslationPort,
   dispatchShortcutCommand,
@@ -17,28 +18,66 @@ export * from './router';
 
 let listenersInitialized = false;
 
+export function isUntrustedExternalSender(
+  sender?: chrome.runtime.MessageSender,
+): boolean {
+  const runtimeId =
+    typeof globalThis.chrome !== 'undefined'
+      ? globalThis.chrome?.runtime?.id
+      : undefined;
+  if (!runtimeId) {
+    return false;
+  }
+  if (sender?.id && sender.id !== runtimeId) {
+    return true;
+  }
+  if (
+    sender &&
+    !sender.id &&
+    typeof sender.origin === 'string' &&
+    sender.origin !== '' &&
+    !sender.origin.startsWith(`chrome-extension://${runtimeId}`)
+  ) {
+    return true;
+  }
+  return false;
+}
+
+export function resetBackgroundServiceWorkerForTests(): void {
+  listenersInitialized = false;
+}
+
 export function initializeBackgroundServiceWorker(): void {
   if (listenersInitialized || typeof globalThis.chrome === 'undefined') {
     return;
   }
   listenersInitialized = true;
 
+  void sweepOrphanedDnrSessionRules();
+
   if (chrome.runtime?.onInstalled) {
     chrome.runtime.onInstalled.addListener(() => {
       void getMarginConfig();
+      void sweepOrphanedDnrSessionRules();
       registerContextMenus();
-      console.info(`[${BRAND.name}] Service worker initialized (${BRAND.version})`);
+      console.info(
+        `[${BRAND.name}] Service worker initialized (${BRAND.version})`,
+      );
     });
   }
 
   if (chrome.runtime?.onStartup) {
     chrome.runtime.onStartup.addListener(() => {
+      void sweepOrphanedDnrSessionRules();
       registerContextMenus();
     });
   }
 
   if (chrome.runtime?.onMessage) {
-    chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+    chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+      if (isUntrustedExternalSender(sender)) {
+        return false;
+      }
       if (!isRuntimeRpcRequest(message)) {
         return false;
       }
@@ -63,6 +102,14 @@ export function initializeBackgroundServiceWorker(): void {
 
   if (chrome.runtime?.onConnect) {
     chrome.runtime.onConnect.addListener((port) => {
+      if (isUntrustedExternalSender(port.sender)) {
+        try {
+          port.disconnect();
+        } catch {
+          // Ignore disconnect errors on untrusted ports
+        }
+        return;
+      }
       attachStreamTranslationPort(port);
     });
   }

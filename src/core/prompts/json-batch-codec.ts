@@ -76,6 +76,78 @@ interface RawJsonBatchEntry {
   trans: string;
 }
 
+const TRANS_FIELD_NAMES = new Set(['trans', 'translation', 'target', 'text']);
+
+function extractEntryFromObjectRecord(
+  rec: Record<string, unknown>,
+): RawJsonBatchEntry | null {
+  const id =
+    typeof rec.id === 'number'
+      ? rec.id
+      : Number.parseInt(String(rec.id ?? ''), 10);
+  const trans = rec.trans ?? rec.translation ?? rec.target ?? rec.text;
+  if (Number.isFinite(id) && typeof trans === 'string') {
+    return { id, trans };
+  }
+  return null;
+}
+
+function scanJsonObjectsInStream(text: string): {
+  completeObjects: string[];
+  trailingUnclosedObject: string | null;
+} {
+  const completeObjects: string[] = [];
+  const braceStack: number[] = [];
+  let inString = false;
+  let escaped = false;
+
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (ch === '\\') {
+        escaped = true;
+      } else if (ch === '"') {
+        inString = false;
+      }
+      continue;
+    }
+
+    if (ch === '"') {
+      inString = true;
+    } else if (ch === '{') {
+      braceStack.push(i);
+    } else if (ch === '}') {
+      const startIdx = braceStack.pop();
+      if (startIdx !== undefined) {
+        completeObjects.push(text.slice(startIdx, i + 1));
+      }
+    }
+  }
+
+  const trailingUnclosedObject =
+    braceStack.length > 0 ? text.slice(braceStack[braceStack.length - 1]) : null;
+
+  return { completeObjects, trailingUnclosedObject };
+}
+
+export function stripIncompleteTrailingJsonEscape(rawBody: string): string {
+  // Trailing run of backslashes: only strip 1 backslash when the run has odd length
+  const trailingSlashes = /\\+$/.exec(rawBody);
+  if (trailingSlashes) {
+    return trailingSlashes[0].length % 2 === 1 ? rawBody.slice(0, -1) : rawBody;
+  }
+
+  // Incomplete `\uXXXX` escape (`\u`, `\u0`, `\u00`, `\u004`): only strip when preceded by an odd number of backslashes
+  const incompleteUnicode = /(\\+)(u[0-9a-fA-F]{0,3})$/.exec(rawBody);
+  if (incompleteUnicode && incompleteUnicode[1].length % 2 === 1) {
+    return rawBody.slice(0, -(1 + incompleteUnicode[2].length));
+  }
+
+  return rawBody;
+}
+
 function parseJsonBatchEntries(cleaned: string): RawJsonBatchEntry[] {
   if (!cleaned) return [];
 
@@ -93,32 +165,31 @@ function parseJsonBatchEntries(cleaned: string): RawJsonBatchEntry[] {
       const entries: RawJsonBatchEntry[] = [];
       for (const item of list) {
         if (!item || typeof item !== 'object') continue;
-        const rec = item as Record<string, unknown>;
-        const id =
-          typeof rec.id === 'number'
-            ? rec.id
-            : Number.parseInt(String(rec.id ?? ''), 10);
-        const trans = rec.trans ?? rec.translation ?? rec.target ?? rec.text;
-        if (Number.isFinite(id) && typeof trans === 'string') {
-          entries.push({ id, trans });
+        const entry = extractEntryFromObjectRecord(
+          item as Record<string, unknown>,
+        );
+        if (entry) {
+          entries.push(entry);
         }
       }
       if (entries.length > 0) return entries;
     }
   } catch {
-    // Fall through to object-level regex recovery for partial/streaming JSON
+    // Fall through to object-level recovery for partial/streaming JSON
   }
 
+  const { completeObjects } = scanJsonObjectsInStream(cleaned);
   const recovered: RawJsonBatchEntry[] = [];
-  const objRe =
-    /\{\s*"id"\s*:\s*"?(\d+)"?\s*,\s*"(?:trans|translation|target)"\s*:\s*("(?:\\.|[^"\\])*")\s*\}/g;
-  let m: RegExpExecArray | null;
-  while ((m = objRe.exec(cleaned)) !== null) {
-    const id = Number.parseInt(m[1], 10);
+  for (const objStr of completeObjects) {
     try {
-      const trans = JSON.parse(m[2]) as string;
-      if (Number.isFinite(id)) {
-        recovered.push({ id, trans });
+      const parsedObj = JSON.parse(objStr) as unknown;
+      if (parsedObj && typeof parsedObj === 'object' && !Array.isArray(parsedObj)) {
+        const entry = extractEntryFromObjectRecord(
+          parsedObj as Record<string, unknown>,
+        );
+        if (entry) {
+          recovered.push(entry);
+        }
       }
     } catch {
       // Skip malformed partial entry
@@ -127,25 +198,159 @@ function parseJsonBatchEntries(cleaned: string): RawJsonBatchEntry[] {
   return recovered;
 }
 
+function readJsonStringToken(
+  src: string,
+  openQuoteIdx: number,
+): { closed: boolean; rawContent: string; nextIdx: number } {
+  let escaped = false;
+  for (let i = openQuoteIdx + 1; i < src.length; i++) {
+    const ch = src[i];
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+    if (ch === '\\') {
+      escaped = true;
+      continue;
+    }
+    if (ch === '"') {
+      return {
+        closed: true,
+        rawContent: src.slice(openQuoteIdx + 1, i),
+        nextIdx: i + 1,
+      };
+    }
+  }
+  return {
+    closed: false,
+    rawContent: src.slice(openQuoteIdx + 1),
+    nextIdx: src.length,
+  };
+}
+
+function skipCompleteJsonValue(src: string, startIdx: number): number | null {
+  let i = startIdx;
+  while (i < src.length && /\s/.test(src[i])) i++;
+  if (i >= src.length) return null;
+
+  const ch = src[i];
+  if (ch === '"') {
+    const strTok = readJsonStringToken(src, i);
+    return strTok.closed ? strTok.nextIdx : null;
+  }
+  if (ch === '{' || ch === '[') {
+    let depth = 0;
+    let inStr = false;
+    let esc = false;
+    for (let j = i; j < src.length; j++) {
+      const c = src[j];
+      if (inStr) {
+        if (esc) esc = false;
+        else if (c === '\\') esc = true;
+        else if (c === '"') inStr = false;
+        continue;
+      }
+      if (c === '"') inStr = true;
+      else if (c === '{' || c === '[') depth++;
+      else if (c === '}' || c === ']') {
+        depth--;
+        if (depth === 0) return j + 1;
+      }
+    }
+    return null;
+  }
+
+  // Primitive value (number, true, false, null): ends at `,` or whitespace before `,`
+  let j = i;
+  while (j < src.length && !/[,}\]\s]/.test(src[j])) {
+    j++;
+  }
+  return j > i ? j : null;
+}
+
 function extractTrailingPartialJsonEntry(
   visible: string,
 ): RawJsonBatchEntry | null {
-  const m =
-    /\{\s*"id"\s*:\s*"?(\d+)"?\s*,\s*"(?:trans|translation|target)"\s*:\s*"((?:\\.|[^"\\])*(?:\\)?)$/.exec(
-      visible,
-    );
-  if (!m) return null;
-  const id = Number.parseInt(m[1], 10);
-  if (!Number.isFinite(id)) return null;
-
-  // Strip trailing incomplete escape (`\` or `\u00`) so JSON.parse succeeds cleanly mid-string
-  const safeBody = m[2].replace(/\\(?:u[0-9a-fA-F]{0,3})?$/, '');
-  try {
-    const trans = JSON.parse(`"${safeBody}"`) as string;
-    return { id, trans };
-  } catch {
+  const { trailingUnclosedObject } = scanJsonObjectsInStream(visible);
+  if (!trailingUnclosedObject || !trailingUnclosedObject.startsWith('{')) {
     return null;
   }
+
+  let foundId: number | null = null;
+  let foundTrans: string | null = null;
+
+  let idx = 1; // skip opening `{`
+  const len = trailingUnclosedObject.length;
+
+  while (idx < len) {
+    while (idx < len && /[\s,]/.test(trailingUnclosedObject[idx])) idx++;
+    if (idx >= len || trailingUnclosedObject[idx] !== '"') break;
+
+    const keyTok = readJsonStringToken(trailingUnclosedObject, idx);
+    if (!keyTok.closed) break;
+    let keyName: string;
+    try {
+      keyName = JSON.parse(`"${keyTok.rawContent}"`) as string;
+    } catch {
+      break;
+    }
+    idx = keyTok.nextIdx;
+
+    while (idx < len && /\s/.test(trailingUnclosedObject[idx])) idx++;
+    if (idx >= len || trailingUnclosedObject[idx] !== ':') break;
+    idx++;
+    while (idx < len && /\s/.test(trailingUnclosedObject[idx])) idx++;
+    if (idx >= len) break;
+
+    if (keyName === 'id') {
+      if (trailingUnclosedObject[idx] === '"') {
+        const idStrTok = readJsonStringToken(trailingUnclosedObject, idx);
+        if (!idStrTok.closed) break;
+        const parsedId = Number.parseInt(idStrTok.rawContent, 10);
+        if (Number.isFinite(parsedId)) {
+          foundId = parsedId;
+        }
+        idx = idStrTok.nextIdx;
+      } else {
+        const numMatch = /^(\d+)/.exec(trailingUnclosedObject.slice(idx));
+        if (!numMatch) break;
+        const parsedId = Number.parseInt(numMatch[1], 10);
+        if (Number.isFinite(parsedId)) {
+          foundId = parsedId;
+        }
+        idx += numMatch[1].length;
+      }
+      continue;
+    }
+
+    if (TRANS_FIELD_NAMES.has(keyName) && trailingUnclosedObject[idx] === '"') {
+      const valTok = readJsonStringToken(trailingUnclosedObject, idx);
+      const safeBody = valTok.closed
+        ? valTok.rawContent
+        : stripIncompleteTrailingJsonEscape(valTok.rawContent);
+      try {
+        foundTrans = JSON.parse(`"${safeBody}"`) as string;
+      } catch {
+        return null;
+      }
+      if (!valTok.closed) {
+        break;
+      }
+      idx = valTok.nextIdx;
+      continue;
+    }
+
+    const nextIdx = skipCompleteJsonValue(trailingUnclosedObject, idx);
+    if (nextIdx === null) {
+      break;
+    }
+    idx = nextIdx;
+  }
+
+  if (foundId !== null && Number.isFinite(foundId) && foundTrans !== null) {
+    return { id: foundId, trans: foundTrans };
+  }
+  return null;
 }
 
 function alignJsonEntries(

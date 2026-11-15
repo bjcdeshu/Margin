@@ -86,6 +86,8 @@ export function OptionsApp({ initialTab }: OptionsAppProps = {}) {
   const trackerRef = useRef(createSaveTracker());
   const draftRef = useRef(draft);
   draftRef.current = draft;
+  const draftRevisionRef = useRef(0);
+  const activeSaveRevRef = useRef(0);
   const hydratedRef = useRef(hydrated);
   hydratedRef.current = hydrated;
   const pendingFlushRef = useRef<(() => void) | null>(null);
@@ -120,7 +122,11 @@ export function OptionsApp({ initialTab }: OptionsAppProps = {}) {
       const wasDirtyBeforeSync = tracker.isDirty(draftRef.current);
       const matchedUserSave = tracker.observePersisted(incoming);
       setPersistedBaseline(structuredClone(incoming));
-      if (matchedUserSave || !wasDirtyBeforeSync) {
+      const canApplyMatchedSave =
+        matchedUserSave && draftRevisionRef.current === activeSaveRevRef.current;
+      const canApplyExternalSync =
+        !matchedUserSave && !wasDirtyBeforeSync && !tracker.getSnapshot().saving;
+      if (canApplyMatchedSave || canApplyExternalSync) {
         const nextClone = structuredClone(incoming);
         draftRef.current = nextClone;
         setDraft(nextClone);
@@ -137,6 +143,7 @@ export function OptionsApp({ initialTab }: OptionsAppProps = {}) {
 
   const mutateDraft = useCallback((mutator: (next: MarginConfig) => void) => {
     if (!hydratedRef.current) return;
+    draftRevisionRef.current += 1;
     const next = structuredClone(draftRef.current);
     mutator(next);
     draftRef.current = next;
@@ -145,35 +152,59 @@ export function OptionsApp({ initialTab }: OptionsAppProps = {}) {
 
   const isDirty = hydrated && trackerRef.current.isDirty(draft);
 
-  const commitConfigSave = useCallback(async (targetConfig: MarginConfig) => {
-    if (!hydratedRef.current) return;
-    const normalized = trackerRef.current.beginUserSave(targetConfig);
-    draftRef.current = normalized;
-    setDraft(normalized);
-
-    try {
-      await saveMarginConfig(normalized);
-      const persisted = await getMarginConfig();
-      const confirmedLatest = trackerRef.current.observePersisted(persisted);
-      if (confirmedLatest) {
-        const synced = structuredClone(persisted);
-        setPersistedBaseline(structuredClone(persisted));
-        draftRef.current = synced;
-        setDraft(synced);
+  const commitConfigSave = useCallback(
+    async (
+      targetConfig: MarginConfig,
+      options?: { replaceDraft?: boolean },
+    ): Promise<boolean> => {
+      if (!hydratedRef.current) return false;
+      const prevDraft = structuredClone(draftRef.current);
+      const normalized = trackerRef.current.beginUserSave(targetConfig);
+      if (options?.replaceDraft) {
+        draftRevisionRef.current += 1;
       }
-    } catch (err) {
-      trackerRef.current.failSave(err instanceof Error ? err.message : String(err));
-    }
-  }, []);
+      const revAtSaveStart = draftRevisionRef.current;
+      activeSaveRevRef.current = revAtSaveStart;
+
+      if (options?.replaceDraft || draftRevisionRef.current === revAtSaveStart) {
+        draftRef.current = normalized;
+        setDraft(normalized);
+      }
+
+      try {
+        await saveMarginConfig(normalized);
+        const persisted = await getMarginConfig();
+        const confirmedLatest = trackerRef.current.observePersisted(persisted);
+        setPersistedBaseline(structuredClone(persisted));
+        if (confirmedLatest && draftRevisionRef.current === revAtSaveStart) {
+          const synced = structuredClone(persisted);
+          draftRef.current = synced;
+          setDraft(synced);
+        }
+        return true;
+      } catch (err) {
+        if (options?.replaceDraft && draftRevisionRef.current === revAtSaveStart) {
+          draftRef.current = prevDraft;
+          setDraft(prevDraft);
+        }
+        if (activeSaveRevRef.current === revAtSaveStart) {
+          trackerRef.current.failSave(err instanceof Error ? err.message : String(err));
+        }
+        return false;
+      }
+    },
+    [],
+  );
 
   const handleSaveChanges = useCallback(async () => {
-    if (!hydratedRef.current) return;
+    if (!hydratedRef.current) return false;
     pendingFlushRef.current?.();
-    await commitConfigSave(draftRef.current);
+    return commitConfigSave(draftRef.current);
   }, [commitConfigSave]);
 
   const handleRevertDraft = () => {
     if (!persistedBaseline) return;
+    draftRevisionRef.current += 1;
     const reverted = structuredClone(persistedBaseline);
     draftRef.current = reverted;
     setDraft(reverted);
@@ -373,8 +404,9 @@ export function OptionsApp({ initialTab }: OptionsAppProps = {}) {
             onEnsureSavedBeforeTest={async () => {
               pendingFlushRef.current?.();
               if (trackerRef.current.isDirty(draftRef.current)) {
-                await commitConfigSave(draftRef.current);
+                return commitConfigSave(draftRef.current);
               }
+              return true;
             }}
           />
         ) : null}
@@ -391,8 +423,9 @@ export function OptionsApp({ initialTab }: OptionsAppProps = {}) {
             onEnsureSavedBeforeTest={async () => {
               pendingFlushRef.current?.();
               if (trackerRef.current.isDirty(draftRef.current)) {
-                await commitConfigSave(draftRef.current);
+                return commitConfigSave(draftRef.current);
               }
+              return true;
             }}
           />
         ) : null}
@@ -408,9 +441,9 @@ export function OptionsApp({ initialTab }: OptionsAppProps = {}) {
             onRefreshCapabilityCache={setCapabilityCache}
             stagedImport={stagedImport}
             onStagedImportChange={setStagedImport}
-            onApplyImportedConfig={async (importedConfig) => {
-              await commitConfigSave(importedConfig);
-            }}
+            onApplyImportedConfig={(importedConfig) =>
+              commitConfigSave(importedConfig, { replaceDraft: true })
+            }
           />
         ) : null}
       </PaperShell>

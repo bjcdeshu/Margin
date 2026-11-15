@@ -36,7 +36,7 @@ export interface MigrationDiagnosticsTabProps {
   draft: MarginConfig;
   capabilityCache: ModelCapabilityMap;
   onRefreshCapabilityCache: (next: ModelCapabilityMap) => void;
-  onApplyImportedConfig: (importedConfig: MarginConfig) => Promise<void>;
+  onApplyImportedConfig: (importedConfig: MarginConfig) => Promise<boolean>;
   stagedImport?: StagedMigrationState;
   onStagedImportChange?: (
     updater:
@@ -155,7 +155,8 @@ export function MigrationDiagnosticsTab({
 
   const handleConfirmApplyImport = async () => {
     if (!importPreview) return;
-    await onApplyImportedConfig(importPreview.config);
+    const ok = await onApplyImportedConfig(importPreview.config);
+    if (!ok) return;
     updateStaged((prev) => ({
       ...prev,
       importApplied: true,
@@ -258,9 +259,13 @@ export function MigrationDiagnosticsTab({
       : undefined;
 
   const en = lang === 'en';
-  const capabilityCount = Object.keys(capabilityCache).length;
-  const okCount = diagnostics.filter((snap) => snap.kind === 'ok').length;
-  const latencySamples = diagnostics
+  const safeDiagnostics = Array.isArray(diagnostics) ? diagnostics : [];
+  const capabilityCount =
+    capabilityCache && typeof capabilityCache === 'object'
+      ? Object.keys(capabilityCache).length
+      : 0;
+  const okCount = safeDiagnostics.filter((snap) => snap.kind === 'ok').length;
+  const latencySamples = safeDiagnostics
     .map((snap) => snap.latencyMs)
     .filter((ms): ms is number => typeof ms === 'number' && Number.isFinite(ms));
   const medianLatency =
@@ -609,12 +614,12 @@ export function MigrationDiagnosticsTab({
 
         <div class="mp-card mp-diag-card">
           <div class="mp-metric-grid">
-            <Metric icon="pulse" label={en ? 'Snapshots' : '诊断快照'} value={diagnostics.length} />
+            <Metric icon="pulse" label={en ? 'Snapshots' : '诊断快照'} value={safeDiagnostics.length} />
             <Metric
               icon="check"
               label={en ? 'Succeeded' : '成功'}
               value={okCount}
-              unit={diagnostics.length > 0 ? `/ ${diagnostics.length}` : undefined}
+              unit={safeDiagnostics.length > 0 ? `/ ${safeDiagnostics.length}` : undefined}
             />
             <Metric
               icon="bolt"
@@ -662,7 +667,7 @@ export function MigrationDiagnosticsTab({
           <div class="mp-editorial-note mp-editorial-note--ok">{diagNotice}</div>
         ) : null}
 
-        {diagnostics.length === 0 ? (
+        {safeDiagnostics.length === 0 ? (
           <div class="mp-diag-empty">
             <EmptyState title={en ? 'No diagnostic entries recorded yet.' : '暂无最近诊断记录'}>
               {en
@@ -672,7 +677,7 @@ export function MigrationDiagnosticsTab({
           </div>
         ) : (
           <div class="mp-flat-list mp-diag-list">
-            {diagnostics.map((snap, idx) => (
+            {safeDiagnostics.map((snap, idx) => (
               <div key={`${snap.time}-${idx}`} class="mp-flat-item mp-diag-row">
                 <span
                   class={snap.kind === 'ok' ? 'mp-diag-dot mp-diag-dot--ok' : 'mp-diag-dot mp-diag-dot--danger'}

@@ -486,7 +486,7 @@ export type RuntimeRpcResponse =
   | { ok: boolean; error?: string };
 
 export type TabCommandMessage =
-  | { type: 'margin:cmd:toggle-page' }
+  | { type: 'margin:cmd:toggle-page'; targetActive?: boolean }
   | { type: 'margin:cmd:translate-whole-page' }
   | { type: 'margin:cmd:toggle-mask' }
   | { type: 'margin:cmd:translate-input' }

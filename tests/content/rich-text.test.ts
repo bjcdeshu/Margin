@@ -195,6 +195,31 @@ describe('rich-text: <mN> tokenizer, zero-innerHTML reconstructor & per-item fal
     );
   });
 
+  it('preserves valid atomic <mN/> inline code & math clones when sibling formatting tags fall back in reconstructRichDom', () => {
+    const p = document.createElement('p');
+    p.innerHTML =
+      'Run <code>npx vitest</code> to verify <strong>all assertions</strong> against <span class="katex"><span class="katex-html">O(n)</span></span>.';
+    document.body.appendChild(p);
+
+    const tokenized = tokenizeParagraph(p);
+    expect(tokenized.text).toBe(
+      'Run <m0/> to verify <m1>all assertions</m1> against <m2/>.',
+    );
+
+    // LLM forgot closing </m1>, causing rich-tag validation fallback — atomic <m0/> and <m2/> MUST still hydrate!
+    const mangled = '运行 <m0/> 以验证 <m1>全部断言 符合 <m2></m2> 复杂度。';
+    const result = reconstructRichDom(mangled, tokenized, document);
+    expect(result.fallbackPlain).toBe(true);
+
+    const out = document.createElement('div');
+    out.appendChild(result.fragment);
+    expect(out.querySelector('code')?.textContent).toBe('npx vitest');
+    expect(out.querySelector('.katex')?.textContent).toBe('O(n)');
+    expect(out.querySelector('strong')).toBeNull();
+    expect(out.textContent).toBe('运行 npx vitest 以验证 全部断言 符合 O(n) 复杂度。');
+    expect(out.textContent).not.toMatch(/<\/?m\d+/);
+  });
+
   it('preserves multi-paragraph newlines on pre-line/pre-wrap blocks while collapsing HTML indentation newlines on normal prose and skipping nested blocks/buttons', () => {
     const tweet = document.createElement('div');
     tweet.style.whiteSpace = 'pre-line';

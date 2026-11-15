@@ -1,4 +1,7 @@
-import { buildDiagnosticSnapshot } from '@core/diagnostics';
+import {
+  buildDiagnosticSnapshot,
+  sanitizeErrorText,
+} from '@core/diagnostics';
 import {
   computeMatchedGlossarySignature,
   resolveEffectiveGlossary,
@@ -18,6 +21,7 @@ import { appendDiagnosticSnapshot, getMarginConfig } from '@shared/storage';
 import type {
   BatchItemInput,
   BatchItemOutput,
+  DiagnosticSnapshot,
   MarginConfig,
   PageContextPayload,
   ProviderConfig,
@@ -84,13 +88,112 @@ const inFlightStreamListeners = new Map<
   Set<SingleflightStreamListener>
 >();
 
+interface SharedBatchAbort {
+  readonly signal: AbortSignal;
+  retain(callerSignal?: AbortSignal): (() => void) | null;
+  markSettled(): void;
+}
+
+interface ActiveFlightRecord {
+  key: string;
+  cache: TranslationLruCache;
+  epoch: number;
+  promise: Promise<SingleflightTranslationResult>;
+  listeners: Set<SingleflightStreamListener>;
+  batchAbort: SharedBatchAbort;
+}
+
+const inFlightRecords = new Map<string, ActiveFlightRecord>();
+
+class BatchUpstreamFailureError extends Error {
+  readonly batchError: NonNullable<ExecuteBatchResult['error']>;
+  readonly diagnostic: DiagnosticSnapshot;
+
+  constructor(
+    batchError: NonNullable<ExecuteBatchResult['error']>,
+    diagnostic: DiagnosticSnapshot,
+  ) {
+    super(batchError.message || 'Upstream batch translation failed.');
+    this.name = 'BatchUpstreamFailureError';
+    this.batchError = batchError;
+    this.diagnostic = diagnostic;
+  }
+}
+
 const WARMUP_ORIGIN_THROTTLE_MS = 45_000;
 const lastWarmupByOrigin = new Map<string, number>();
 
 export function resetRouterTransientStateForTests(): void {
   inFlightTranslations.clear();
   inFlightStreamListeners.clear();
+  inFlightRecords.clear();
   lastWarmupByOrigin.clear();
+}
+
+async function safeAppendDiagnosticSnapshot(
+  snapshot: DiagnosticSnapshot,
+): Promise<void> {
+  try {
+    await appendDiagnosticSnapshot(snapshot);
+  } catch {
+    // Best-effort telemetry: never fail live translations due to storage quota errors
+  }
+}
+
+function createSharedBatchAbort(): SharedBatchAbort {
+  const controller = new AbortController();
+  const consumers = new Map<symbol, () => void>();
+  let settled = false;
+
+  return {
+    get signal() {
+      return controller.signal;
+    },
+    retain(callerSignal?: AbortSignal): (() => void) | null {
+      if (settled || controller.signal.aborted || callerSignal?.aborted) {
+        return null;
+      }
+      const token = Symbol();
+      let cleanupCallerListener: (() => void) | undefined;
+
+      const release = () => {
+        if (!consumers.has(token)) return;
+        consumers.delete(token);
+        cleanupCallerListener?.();
+        cleanupCallerListener = undefined;
+        if (!settled && consumers.size === 0 && !controller.signal.aborted) {
+          controller.abort(
+            new DOMException('The operation was aborted.', 'AbortError'),
+          );
+        }
+      };
+
+      if (callerSignal) {
+        const onAbort = () => {
+          release();
+        };
+        callerSignal.addEventListener('abort', onAbort, { once: true });
+        cleanupCallerListener = () => {
+          callerSignal.removeEventListener('abort', onAbort);
+        };
+      }
+
+      consumers.set(token, () => {
+        cleanupCallerListener?.();
+        cleanupCallerListener = undefined;
+      });
+
+      return release;
+    },
+    markSettled() {
+      if (settled) return;
+      settled = true;
+      for (const cleanup of consumers.values()) {
+        cleanup();
+      }
+      consumers.clear();
+    },
+  };
 }
 
 function raceWithAbort<T>(
@@ -208,7 +311,7 @@ export async function handleTranslateBatch(
         request.providerId,
         explicit ? 'PROVIDER_DISABLED' : 'PROVIDER_NOT_FOUND',
       );
-      await appendDiagnosticSnapshot(missingResp.diagnostic);
+      await safeAppendDiagnosticSnapshot(missingResp.diagnostic);
       return missingResp;
     }
   }
@@ -226,17 +329,20 @@ export async function handleTranslateBatch(
       providerId,
       provider ? 'PROVIDER_DISABLED' : 'PROVIDER_NOT_FOUND',
     );
-    await appendDiagnosticSnapshot(missingResp.diagnostic);
+    await safeAppendDiagnosticSnapshot(missingResp.diagnostic);
     return missingResp;
   }
 
-  const assistant = provider.assistantId
-    ? config.assistants[provider.assistantId]
-    : undefined;
-  const codecId =
-    provider.protocol === 'deeplx' || provider.protocol === 'google-web'
-      ? 'single-text'
-      : (assistant?.codec ?? 'json-batch');
+  const isAiProtocol =
+    provider.protocol === 'openai-chat' ||
+    provider.protocol === 'anthropic-messages';
+  const assistant =
+    isAiProtocol && provider.assistantId
+      ? config.assistants[provider.assistantId]
+      : undefined;
+  const codecId = !isAiProtocol
+    ? 'single-text'
+    : (assistant?.codec ?? 'json-batch');
 
   const effectiveGlossary = resolveEffectiveGlossary(config);
   const configForRun: MarginConfig = {
@@ -244,13 +350,17 @@ export async function handleTranslateBatch(
     glossary: effectiveGlossary,
   };
   const effectiveContext = filterContextForProvider(provider, request.context);
-  const domainOrUrl = request.context?.domain || request.context?.url;
+  const domainOrUrl = request.context?.url || request.context?.domain;
   const effectiveStyleGuide = effectiveContext?.styleGuide;
   const promptFingerprint = computeAssistantPromptFingerprint(
     assistant,
     request.scene,
     codecId,
   );
+  const providerEndpoints =
+    provider.protocol === 'deeplx'
+      ? resolveDeepLXEndpoints(provider)
+      : resolveEndpointForProvider(provider);
 
   const cache = env.translationCache ?? backgroundTranslationCache;
   const useCache = shouldUseTranslationCache(request.scene);
@@ -293,7 +403,7 @@ export async function handleTranslateBatch(
       signal: env.signal,
     });
 
-    await appendDiagnosticSnapshot(directResult.diagnostic);
+    await safeAppendDiagnosticSnapshot(directResult.diagnostic);
 
     if (!directResult.ok) {
       return {
@@ -317,6 +427,7 @@ export async function handleTranslateBatch(
     };
   }
 
+  const cacheEpoch = cache.getClearEpoch();
   const resolvedOutputs = new Map<number, BatchItemOutput>();
   const cacheKeysByItemId = new Map<number, string>();
   const requestedKeys: string[] = [];
@@ -329,13 +440,18 @@ export async function handleTranslateBatch(
     );
     const key = makeTranslationCacheKey({
       providerId: provider.id,
+      protocol: provider.protocol,
+      endpoint: providerEndpoints,
       model: provider.model,
       assistantId: assistant?.id,
       codecId,
       scene: request.scene,
       fromLang: request.fromLang,
       toLang: request.toLang,
+      temperaturePolicy: provider.temperaturePolicy,
+      thinkingPolicy: provider.thinkingPolicy,
       matchedGlossarySig,
+      assistant,
       promptFingerprint,
       styleGuide: effectiveStyleGuide,
       sourceText: item.text,
@@ -345,7 +461,7 @@ export async function handleTranslateBatch(
   }
 
   // 1. L1 + IndexedDB cache lookup
-  const hitsMap = await cache.getMany(requestedKeys);
+  const hitsMap = await raceWithAbort(cache.getMany(requestedKeys), env.signal);
   const missGroupsByKey = new Map<string, BatchItemInput[]>();
 
   for (const item of request.items) {
@@ -365,6 +481,10 @@ export async function handleTranslateBatch(
     }
   }
 
+  const resolvedDiagEndpoint = Array.isArray(providerEndpoints)
+    ? (providerEndpoints[0] ?? provider.baseUrl)
+    : providerEndpoints;
+
   const buildSyntheticSuccessDiagnostic = () =>
     buildDiagnosticSnapshot({
       scene: request.scene,
@@ -373,7 +493,7 @@ export async function handleTranslateBatch(
         id: provider.id,
         preset: provider.preset,
         protocol: provider.protocol,
-        resolvedEndpoint: provider.baseUrl,
+        resolvedEndpoint: resolvedDiagEndpoint,
         model: provider.model,
       },
       parameters: {
@@ -403,11 +523,14 @@ export async function handleTranslateBatch(
     };
   }
 
-  // 2. Partition cache misses into Cross-Request Singleflight subscribers vs Intra-Batch deduplicated representatives
+  // 2. Cross-Request Singleflight with ref-counted shared abort & identity-guarded cleanup
   interface OwnedFlightEntry {
     key: string;
     representative: BatchItemInput;
     dupItems: BatchItemInput[];
+    promise: Promise<SingleflightTranslationResult>;
+    listeners: Set<SingleflightStreamListener>;
+    record: ActiveFlightRecord;
     resolve: (value: SingleflightTranslationResult) => void;
     reject: (reason?: unknown) => void;
   }
@@ -417,37 +540,24 @@ export async function handleTranslateBatch(
     dupItems: BatchItemInput[];
     promise: Promise<SingleflightTranslationResult>;
     unsubscribeStream?: () => void;
+    releaseAbort?: () => void;
   }
 
-  const registerOwnedGroups = (
-    groups: ReadonlyArray< readonly [string, BatchItemInput[]] >,
-  ): OwnedFlightEntry[] => {
-    const entries: OwnedFlightEntry[] = [];
-    for (const [key, dupItems] of groups) {
-      let resolveFn!: (value: SingleflightTranslationResult) => void;
-      let rejectFn!: (reason?: unknown) => void;
-      const promise = new Promise<SingleflightTranslationResult>((res, rej) => {
-        resolveFn = res;
-        rejectFn = rej;
-      });
-      // Prevent unhandled rejection warnings when 0 external requests subscribe to this key
-      promise.catch(() => undefined);
-
-      inFlightTranslations.set(key, promise);
-      inFlightStreamListeners.set(key, new Set());
-      entries.push({
-        key,
-        representative: dupItems[0],
-        dupItems,
-        resolve: resolveFn,
-        reject: rejectFn,
-      });
+  const cleanupOwnedEntryMaps = (entry: OwnedFlightEntry): void => {
+    if (inFlightTranslations.get(entry.key) === entry.promise) {
+      inFlightTranslations.delete(entry.key);
     }
-    return entries;
+    if (inFlightStreamListeners.get(entry.key) === entry.listeners) {
+      inFlightStreamListeners.delete(entry.key);
+    }
+    if (inFlightRecords.get(entry.key) === entry.record) {
+      inFlightRecords.delete(entry.key);
+    }
   };
 
   const executeOwnedEntries = async (
     ownedEntries: readonly OwnedFlightEntry[],
+    batchAbort: SharedBatchAbort,
   ): Promise<ExecuteBatchResult> => {
     const entryByRepId = new Map<number, OwnedFlightEntry>(
       ownedEntries.map((e) => [e.representative.id, e]),
@@ -466,7 +576,13 @@ export async function handleTranslateBatch(
         context: effectiveContext,
         glossary: configForRun.glossary,
         stream: streamCallbacks?.stream ?? false,
-        onDelta: streamCallbacks?.onDelta,
+        onDelta: streamCallbacks?.onDelta
+          ? (delta) => {
+              if (!env.signal?.aborted) {
+                streamCallbacks.onDelta?.(delta);
+              }
+            }
+          : undefined,
         onItemReady: (repItem) => {
           const entry = entryByRepId.get(repItem.id);
           if (!entry) return;
@@ -480,9 +596,8 @@ export async function handleTranslateBatch(
           }
 
           // Fan out to any cross-request singleflight stream subscribers
-          const listeners = inFlightStreamListeners.get(entry.key);
-          if (listeners && listeners.size > 0) {
-            for (const listener of listeners) {
+          if (entry.listeners.size > 0) {
+            for (const listener of entry.listeners) {
               listener({
                 trans: repItem.trans,
                 thinking: repItem.thinking,
@@ -497,18 +612,22 @@ export async function handleTranslateBatch(
         retryBaseDelayMs: env.retryBaseDelayMs,
         requestTimeoutMs: env.requestTimeoutMs,
         streamIdleTimeoutMs: env.streamIdleTimeoutMs,
-        signal: env.signal,
+        signal: batchAbort.signal,
       });
 
-      await appendDiagnosticSnapshot(execResult.diagnostic);
+      await safeAppendDiagnosticSnapshot(execResult.diagnostic);
 
       if (!execResult.ok) {
-        const upstreamErr = new Error(
-          execResult.error?.message || 'Upstream batch translation failed.',
+        const upstreamErr = new BatchUpstreamFailureError(
+          execResult.error ?? {
+            code: 'UPSTREAM_ERROR',
+            message: 'Upstream batch translation failed.',
+            retryable: true,
+          },
+          execResult.diagnostic,
         );
         for (const entry of ownedEntries) {
-          inFlightTranslations.delete(entry.key);
-          inFlightStreamListeners.delete(entry.key);
+          cleanupOwnedEntryMaps(entry);
           entry.reject(upstreamErr);
         }
         return execResult;
@@ -538,12 +657,11 @@ export async function handleTranslateBatch(
       }
 
       if (writeBatch.length > 0) {
-        await cache.setMany(writeBatch);
+        await cache.setMany(writeBatch, undefined, cacheEpoch);
       }
 
       for (const entry of ownedEntries) {
-        inFlightTranslations.delete(entry.key);
-        inFlightStreamListeners.delete(entry.key);
+        cleanupOwnedEntryMaps(entry);
         const repOut = finalizedRepMap.get(entry.representative.id);
         if (repOut) {
           const sfValue: SingleflightTranslationResult = {
@@ -553,13 +671,15 @@ export async function handleTranslateBatch(
               ? { fallbackPlain: repOut.fallbackPlain }
               : {}),
           };
-          for (const dup of entry.dupItems) {
-            const dupOut: BatchItemOutput = {
-              id: dup.id,
-              ...sfValue,
-            };
-            resolvedOutputs.set(dup.id, dupOut);
-            emitItemReady(dupOut);
+          if (!env.signal?.aborted) {
+            for (const dup of entry.dupItems) {
+              const dupOut: BatchItemOutput = {
+                id: dup.id,
+                ...sfValue,
+              };
+              resolvedOutputs.set(dup.id, dupOut);
+              emitItemReady(dupOut);
+            }
           }
           entry.resolve(sfValue);
         } else {
@@ -570,106 +690,223 @@ export async function handleTranslateBatch(
       return execResult;
     } catch (err) {
       for (const entry of ownedEntries) {
-        inFlightTranslations.delete(entry.key);
-        inFlightStreamListeners.delete(entry.key);
+        cleanupOwnedEntryMaps(entry);
         entry.reject(err);
       }
       throw err;
+    } finally {
+      batchAbort.markSettled();
     }
   };
 
-  const subscribedFlights: SubscribedFlightEntry[] = [];
-  const initialOwnedGroups: Array<readonly [string, BatchItemInput[]]> = [];
-
-  for (const [key, dupItems] of missGroupsByKey.entries()) {
-    const existingPromise = inFlightTranslations.get(key);
-    if (existingPromise) {
-      let unsubscribeStream: (() => void) | undefined;
-      const listenerSet = inFlightStreamListeners.get(key);
-      if (listenerSet && streamCallbacks?.onItemReady) {
-        const streamListener: SingleflightStreamListener = (upd) => {
-          for (const dup of dupItems) {
-            emitItemReady({
-              id: dup.id,
-              trans: upd.trans,
-              ...(upd.thinking ? { thinking: upd.thinking } : {}),
-              ...(upd.fallbackPlain
-                ? { fallbackPlain: upd.fallbackPlain }
-                : {}),
-              ...(upd.partial ? { partial: true } : {}),
-            });
-          }
-        };
-        listenerSet.add(streamListener);
-        unsubscribeStream = () => {
-          listenerSet.delete(streamListener);
-        };
-      }
-      subscribedFlights.push({
-        key,
-        dupItems,
-        promise: existingPromise,
-        unsubscribeStream,
-      });
-    } else {
-      initialOwnedGroups.push([key, dupItems]);
-    }
+  interface FlightRoundOutcome {
+    execResult: ExecuteBatchResult | null;
+    orphanedGroups: Array<readonly [string, BatchItemInput[]]>;
+    unhandledSubFailure: unknown;
   }
 
-  const ownedEntries = registerOwnedGroups(initialOwnedGroups);
-  let lastExecResult: ExecuteBatchResult | null = null;
+  const runAcquireOrSubscribeRound = async (
+    groups: ReadonlyArray<readonly [string, BatchItemInput[]]>,
+    collectOrphansForRescue: boolean,
+  ): Promise<FlightRoundOutcome> => {
+    if (env.signal?.aborted) {
+      throw new DOMException('The operation was aborted.', 'AbortError');
+    }
 
-  const ownedRunPromise =
-    ownedEntries.length > 0
-      ? executeOwnedEntries(ownedEntries)
-      : Promise.resolve(null);
+    const subscribedFlights: SubscribedFlightEntry[] = [];
+    const groupsToOwn: Array<readonly [string, BatchItemInput[]]> = [];
 
-  const orphanedGroups: Array<readonly [string, BatchItemInput[]]> = [];
-  const subscribePromise = (async () => {
-    for (const sub of subscribedFlights) {
-      try {
-        const sfVal = await raceWithAbort(sub.promise, env.signal);
-        for (const dup of sub.dupItems) {
-          const dupOut: BatchItemOutput = {
-            id: dup.id,
-            trans: sfVal.trans,
-            ...(sfVal.thinking ? { thinking: sfVal.thinking } : {}),
-            ...(sfVal.fallbackPlain
-              ? { fallbackPlain: sfVal.fallbackPlain }
-              : {}),
-          };
+    for (const [key, dupItems] of groups) {
+      // Check synchronous L1 cache first in case a peer just finished on a prior microtask
+      const cachedNow =
+        cache.getClearEpoch() === cacheEpoch ? cache.get(key) : undefined;
+      if (cachedNow !== undefined) {
+        for (const dup of dupItems) {
+          const dupOut: BatchItemOutput = { id: dup.id, trans: cachedNow };
           resolvedOutputs.set(dup.id, dupOut);
           emitItemReady(dupOut);
         }
-      } catch (err) {
-        if (env.signal?.aborted) {
-          throw err;
+        continue;
+      }
+
+      const existingRecord = inFlightRecords.get(key);
+      if (existingRecord) {
+        if (
+          existingRecord.cache === cache &&
+          existingRecord.epoch === cacheEpoch &&
+          cache.getClearEpoch() === cacheEpoch
+        ) {
+          const releaseAbort = existingRecord.batchAbort.retain(env.signal);
+          if (releaseAbort) {
+            let unsubscribeStream: (() => void) | undefined;
+            if (streamCallbacks?.onItemReady) {
+              const streamListener: SingleflightStreamListener = (upd) => {
+                for (const dup of dupItems) {
+                  emitItemReady({
+                    id: dup.id,
+                    trans: upd.trans,
+                    ...(upd.thinking ? { thinking: upd.thinking } : {}),
+                    ...(upd.fallbackPlain
+                      ? { fallbackPlain: upd.fallbackPlain }
+                      : {}),
+                    ...(upd.partial ? { partial: true } : {}),
+                  });
+                }
+              };
+              existingRecord.listeners.add(streamListener);
+              unsubscribeStream = () => {
+                existingRecord.listeners.delete(streamListener);
+              };
+            }
+            subscribedFlights.push({
+              key,
+              dupItems,
+              promise: existingRecord.promise,
+              unsubscribeStream,
+              releaseAbort,
+            });
+            continue;
+          }
         }
-        // Peer request cancelled or failed while this request is still alive: check cache or rescue
-        const lateCached = cache.get(sub.key);
-        if (lateCached !== undefined) {
+      } else {
+        const externalPromise = inFlightTranslations.get(key);
+        if (externalPromise) {
+          subscribedFlights.push({
+            key,
+            dupItems,
+            promise: externalPromise,
+          });
+          continue;
+        }
+      }
+
+      groupsToOwn.push([key, dupItems]);
+    }
+
+    let ownedEntries: OwnedFlightEntry[] = [];
+    let batchAbort: SharedBatchAbort | null = null;
+    let releaseOwnerAbort: (() => void) | null = null;
+
+    if (groupsToOwn.length > 0) {
+      batchAbort = createSharedBatchAbort();
+      releaseOwnerAbort = batchAbort.retain(env.signal);
+      if (!releaseOwnerAbort) {
+        throw new DOMException('The operation was aborted.', 'AbortError');
+      }
+
+      ownedEntries = groupsToOwn.map(([key, dupItems]) => {
+        let resolveFn!: (value: SingleflightTranslationResult) => void;
+        let rejectFn!: (reason?: unknown) => void;
+        const promise = new Promise<SingleflightTranslationResult>((res, rej) => {
+          resolveFn = res;
+          rejectFn = rej;
+        });
+        // Prevent unhandled rejection warnings when 0 external requests subscribe
+        promise.catch(() => undefined);
+
+        const listeners = new Set<SingleflightStreamListener>();
+        const record: ActiveFlightRecord = {
+          key,
+          cache,
+          epoch: cacheEpoch,
+          promise,
+          listeners,
+          batchAbort: batchAbort!,
+        };
+
+        inFlightTranslations.set(key, promise);
+        inFlightStreamListeners.set(key, listeners);
+        inFlightRecords.set(key, record);
+
+        return {
+          key,
+          representative: dupItems[0],
+          dupItems,
+          promise,
+          listeners,
+          record,
+          resolve: resolveFn,
+          reject: rejectFn,
+        };
+      });
+    }
+
+    const ownedRunPromise =
+      ownedEntries.length > 0 && batchAbort
+        ? executeOwnedEntries(ownedEntries, batchAbort)
+        : Promise.resolve(null);
+    // Prevent unhandled rejection if caller aborts while shared flight continues or later aborts
+    ownedRunPromise.catch(() => undefined);
+
+    const orphanedGroups: Array<readonly [string, BatchItemInput[]]> = [];
+    let unhandledSubFailure: unknown = null;
+
+    const subscribePromise = (async () => {
+      for (const sub of subscribedFlights) {
+        try {
+          const sfVal = await raceWithAbort(sub.promise, env.signal);
           for (const dup of sub.dupItems) {
-            const dupOut: BatchItemOutput = { id: dup.id, trans: lateCached };
+            const dupOut: BatchItemOutput = {
+              id: dup.id,
+              trans: sfVal.trans,
+              ...(sfVal.thinking ? { thinking: sfVal.thinking } : {}),
+              ...(sfVal.fallbackPlain
+                ? { fallbackPlain: sfVal.fallbackPlain }
+                : {}),
+            };
             resolvedOutputs.set(dup.id, dupOut);
             emitItemReady(dupOut);
           }
-        } else {
-          orphanedGroups.push([sub.key, sub.dupItems]);
+        } catch (err) {
+          if (env.signal?.aborted) {
+            throw err;
+          }
+          const lateCached =
+            cache.getClearEpoch() === cacheEpoch
+              ? cache.get(sub.key)
+              : undefined;
+          if (lateCached !== undefined) {
+            for (const dup of sub.dupItems) {
+              const dupOut: BatchItemOutput = { id: dup.id, trans: lateCached };
+              resolvedOutputs.set(dup.id, dupOut);
+              emitItemReady(dupOut);
+            }
+          } else if (collectOrphansForRescue) {
+            orphanedGroups.push([sub.key, sub.dupItems]);
+          } else if (unhandledSubFailure === null) {
+            unhandledSubFailure = err;
+          }
+        } finally {
+          sub.unsubscribeStream?.();
+          sub.releaseAbort?.();
         }
-      } finally {
+      }
+    })();
+
+    try {
+      const [ownedOut] = await raceWithAbort(
+        Promise.all([ownedRunPromise, subscribePromise]),
+        env.signal,
+      );
+      return {
+        execResult: ownedOut,
+        orphanedGroups,
+        unhandledSubFailure,
+      };
+    } finally {
+      releaseOwnerAbort?.();
+      for (const sub of subscribedFlights) {
         sub.unsubscribeStream?.();
+        sub.releaseAbort?.();
       }
     }
-  })();
+  };
 
-  try {
-    const [ownedOut] = await Promise.all([ownedRunPromise, subscribePromise]);
-    lastExecResult = ownedOut;
-  } finally {
-    for (const sub of subscribedFlights) {
-      sub.unsubscribeStream?.();
-    }
-  }
+  const initialOutcome = await runAcquireOrSubscribeRound(
+    Array.from(missGroupsByKey.entries()),
+    true,
+  );
+  let lastExecResult = initialOutcome.execResult;
 
   if (lastExecResult && !lastExecResult.ok) {
     return {
@@ -683,19 +920,77 @@ export async function handleTranslateBatch(
     };
   }
 
-  if (orphanedGroups.length > 0 && !env.signal?.aborted) {
-    const rescueEntries = registerOwnedGroups(orphanedGroups);
-    const rescueResult = await executeOwnedEntries(rescueEntries);
-    lastExecResult = rescueResult;
-    if (!rescueResult.ok && resolvedOutputs.size === 0) {
+  if (initialOutcome.orphanedGroups.length > 0 && !env.signal?.aborted) {
+    const rescueOutcome = await runAcquireOrSubscribeRound(
+      initialOutcome.orphanedGroups,
+      false,
+    );
+    if (rescueOutcome.execResult) {
+      lastExecResult = rescueOutcome.execResult;
+    }
+
+    if (rescueOutcome.execResult && !rescueOutcome.execResult.ok) {
       return {
         ok: false,
         requestId: request.requestId,
         providerId: provider.id,
         model: provider.model,
         items: [],
-        diagnostic: rescueResult.diagnostic,
-        error: rescueResult.error,
+        diagnostic: rescueOutcome.execResult.diagnostic,
+        error: rescueOutcome.execResult.error,
+      };
+    }
+
+    if (rescueOutcome.unhandledSubFailure !== null) {
+      const subErr = rescueOutcome.unhandledSubFailure;
+      if (subErr instanceof BatchUpstreamFailureError) {
+        return {
+          ok: false,
+          requestId: request.requestId,
+          providerId: provider.id,
+          model: provider.model,
+          items: [],
+          diagnostic: subErr.diagnostic,
+          error: subErr.batchError,
+        };
+      }
+      const errMsg =
+        sanitizeErrorText(subErr, provider.apiKeys) ||
+        'Singleflight rescue translation failed.';
+      const fallbackDiag = buildDiagnosticSnapshot({
+        scene: request.scene,
+        codec: codecId,
+        provider: {
+          id: provider.id,
+          preset: provider.preset,
+          protocol: provider.protocol,
+          resolvedEndpoint: resolvedDiagEndpoint,
+          model: provider.model,
+        },
+        parameters: {
+          temperatureTrace: 'omitted-default',
+          thinkingMode: provider.thinkingPolicy.mode,
+          stream: streamCallbacks?.stream ?? false,
+        },
+        kind: 'upstream-error',
+        retryable: true,
+        attempts: 1,
+        latencyMs: 0,
+        rawError: errMsg,
+        knownSecrets: provider.apiKeys,
+      });
+      return {
+        ok: false,
+        requestId: request.requestId,
+        providerId: provider.id,
+        model: provider.model,
+        items: [],
+        diagnostic: fallbackDiag,
+        error: {
+          code: 'RESCUE_FAILED',
+          message: errMsg,
+          retryable: true,
+        },
       };
     }
   }
@@ -766,7 +1061,7 @@ export async function handleTranslateImage(
       latencyMs: 0,
       rawError: msg,
     });
-    await appendDiagnosticSnapshot(diagnostic);
+    await safeAppendDiagnosticSnapshot(diagnostic);
     return {
       ok: false,
       requestId: request.requestId,
@@ -809,7 +1104,7 @@ export async function handleTranslateImage(
     signal: env.signal,
   });
 
-  await appendDiagnosticSnapshot(visionExec.diagnostic);
+  await safeAppendDiagnosticSnapshot(visionExec.diagnostic);
 
   if (!visionExec.ok) {
     return {
@@ -857,6 +1152,8 @@ export async function handleRuntimeRpcRequest(
       return fetchImageDataUrlWithDnr(request.payload, {
         fetchImpl: env.fetchImpl,
         dnrApi: env.dnrApi,
+        timeoutMs: env.timeoutMs ?? env.requestTimeoutMs,
+        maxImageBytes: env.maxImageBytes,
       });
     }
 
@@ -887,6 +1184,17 @@ export async function handleRuntimeRpcRequest(
     case 'margin:clear-translation-cache': {
       const cache = env.translationCache ?? backgroundTranslationCache;
       await cache.clearAll();
+      for (const [k, rec] of Array.from(inFlightRecords.entries())) {
+        if (rec.cache === cache) {
+          inFlightRecords.delete(k);
+          if (inFlightTranslations.get(k) === rec.promise) {
+            inFlightTranslations.delete(k);
+          }
+          if (inFlightStreamListeners.get(k) === rec.listeners) {
+            inFlightStreamListeners.delete(k);
+          }
+        }
+      }
       if (
         typeof globalThis.chrome !== 'undefined' &&
         typeof chrome.tabs?.query === 'function' &&
@@ -995,10 +1303,23 @@ export function attachStreamTranslationPort(
   port: Pick<
     chrome.runtime.Port,
     'name' | 'postMessage' | 'onMessage' | 'onDisconnect' | 'disconnect'
-  >,
+  > & { sender?: chrome.runtime.MessageSender },
   env: BackgroundRouterEnv = {},
 ): void {
   if (port.name !== BRAND.streamPortName) {
+    return;
+  }
+
+  const runtimeId =
+    typeof globalThis.chrome !== 'undefined'
+      ? globalThis.chrome?.runtime?.id
+      : undefined;
+  if (port.sender?.id && runtimeId && port.sender.id !== runtimeId) {
+    try {
+      port.disconnect();
+    } catch {
+      // Ignore disconnect errors
+    }
     return;
   }
 
@@ -1029,20 +1350,27 @@ export function attachStreamTranslationPort(
     if (msg.type === 'cancel') {
       const ctrl = activeControllers.get(msg.requestId);
       if (ctrl) {
-        ctrl.abort();
         activeControllers.delete(msg.requestId);
+        ctrl.abort();
       }
       return;
     }
 
     if (msg.type === 'start') {
       const payload = msg.payload;
+      const existingController = activeControllers.get(payload.requestId);
+      if (existingController) {
+        existingController.abort();
+      }
       const controller = new AbortController();
       activeControllers.set(payload.requestId, controller);
 
       void (async () => {
         try {
           const config = await getMarginConfig();
+          if (controller.signal.aborted || portDisconnected) {
+            return;
+          }
           const response = await handleTranslateBatch(
             payload,
             config,
@@ -1053,6 +1381,7 @@ export function attachStreamTranslationPort(
             {
               stream: true,
               onDelta: (rawDelta) => {
+                if (controller.signal.aborted || portDisconnected) return;
                 safePost({
                   type: 'delta',
                   requestId: payload.requestId,
@@ -1060,6 +1389,7 @@ export function attachStreamTranslationPort(
                 });
               },
               onItemReady: (item) => {
+                if (controller.signal.aborted || portDisconnected) return;
                 safePost({
                   type: 'item-ready',
                   requestId: payload.requestId,
@@ -1102,7 +1432,9 @@ export function attachStreamTranslationPort(
             },
           });
         } finally {
-          activeControllers.delete(payload.requestId);
+          if (activeControllers.get(payload.requestId) === controller) {
+            activeControllers.delete(payload.requestId);
+          }
         }
       })();
     }

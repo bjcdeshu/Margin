@@ -37,6 +37,56 @@ export class ProviderHttpError extends Error {
   }
 }
 
+export type TruncationReason =
+  | 'length'
+  | 'content_filter'
+  | 'max_tokens'
+  | 'refusal'
+  | 'premature-eof';
+
+export class ProviderTruncatedResponseError extends Error {
+  readonly reason: TruncationReason;
+  readonly httpStatus?: number;
+  readonly retryable: boolean;
+
+  constructor(params: {
+    reason: TruncationReason;
+    protocol: 'openai-chat' | 'anthropic-messages';
+    httpStatus?: number;
+    message?: string;
+  }) {
+    const retryable = params.reason === 'premature-eof';
+    const defaultMessage =
+      params.reason === 'premature-eof'
+        ? `Upstream ${params.protocol} SSE stream ended prematurely without a terminal stop marker.`
+        : `Upstream ${params.protocol} completion terminated incomplete (reason: ${params.reason}).`;
+    super(params.message ?? defaultMessage);
+    this.name = 'ProviderTruncatedResponseError';
+    this.reason = params.reason;
+    this.httpStatus = params.httpStatus;
+    this.retryable = retryable;
+  }
+}
+
+export function describeBodyMetadata(
+  rawBody: string,
+  response?: Pick<Response, 'headers'>,
+): string {
+  const contentType =
+    response?.headers?.get?.('content-type')?.split(';')[0]?.trim() || 'unknown';
+  const trimmed = rawBody.trimStart();
+  const shape = /<!doctype\s+html|<html\b/i.test(trimmed)
+    ? 'html'
+    : trimmed.startsWith('{')
+      ? 'json-object-prefix'
+      : trimmed.startsWith('[')
+        ? 'json-array-prefix'
+        : trimmed.length === 0
+          ? 'empty'
+          : 'non-json';
+  return `chars=${rawBody.length}, contentType=${contentType}, shape=${shape}`;
+}
+
 export interface ProviderRuntimeEnv {
   fetchImpl?: typeof fetch;
   pool?: ProviderExecutionPool;

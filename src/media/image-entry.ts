@@ -65,34 +65,83 @@ function findMatchingImageOnPage(srcUrl: string): HTMLImageElement | null {
   return sorted[0] ?? null;
 }
 
-export function initMarginImageTranslator(): void {
-  if (typeof document === 'undefined' || !document.documentElement) return;
+function isImageTestEnvironment(): boolean {
+  const proc = (
+    globalThis as { process?: { env?: Record<string, string | undefined> } }
+  ).process;
+  return Boolean(
+    (globalThis as Record<string, unknown>).__VITEST_WORKER_ID__ ||
+      proc?.env?.VITEST ||
+      proc?.env?.VITEST_WORKER_ID ||
+      proc?.env?.NODE_ENV === 'test',
+  );
+}
+
+export interface InitImageTranslatorOptions {
+  forceProductionMode?: boolean;
+}
+
+export function initMarginImageTranslator(
+  options?: InitImageTranslatorOptions,
+): () => void {
+  if (typeof document === 'undefined' || !document.documentElement) {
+    return () => {};
+  }
   const globalBag = globalThis as Record<string, unknown>;
   const bootKey = `__${BRAND.slug}_image_translator_booted__`;
+  const cleanupKey = `__${BRAND.slug}_image_translator_destroy__`;
   if (globalBag[bootKey] === true) {
-    return;
+    if (
+      options?.forceProductionMode !== undefined &&
+      typeof globalBag[cleanupKey] === 'function'
+    ) {
+      (globalBag[cleanupKey] as () => void)();
+    } else {
+      return typeof globalBag[cleanupKey] === 'function'
+        ? (globalBag[cleanupKey] as () => void)
+        : () => {};
+    }
   }
   globalBag[bootKey] = true;
   // Clear legacy v2.1.1 cross-world DOM dataset flag if present on `<html>`
   delete document.documentElement.dataset.marginImageReady;
 
+  const isTestEnv = !options?.forceProductionMode && isImageTestEnvironment();
   const hadRuntimeIdAtMount = Boolean(globalThis.chrome?.runtime?.id);
   let destroyed = false;
   let config: MarginConfig = createDefaultMarginConfig();
-  const activeOverlays = new WeakMap<HTMLImageElement, MountedImageOverlayController>();
+  const activeOverlays = new Map<HTMLImageElement, MountedImageOverlayController>();
+  const imageRequestSeq = new WeakMap<HTMLImageElement, number>();
 
-  void getMarginConfig()
+  const clearAllActiveOverlays = () => {
+    for (const ctrl of Array.from(activeOverlays.values())) {
+      ctrl.destroy();
+    }
+    activeOverlays.clear();
+  };
+
+  const isCurrentPageAllowed = (): boolean =>
+    !isUnsupportedBrowserUrl(window.location.href) &&
+    !matchesAnyUrlGlob(window.location.href, config.urlRules.excludeMatches);
+
+  const configReady = getMarginConfig()
     .then((loaded) => {
       if (!destroyed) {
         config = loaded;
+        if (!isCurrentPageAllowed()) {
+          hideHoverPill();
+          clearAllActiveOverlays();
+        }
       }
     })
     .catch(() => {});
+
   let unsubscribeConfig: (() => void) | null = onMarginConfigChanged((next) => {
     if (destroyed) return;
     config = next;
-    if (matchesAnyUrlGlob(window.location.href, next.urlRules.excludeMatches)) {
+    if (!isCurrentPageAllowed()) {
       hideHoverPill();
+      clearAllActiveOverlays();
     }
   });
 
@@ -100,7 +149,7 @@ export function initMarginImageTranslator(): void {
   let hoverPillHost: HTMLElement | null = null;
   let hoveredImg: HTMLImageElement | null = null;
   let pillLabelEl: HTMLButtonElement | null = null;
-  let isTranslatingImage = false;
+  let inFlightImageCount = 0;
   let hoverHideTimer: ReturnType<typeof setTimeout> | null = null;
 
   const clearHoverHideTimer = () => {
@@ -114,7 +163,7 @@ export function initMarginImageTranslator(): void {
     clearHoverHideTimer();
     hoverHideTimer = setTimeout(() => {
       hoverHideTimer = null;
-      if (!isTranslatingImage) {
+      if (inFlightImageCount === 0) {
         hideHoverPill();
       }
     }, 160);
@@ -221,13 +270,23 @@ export function initMarginImageTranslator(): void {
     targetImg: HTMLImageElement | null,
     srcUrl: string,
   ) => {
+    if (destroyed || !isCurrentPageAllowed()) return;
+
+    const expectedImgSrc = targetImg
+      ? targetImg.currentSrc || targetImg.src || srcUrl
+      : srcUrl;
+    const reqGen = targetImg
+      ? (imageRequestSeq.get(targetImg) ?? 0) + 1
+      : 0;
+
     if (targetImg) {
+      imageRequestSeq.set(targetImg, reqGen);
       const existing = activeOverlays.get(targetImg);
       existing?.destroy();
       activeOverlays.delete(targetImg);
     }
 
-    isTranslatingImage = true;
+    inFlightImageCount += 1;
     if (targetImg) {
       const rect = targetImg.getBoundingClientRect();
       showHoverPillAt(
@@ -243,6 +302,8 @@ export function initMarginImageTranslator(): void {
         srcUrl,
         pageUrl: window.location.href,
       });
+      if (destroyed || !isCurrentPageAllowed()) return;
+      if (targetImg && imageRequestSeq.get(targetImg) !== reqGen) return;
 
       const res = await requestImageTranslation({
         requestId: `img-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
@@ -252,25 +313,49 @@ export function initMarginImageTranslator(): void {
         pageUrl: window.location.href,
       });
 
-      isTranslatingImage = false;
-      hideHoverPill();
-      if (!res.ok) return;
+      if (destroyed || !res.ok || !isCurrentPageAllowed()) return;
 
       if (targetImg) {
-        const controller = mountVisionImageOverlay({
+        if (
+          imageRequestSeq.get(targetImg) !== reqGen ||
+          !targetImg.isConnected
+        ) {
+          return;
+        }
+        const latestImgSrc = targetImg.currentSrc || targetImg.src || srcUrl;
+        if (
+          expectedImgSrc &&
+          latestImgSrc &&
+          latestImgSrc !== expectedImgSrc
+        ) {
+          return;
+        }
+
+        const prevOverlay = activeOverlays.get(targetImg);
+        prevOverlay?.destroy();
+        activeOverlays.delete(targetImg);
+
+        let controller!: MountedImageOverlayController;
+        controller = mountVisionImageOverlay({
           targetImg,
           response: res,
           uiColorMode: config.uiColorMode,
           interfaceLang: config.interfaceLang,
           onClose: () => {
-            activeOverlays.delete(targetImg);
+            if (activeOverlays.get(targetImg) === controller) {
+              activeOverlays.delete(targetImg);
+            }
           },
         });
         activeOverlays.set(targetImg, controller);
       }
     } catch {
-      isTranslatingImage = false;
-      hideHoverPill();
+      // Ignore failed capture/translation
+    } finally {
+      inFlightImageCount = Math.max(0, inFlightImageCount - 1);
+      if (inFlightImageCount === 0) {
+        hideHoverPill();
+      }
     }
   };
 
@@ -325,30 +410,55 @@ export function initMarginImageTranslator(): void {
       destroyImageTranslator();
       return;
     }
-    if (!hoveredImg || isTranslatingImage) return;
+    if (!hoveredImg || inFlightImageCount > 0) return;
     if (e.target === hoveredImg) {
       scheduleHoverPillHide();
     }
   };
 
-  const onRuntimeMessage = (raw: unknown) => {
+  const onRuntimeMessage = (
+    raw: unknown,
+    sender?: chrome.runtime.MessageSender,
+  ) => {
     if (destroyed) return;
+    if (!isExtensionContextValid(hadRuntimeIdAtMount)) {
+      destroyImageTranslator();
+      return;
+    }
+    const runtimeId = globalThis.chrome?.runtime?.id;
+    if (runtimeId) {
+      if (!isTestEnv) {
+        if (sender?.id !== runtimeId) return;
+      } else if (sender?.id && sender.id !== runtimeId) {
+        return;
+      }
+    }
+
     const msg = raw as TabCommandMessage;
     if (msg && msg.type === 'margin:cmd:translate-context-image' && msg.srcUrl) {
-      const img = findMatchingImageOnPage(msg.srcUrl);
-      void translateTargetImage(img, msg.srcUrl);
+      const requestedSrc = msg.srcUrl;
+      void configReady.then(() => {
+        if (destroyed || !isCurrentPageAllowed()) return;
+        const img = findMatchingImageOnPage(requestedSrc);
+        void translateTargetImage(img, requestedSrc);
+      });
     }
   };
 
   const onWindowTranslateCmd = (ev: Event) => {
+    if (destroyed || !isTestEnv) return;
     if (!isExtensionContextValid(hadRuntimeIdAtMount)) {
       destroyImageTranslator();
       return;
     }
     const detail = (ev as CustomEvent<{ srcUrl?: string }>).detail;
-    if (detail?.srcUrl) {
-      const img = findMatchingImageOnPage(detail.srcUrl);
-      void translateTargetImage(img, detail.srcUrl);
+    const requestedSrc = detail?.srcUrl;
+    if (requestedSrc) {
+      void configReady.then(() => {
+        if (destroyed || !isCurrentPageAllowed()) return;
+        const img = findMatchingImageOnPage(requestedSrc);
+        void translateTargetImage(img, requestedSrc);
+      });
     }
   };
 
@@ -357,10 +467,12 @@ export function initMarginImageTranslator(): void {
     destroyed = true;
     document.removeEventListener('pointerover', onPointerOver);
     document.removeEventListener('pointerout', onPointerOut);
-    window.removeEventListener(
-      'margin:cmd:translate-context-image',
-      onWindowTranslateCmd,
-    );
+    if (isTestEnv) {
+      window.removeEventListener(
+        'margin:cmd:translate-context-image',
+        onWindowTranslateCmd,
+      );
+    }
     try {
       unsubscribeConfig?.();
     } catch {
@@ -372,13 +484,17 @@ export function initMarginImageTranslator(): void {
     } catch {
       // Ignore runtime message cleanup errors when extension context is invalidated
     }
+    clearAllActiveOverlays();
     clearHoverHideTimer();
     hoverPillHost?.remove();
     hoverPillHost = null;
     pillLabelEl = null;
     hoveredImg = null;
     delete globalBag[bootKey];
+    delete globalBag[cleanupKey];
   }
+
+  globalBag[cleanupKey] = destroyImageTranslator;
 
   document.addEventListener('pointerover', onPointerOver, { passive: true });
   document.addEventListener('pointerout', onPointerOut, { passive: true });
@@ -391,18 +507,22 @@ export function initMarginImageTranslator(): void {
     chrome.runtime.onMessage.addListener(onRuntimeMessage);
   }
 
-  // Also listen for custom DOM event dispatch (handy for local integration / tests)
-  window.addEventListener(
-    'margin:cmd:translate-context-image',
-    onWindowTranslateCmd,
-  );
+  // Listen for custom DOM event dispatch strictly in test environments only
+  if (isTestEnv) {
+    window.addEventListener(
+      'margin:cmd:translate-context-image',
+      onWindowTranslateCmd,
+    );
+  }
+
+  return destroyImageTranslator;
 }
 
 // Auto-initialize in browser content-script environment (skip automatic hook in Vitest unit runner)
 if (
   typeof window !== 'undefined' &&
   typeof document !== 'undefined' &&
-  !(globalThis as Record<string, unknown>).__VITEST_WORKER_ID__
+  !isImageTestEnvironment()
 ) {
   initMarginImageTranslator();
 }

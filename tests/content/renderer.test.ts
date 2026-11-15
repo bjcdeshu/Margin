@@ -2632,4 +2632,364 @@ describe('renderer & content orchestrator: themes, reversible target-only, retry
 
     renderer.destroy();
   });
+
+  it('unwraps target-only original text on streaming error, abort, and mid-flight SPA mutation so paragraphs are never left hidden', async () => {
+    const config = createDefaultMarginConfig();
+    config.webpage.displayMode = 'target-only';
+    config.providers['google-free'].stream = 'on';
+
+    // Case A: Streaming emits partial delta (wrapping original text in hidden span), then batch fails -> original text MUST be unwrapped!
+    document.body.innerHTML = `<main><p id="err-para">Original paragraph text must remain visible when upstream fails.</p></main>`;
+    const errPara = document.getElementById('err-para')!;
+
+    const errRenderer = new WebpageRenderer({
+      config,
+      transport: async (req, callbacks) => {
+        callbacks.onItemReady?.({
+          id: req.items[0]!.id,
+          trans: '半截流式译文…',
+          partial: true,
+        });
+        // Verify wrapper was mounted during streaming
+        expect(errPara.querySelector('[data-margin-orig-wrap="true"]')).not.toBeNull();
+        return {
+          ok: false,
+          requestId: req.requestId,
+          providerId: 'google-free',
+          model: 'gtx',
+          items: [],
+          error: {
+            code: 'HTTP_502',
+            message: 'HTTP 502 Bad Gateway',
+            retryable: true,
+          },
+          diagnostic: makeMockDiagnostic(),
+        };
+      },
+    });
+
+    try {
+      await errRenderer.translateWholePage();
+      expect(errPara.querySelector('[data-margin-orig-wrap="true"]')).toBeNull();
+      expect(errPara.textContent).toContain(
+        'Original paragraph text must remain visible when upstream fails.',
+      );
+      expect(errPara.querySelector('.margin-inline-retry')).not.toBeNull();
+    } finally {
+      errRenderer.destroy();
+    }
+
+    // Case B: Streaming emits partial delta, then host SPA mutates source text mid-flight -> stale block unwraps cleanly before re-translation settles!
+    document.body.innerHTML = `<main><p id="spa-para">Initial SPA paragraph before client route swap.</p></main>`;
+    const spaPara = document.getElementById('spa-para')!;
+    let spaPass = 0;
+    let resolveSecondSpaPass!: (res: TranslateBatchResponse) => void;
+
+    const spaRenderer = new WebpageRenderer({
+      config,
+      transport: async (req, callbacks) => {
+        spaPass += 1;
+        if (spaPass === 1) {
+          callbacks.onItemReady?.({
+            id: req.items[0]!.id,
+            trans: '旧段落流式译文',
+            partial: true,
+          });
+          const origWrap = spaPara.querySelector('[data-margin-orig-wrap="true"]');
+          expect(origWrap).not.toBeNull();
+          // Simulate SPA mutating underlying text while request #1 is still in-flight
+          origWrap!.textContent = 'Updated SPA paragraph after client route swap.';
+          return {
+            ok: true,
+            requestId: req.requestId,
+            providerId: 'google-free',
+            model: 'gtx',
+            items: [{ id: req.items[0]!.id, trans: '旧段落最终译文' }],
+            diagnostic: makeMockDiagnostic(),
+          };
+        }
+        return new Promise<TranslateBatchResponse>((resolve) => {
+          resolveSecondSpaPass = resolve;
+        });
+      },
+    });
+
+    try {
+      await spaRenderer.translateWholePage();
+      // Right after stale flight #1 is discarded (and while pass #2 is pending), original updated text MUST be unwrapped and visible!
+      expect(spaPara.querySelector('[data-margin-orig-wrap="true"]')).toBeNull();
+      expect(spaPara.textContent).toBe('Updated SPA paragraph after client route swap.');
+
+      resolveSecondSpaPass?.({
+        ok: true,
+        requestId: 'spa-pass-2',
+        providerId: 'google-free',
+        model: 'gtx',
+        items: [{ id: 1, trans: '新路由段落译文' }],
+        diagnostic: makeMockDiagnostic(),
+      });
+      await new Promise((r) => setTimeout(r, 10));
+      expect(spaPara.textContent).toContain('新路由段落译文');
+    } finally {
+      spaRenderer.destroy();
+    }
+  });
+
+  it('resets inFlightBlocks across restorePage() restarts, wraps trailing inline prose around nested blocks in target-only mode, busts L1 cache on prompt/env edits, and detects pushState URL changes + prunes detached nodes', async () => {
+    // 1. Live config restart (`restorePage()` -> `enablePageTranslation()`) while old flight settles asynchronously MUST NOT skip previously in-flight blocks!
+    const config = createDefaultMarginConfig();
+    config.targetLang = 'zh-CN';
+    config.providers['openai-prompt'] = {
+      ...config.providers['google-free'],
+      id: 'openai-prompt',
+      name: 'OpenAI Prompt Test',
+      preset: 'openai',
+      protocol: 'openai-chat',
+      assistantId: 'builtin-yaml',
+    };
+    config.routing.webpage = 'openai-prompt';
+
+    document.body.innerHTML = `<main><p id="restart-para">Speculative execution requires deterministic generation fencing across restarts.</p></main>`;
+    const restartPara = document.getElementById('restart-para')!;
+
+    let callIdx = 0;
+    let resolveStaleFlight!: (res: TranslateBatchResponse) => void;
+    const seenToLangs: string[] = [];
+
+    const restartRenderer = new WebpageRenderer({
+      config,
+      transport: (req) => {
+        callIdx += 1;
+        seenToLangs.push(req.toLang);
+        if (callIdx === 1) {
+          // Simulate non-streaming request that settles asynchronously AFTER restorePage() + enablePageTranslation()
+          return new Promise<TranslateBatchResponse>((resolve) => {
+            resolveStaleFlight = resolve;
+          });
+        }
+        return Promise.resolve({
+          ok: true,
+          requestId: req.requestId,
+          providerId: 'openai-prompt',
+          model: 'gpt-4o-mini',
+          items: req.items.map((it) => ({
+            id: it.id,
+            trans: `[${req.toLang}#${callIdx}] 确定性代际隔离译文`,
+          })),
+          diagnostic: makeMockDiagnostic(),
+        });
+      },
+    });
+
+    restartRenderer.enablePageTranslation();
+    expect(seenToLangs).toEqual(['zh-CN']);
+
+    // Switch targetLang while call #1 is still in-flight -> triggers synchronous restorePage() + enablePageTranslation()
+    const jaCfg = structuredClone(config);
+    jaCfg.targetLang = 'ja';
+    restartRenderer.updateConfig(jaCfg);
+
+    // Block MUST be immediately re-dispatched for `ja` instead of skipped by stale `inFlightBlocks`!
+    expect(seenToLangs).toEqual(['zh-CN', 'ja']);
+    await new Promise((r) => setTimeout(r, 15));
+
+    // Now settle the stale flight #1 -> sessionGen guard prevents corrupting the active `ja` session!
+    resolveStaleFlight({
+      ok: true,
+      requestId: 'stale-1',
+      providerId: 'openai-prompt',
+      model: 'gpt-4o-mini',
+      items: [{ id: 1, trans: '过期中文译文' }],
+      diagnostic: makeMockDiagnostic(),
+    });
+    await new Promise((r) => setTimeout(r, 10));
+    expect(restartPara.textContent).toContain('[ja#2] 确定性代际隔离译文');
+
+    // 2. Editing assistant prompt or `env` busts both `computeTranslationConfigSignature` and renderer L1 LRU cache!
+    const editedPromptCfg = structuredClone(jaCfg);
+    editedPromptCfg.assistants['builtin-yaml'].prompt += '\n# Custom editorial tone';
+    editedPromptCfg.assistants['builtin-yaml'].env.custom_macro = 'preserve-idioms';
+    restartRenderer.updateConfig(editedPromptCfg);
+    await new Promise((r) => setTimeout(r, 15));
+
+    expect(callIdx).toBe(3);
+    expect(restartPara.textContent).toContain('[ja#3] 确定性代际隔离译文');
+    restartRenderer.destroy();
+
+    // 3. Mixed container `<div>Intro <p>Nested</p> Trailing</div>` in target-only mode wraps BOTH inline runs and restores exact order
+    const targetOnlyCfg = createDefaultMarginConfig();
+    targetOnlyCfg.webpage.displayMode = 'target-only';
+    document.body.innerHTML = `<main><div id="mixed-box">Introductory clause before nested block. <p id="nested-p">Nested child paragraph inside container.</p> Trailing clause after nested block.</div></main>`;
+    const mixedBox = document.getElementById('mixed-box')!;
+
+    const mixedRenderer = new WebpageRenderer({
+      config: targetOnlyCfg,
+      transport: async (req) => ({
+        ok: true,
+        requestId: req.requestId,
+        providerId: 'google-free',
+        model: 'gtx',
+        items: req.items.map((it) => ({
+          id: it.id,
+          trans: `替换译文：${it.text.slice(0, 18)}`,
+        })),
+        diagnostic: makeMockDiagnostic(),
+      }),
+    });
+
+    await mixedRenderer.translateWholePage();
+    const directWrappers = Array.from(mixedBox.children).filter(
+      (el) => el.getAttribute('data-margin-orig-wrap') === 'true',
+    );
+    expect(directWrappers.length).toBeGreaterThanOrEqual(2);
+    expect(directWrappers.map((w) => w.textContent?.trim())).toEqual([
+      'Introductory clause before nested block.',
+      'Trailing clause after nested block.',
+    ]);
+
+    mixedRenderer.restorePage();
+    expect(mixedBox.querySelectorAll('[data-margin-orig-wrap="true"]')).toHaveLength(0);
+    expect(mixedBox.textContent).toBe(
+      'Introductory clause before nested block. Nested child paragraph inside container. Trailing clause after nested block.',
+    );
+
+    // 4. Virtualized feed DOM removal prunes detached nodes cleanly
+    await mixedRenderer.translateWholePage();
+    mixedBox.remove();
+    expect(mixedRenderer.getPageState().translatedBlocks).toBe(0);
+    mixedRenderer.destroy();
+
+    // 5. MarginContentController detects SPA `pushState` URL change to excluded domain without `popstate`
+    let simulatedUrl = 'https://x.com/explore';
+    document.body.innerHTML = `<main id="spa-feed"><p>Foreign English article paragraph ready for automatic translation.</p></main>`;
+    const spaCtrl = new MarginContentController({
+      config: createDefaultMarginConfig(),
+      getUrl: () => simulatedUrl,
+      warmup: async () => ({ ok: true }),
+      transport: async (req) => ({
+        ok: true,
+        requestId: req.requestId,
+        providerId: 'google-free',
+        model: 'gtx',
+        items: req.items.map((it) => ({ id: it.id, trans: `译：${it.text}` })),
+        diagnostic: makeMockDiagnostic(),
+      }),
+    });
+    spaCtrl.mount();
+    await new Promise((r) => setTimeout(r, 15));
+    expect(spaCtrl.renderer.isActive).toBe(true);
+
+    // Simulate SPA forward pushState to an excluded URL + external DOM mutation (no popstate/hashchange!)
+    simulatedUrl = 'https://linux.do/t/topic/12345';
+    const nextRouteNode = document.createElement('p');
+    nextRouteNode.textContent = 'Navigated via pushState to excluded community route.';
+    document.getElementById('spa-feed')!.appendChild(nextRouteNode);
+    await new Promise((r) => setTimeout(r, 20));
+
+    expect(spaCtrl.renderer.isActive).toBe(false);
+    spaCtrl.destroy();
+  });
+
+  it('rolls back provisional streamed slots on TRUNCATED_RESPONSE, detects bare #text appended in target-only mode, and honors targetActive idempotency', async () => {
+    const config = createDefaultMarginConfig();
+    config.webpage.displayMode = 'target-only';
+    document.body.innerHTML = `<article><p id="trunc-p">Streaming sentence that drops mid-flight before EOF.</p></article>`;
+    const para = document.getElementById('trunc-p')!;
+
+    let attempt = 0;
+    const renderer = new WebpageRenderer({
+      config,
+      getUrl: () => 'https://example.com/article',
+      transport: async (req, callbacks) => {
+        attempt += 1;
+        if (attempt === 1) {
+          // Emit item #1 provisionally, then abort stream with TRUNCATED_RESPONSE
+          callbacks?.onItemReady?.({ id: 1, trans: '截断前的半截流式译文' });
+          return {
+            ok: false,
+            requestId: req.requestId,
+            providerId: 'openai',
+            model: 'gpt-4.1-mini',
+            items: [],
+            error: {
+              code: 'TRUNCATED_RESPONSE',
+              message: 'SSE stream ended prematurely before completion.',
+              retryable: true,
+            },
+            diagnostic: makeMockDiagnostic(),
+          };
+        }
+        return {
+          ok: true,
+          requestId: req.requestId,
+          providerId: 'openai',
+          model: 'gpt-4.1-mini',
+          items: req.items.map((it) => ({
+            id: it.id,
+            trans: `完整译文：${it.text}`,
+          })),
+          diagnostic: makeMockDiagnostic(),
+        };
+      },
+    });
+
+    await renderer.translateWholePage();
+
+    // 1. Provisional slot 1 was rolled back (NOT left mounted or poisoned in L1 cache) and retry pill mounted!
+    expect(para.querySelector('.margin-trans-root')).toBeNull();
+    expect(para.querySelector('[data-margin-orig-wrap="true"]')).toBeNull();
+    const retryBtn = para.querySelector(
+      'button.margin-inline-retry',
+    ) as HTMLButtonElement | null;
+    expect(retryBtn).not.toBeNull();
+
+    // 2. Clicking retry re-fetches upstream (not served from poisoned L1 cache) and mounts full translation!
+    retryBtn!.click();
+    await vi.waitFor(() => {
+      expect(para.querySelector('.margin-trans-root')?.textContent).toBe(
+        '完整译文：Streaming sentence that drops mid-flight before EOF.',
+      );
+    });
+    expect(attempt).toBe(2);
+
+    // 3. In `target-only` mode, appending a bare `#text` node directly onto `para` outside `[data-margin-orig-wrap]` is detected!
+    renderer.enablePageTranslation();
+    para.appendChild(document.createTextNode(' Newly appended live clause.'));
+    await vi.waitFor(() => {
+      expect(para.querySelector('.margin-trans-root')?.textContent).toBe(
+        '完整译文：Streaming sentence that drops mid-flight before EOF. Newly appended live clause.',
+      );
+    });
+    renderer.destroy();
+
+    // 4. `margin:cmd:toggle-page` with `targetActive: true` is an idempotent no-op when already active!
+    document.body.innerHTML = `<main><p>Idempotent targetActive paragraph for site rule verification.</p></main>`;
+    const ctrl = new MarginContentController({
+      config: createDefaultMarginConfig(),
+      getUrl: () => 'https://news.ycombinator.com/item?id=1',
+      warmup: async () => ({ ok: true }),
+      transport: async (req) => ({
+        ok: true,
+        requestId: req.requestId,
+        providerId: 'google-free',
+        model: 'gtx',
+        items: req.items.map((it) => ({ id: it.id, trans: `译：${it.text}` })),
+        diagnostic: makeMockDiagnostic(),
+      }),
+    });
+    ctrl.mount();
+    await ctrl.handleCommand(
+      { type: 'margin:cmd:toggle-page', targetActive: true },
+      'cmd',
+    );
+    expect(ctrl.renderer.isActive).toBe(true);
+    // Second `targetActive: true` MUST keep page active (never toggle OFF!)
+    const secondRes = await ctrl.handleCommand(
+      { type: 'margin:cmd:toggle-page', targetActive: true },
+      'cmd',
+    );
+    expect(secondRes).toBe(true);
+    expect(ctrl.renderer.isActive).toBe(true);
+    ctrl.destroy();
+  });
 });

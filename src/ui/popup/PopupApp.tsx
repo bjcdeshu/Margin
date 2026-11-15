@@ -9,7 +9,6 @@ import { sendTabCommand } from '@shared/messaging';
 import {
   getMarginConfig,
   onMarginConfigChanged,
-  saveMarginConfig,
   updateMarginConfig,
 } from '@shared/storage';
 import type {
@@ -139,6 +138,7 @@ export function PopupApp({
   const configRef = useRef<MarginConfig>(config);
   const hydratedRef = useRef(false);
   const saveSeqRef = useRef(0);
+  const siteActionSeqRef = useRef(0);
 
   const [hydrated, setHydrated] = useState(false);
   const [activeTab, setActiveTab] = useState<ActiveTabInfo>(
@@ -207,8 +207,9 @@ export function PopupApp({
 
     const unsubStorage = onMarginConfigChanged((incoming) => {
       if (!active) return;
-      tracker.observePersisted(incoming);
-      syncConfigState(incoming);
+      if (tracker.observePersisted(incoming) || !tracker.getSnapshot().saving) {
+        syncConfigState(incoming);
+      }
     });
 
     return () => {
@@ -260,16 +261,24 @@ export function PopupApp({
 
     const seq = ++saveSeqRef.current;
     try {
-      await saveMarginConfig(normalized);
-      const persisted = await getMarginConfig();
-      trackerRef.current.observePersisted(persisted);
+      const persisted = await updateMarginConfig((latest) => {
+        mutator(latest);
+        return normalizeConfigForSave(latest);
+      });
+      const matched = trackerRef.current.observePersisted(persisted);
       if (seq === saveSeqRef.current) {
+        if (!matched) {
+          trackerRef.current.beginUserSave(persisted);
+          trackerRef.current.observePersisted(persisted);
+        }
         syncConfigState(persisted);
       }
     } catch (err) {
-      trackerRef.current.failSave(
-        err instanceof Error ? err.message : String(err),
-      );
+      if (seq === saveSeqRef.current) {
+        trackerRef.current.failSave(
+          err instanceof Error ? err.message : String(err),
+        );
+      }
     }
   };
 
@@ -312,7 +321,9 @@ export function PopupApp({
 
   const handleSelectSiteAutoRule = async (nextState: SiteAutoRuleState) => {
     if (!hydratedRef.current || !activeTab.url || !tabDomain) return;
+    const actionSeq = ++siteActionSeqRef.current;
     const targetUrl = activeTab.url;
+    const wasActiveBefore = pageState.active;
 
     if (nextState !== siteAutoRule) {
       const optimistic = structuredClone(configRef.current);
@@ -326,7 +337,7 @@ export function PopupApp({
 
       const seq = ++saveSeqRef.current;
       try {
-        await updateMarginConfig((draft) => {
+        const persisted = await updateMarginConfig((draft) => {
           draft.urlRules = applySiteAutoRule(
             targetUrl,
             nextState,
@@ -334,26 +345,67 @@ export function PopupApp({
           );
           return normalizeConfigForSave(draft);
         });
-        const persisted = await getMarginConfig();
-        trackerRef.current.observePersisted(persisted);
+        const matched = trackerRef.current.observePersisted(persisted);
         if (seq === saveSeqRef.current) {
+          if (!matched) {
+            trackerRef.current.beginUserSave(persisted);
+            trackerRef.current.observePersisted(persisted);
+          }
           syncConfigState(persisted);
         }
       } catch (err) {
-        trackerRef.current.failSave(
-          err instanceof Error ? err.message : String(err),
-        );
+        if (seq === saveSeqRef.current) {
+          trackerRef.current.failSave(
+            err instanceof Error ? err.message : String(err),
+          );
+        }
         return;
       }
+      if (actionSeq !== siteActionSeqRef.current) return;
     }
 
-    const shouldTranslateNow = nextState === 'always' && !pageState.active;
-    const shouldRestoreNow = nextState === 'never' && pageState.active;
+    if (
+      (nextState === 'always' || nextState === 'never') &&
+      activeTab.id !== undefined
+    ) {
+      const targetActive = nextState === 'always';
+      let freshState: TabPageState | null = null;
+      const probeRes = await sendTabCommand(activeTab.id, {
+        type: 'margin:cmd:get-page-state',
+      });
+      if (actionSeq !== siteActionSeqRef.current) return;
+      if (probeRes.ok) {
+        freshState = extractDispatchedPageState(probeRes.result);
+      }
 
-    if ((shouldTranslateNow || shouldRestoreNow) && activeTab.id !== undefined) {
+      const currentActive = freshState ? freshState.active : wasActiveBefore;
+      if (currentActive === targetActive) {
+        if (freshState) {
+          setPageState(freshState);
+        } else {
+          setPageState((prev) => ({ ...prev, active: targetActive }));
+        }
+        if (targetActive || wasActiveBefore) {
+          setCommandNotice({
+            text: targetActive
+              ? lang === 'en'
+                ? 'Site set to Always Translate · Bilingual mode enabled'
+                : '已设为「此站必翻」并开启当前页面翻译'
+              : lang === 'en'
+                ? 'Site set to Never Translate · Restored original page'
+                : '已设为「此站不翻」并还原网页原文',
+          });
+        }
+        return;
+      }
+
+      const shouldTranslateNow = targetActive;
+      const shouldRestoreNow = !targetActive;
       const res = await sendTabCommand(activeTab.id, {
         type: 'margin:cmd:toggle-page',
+        targetActive,
       });
+      if (actionSeq !== siteActionSeqRef.current) return;
       if (res.ok) {
         const returnedState = extractDispatchedPageState(res.result);
         if (returnedState) {
@@ -586,11 +638,12 @@ export function PopupApp({
                 ? 'Cycle Paper / Night / System theme'
                 : '点击切换 纸白 / 夜读 / 跟随系统'
             }
-            onClick={() =>
+            onClick={() => {
+              const nextMode = nextUiColorMode(configRef.current.uiColorMode);
               void persistUserPatch((d) => {
-                d.uiColorMode = nextUiColorMode(d.uiColorMode);
-              })
-            }
+                d.uiColorMode = nextMode;
+              });
+            }}
           >
             <Icon name={themeIcon} />
             <span>{formatThemeCycleLabel(config.uiColorMode, lang)}</span>
@@ -790,14 +843,15 @@ export function PopupApp({
             class="mp-popup-toggle-pill"
             data-testid="popup-toggle-selection"
             aria-pressed={config.selection.enabled ? 'true' : 'false'}
-            onClick={() =>
+            onClick={() => {
+              const nextEnabled = !configRef.current.selection.enabled;
               void persistUserPatch((d) => {
-                d.selection.enabled = !d.selection.enabled;
-                if (d.selection.enabled && d.selection.triggerMode === 'off') {
+                d.selection.enabled = nextEnabled;
+                if (nextEnabled && d.selection.triggerMode === 'off') {
                   d.selection.triggerMode = 'icon';
                 }
-              })
-            }
+              });
+            }}
           >
             <span class="mp-popup-toggle-dot" />
             <span>{lang === 'en' ? 'Selection' : '划词翻译'}</span>
@@ -808,11 +862,12 @@ export function PopupApp({
             class="mp-popup-toggle-pill"
             data-testid="popup-toggle-hover"
             aria-pressed={config.hover.enabled ? 'true' : 'false'}
-            onClick={() =>
+            onClick={() => {
+              const nextEnabled = !configRef.current.hover.enabled;
               void persistUserPatch((d) => {
-                d.hover.enabled = !d.hover.enabled;
-              })
-            }
+                d.hover.enabled = nextEnabled;
+              });
+            }}
           >
             <span class="mp-popup-toggle-dot" />
             <span>{lang === 'en' ? 'Ctrl+Hover' : 'Ctrl+悬停'}</span>

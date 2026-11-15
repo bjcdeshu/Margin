@@ -27,6 +27,7 @@ interface VisualLine {
   maxX: number;
   height: number;
   text: string;
+  regionId: number;
 }
 
 const MATH_OR_FORMULA_TOKEN_RE =
@@ -72,6 +73,190 @@ function joinLineTokens(tokens: PositionedToken[]): string {
   }
 
   return out.replace(/[ \t]{2,}/g, ' ').trim();
+}
+
+function splitBucketAcrossColumnGutters(
+  bucket: readonly PositionedToken[],
+): PositionedToken[][] {
+  if (bucket.length <= 1) {
+    return bucket.length === 0 ? [] : [[...bucket]];
+  }
+  const sorted = [...bucket].sort((a, b) => a.x - b.x);
+  const segments: PositionedToken[][] = [[sorted[0]]];
+
+  for (let i = 1; i < sorted.length; i++) {
+    const prev = sorted[i - 1];
+    const cur = sorted[i];
+    const prevEnd = prev.x + Math.max(prev.width, 0);
+    const gap = cur.x - prevEnd;
+    const refHeight = Math.max(cur.height, prev.height, 10);
+
+    if (gap >= Math.max(refHeight * 1.8, 18)) {
+      segments.push([cur]);
+    } else {
+      segments[segments.length - 1].push(cur);
+    }
+  }
+
+  return segments;
+}
+
+function orderVisualLinesForColumns(
+  lines: VisualLine[],
+  hasRealCoords: boolean,
+): VisualLine[] {
+  if (!hasRealCoords || lines.length === 0) {
+    return lines;
+  }
+
+  const byY = [...lines].sort((a, b) => b.y - a.y || a.minX - b.minX);
+  if (byY.length < 4) {
+    return byY;
+  }
+
+  const pageMinX = Math.min(...byY.map((l) => l.minX));
+  const pageMaxX = Math.max(...byY.map((l) => l.maxX));
+  const pageSpan = pageMaxX - pageMinX;
+  if (pageSpan < 220) {
+    return byY;
+  }
+
+  const narrowLines = byY.filter(
+    (l) => l.maxX - l.minX <= pageSpan * 0.65 && l.text.trim().length >= 2,
+  );
+  if (narrowLines.length < 3) {
+    return byY;
+  }
+
+  interface ColumnCluster {
+    minX: number;
+    maxX: number;
+    minY: number;
+    maxY: number;
+    lines: VisualLine[];
+  }
+
+  const sortedByMinX = [...narrowLines].sort((a, b) => a.minX - b.minX);
+  const clusters: ColumnCluster[] = [];
+  for (const line of sortedByMinX) {
+    const last = clusters[clusters.length - 1];
+    if (!last || line.minX > last.maxX + 12) {
+      clusters.push({
+        minX: line.minX,
+        maxX: line.maxX,
+        minY: line.y,
+        maxY: line.y,
+        lines: [line],
+      });
+    } else {
+      last.maxX = Math.max(last.maxX, line.maxX);
+      last.minY = Math.min(last.minY, line.y);
+      last.maxY = Math.max(last.maxY, line.y);
+      last.lines.push(line);
+    }
+  }
+
+  const validClusters = clusters.filter(
+    (c) =>
+      c.lines.length >= 2 &&
+      (c.maxX - c.minX >= 30 || c.lines.some((l) => l.text.trim().length >= 8)),
+  );
+  if (validClusters.length < 2) {
+    return byY;
+  }
+
+  let hasParallelOverlap = false;
+  for (let i = 0; i < validClusters.length && !hasParallelOverlap; i++) {
+    for (let j = i + 1; j < validClusters.length; j++) {
+      const overlapY =
+        Math.min(validClusters[i].maxY, validClusters[j].maxY) -
+        Math.max(validClusters[i].minY, validClusters[j].minY);
+      if (overlapY >= -4) {
+        hasParallelOverlap = true;
+        break;
+      }
+    }
+  }
+  if (!hasParallelOverlap) {
+    return byY;
+  }
+
+  const gutters: number[] = [];
+  for (let i = 0; i < validClusters.length - 1; i++) {
+    gutters.push((validClusters[i].maxX + validClusters[i + 1].minX) / 2);
+  }
+
+  const classifyColumn = (line: VisualLine): number => {
+    for (const g of gutters) {
+      if (line.minX < g - 6 && line.maxX > g + 6) {
+        return -1; // Full-width spanning line across gutter
+      }
+    }
+    const midX = (line.minX + line.maxX) / 2;
+    let col = 0;
+    while (col < gutters.length && midX > gutters[col]) {
+      col += 1;
+    }
+    return col;
+  };
+
+  const ordered: VisualLine[] = [];
+  let nextRegionId = 1;
+  let pendingSpanning: VisualLine[] = [];
+  let pendingBand: Array<{ line: VisualLine; col: number }> = [];
+
+  const flushSpanning = () => {
+    if (pendingSpanning.length === 0) return;
+    const regionId = nextRegionId++;
+    for (const l of pendingSpanning) {
+      ordered.push({ ...l, regionId });
+    }
+    pendingSpanning = [];
+  };
+
+  const flushBand = () => {
+    if (pendingBand.length === 0) return;
+    const colSet = new Set(pendingBand.map((item) => item.col));
+    if (colSet.size <= 1) {
+      const regionId = nextRegionId++;
+      const sorted = [...pendingBand]
+        .map((item) => item.line)
+        .sort((a, b) => b.y - a.y || a.minX - b.minX);
+      for (const l of sorted) {
+        ordered.push({ ...l, regionId });
+      }
+      pendingBand = [];
+      return;
+    }
+
+    for (let col = 0; col <= gutters.length; col++) {
+      const colLines = pendingBand
+        .filter((item) => item.col === col)
+        .map((item) => item.line)
+        .sort((a, b) => b.y - a.y || a.minX - b.minX);
+      if (colLines.length === 0) continue;
+      const regionId = nextRegionId++;
+      for (const l of colLines) {
+        ordered.push({ ...l, regionId });
+      }
+    }
+    pendingBand = [];
+  };
+
+  for (const line of byY) {
+    const col = classifyColumn(line);
+    if (col === -1) {
+      flushBand();
+      pendingSpanning.push(line);
+    } else {
+      flushSpanning();
+      pendingBand.push({ line, col });
+    }
+  }
+  flushSpanning();
+  flushBand();
+
+  return ordered;
 }
 
 /**
@@ -178,42 +363,45 @@ export function extractParagraphsFromTextItems(
   }
 
   const visualLines: VisualLine[] = [];
-  for (const bucket of lineBuckets) {
-    if (bucket.length === 0) continue;
-    const text = joinLineTokens(bucket);
-    if (!text) continue;
+  for (const rawBucket of lineBuckets) {
+    if (rawBucket.length === 0) continue;
+    const subBuckets = splitBucketAcrossColumnGutters(rawBucket);
+    for (const bucket of subBuckets) {
+      const text = joinLineTokens(bucket);
+      if (!text) continue;
 
-    const ys = bucket.map((b) => b.y);
-    const xs = bucket.map((b) => b.x);
-    const endXs = bucket.map((b) => b.x + Math.max(b.width, 0));
-    const heights = bucket.map((b) => b.height);
+      const ys = bucket.map((b) => b.y);
+      const xs = bucket.map((b) => b.x);
+      const endXs = bucket.map((b) => b.x + Math.max(b.width, 0));
+      const heights = bucket.map((b) => b.height);
 
-    visualLines.push({
-      y: ys.reduce((a, b) => a + b, 0) / ys.length,
-      minX: Math.min(...xs),
-      maxX: Math.max(...endXs),
-      height: Math.max(...heights, 10),
-      text,
-    });
+      visualLines.push({
+        y: ys.reduce((a, b) => a + b, 0) / ys.length,
+        minX: Math.min(...xs),
+        maxX: Math.max(...endXs),
+        height: Math.max(...heights, 10),
+        text,
+        regionId: 0,
+      });
+    }
   }
 
-  // Sort top-to-bottom if coordinates are valid non-zero PDF coordinates
+  // Order visual lines top-to-bottom while respecting multi-column regions
   const hasRealCoords = visualLines.some((l) => l.y !== 0);
-  if (hasRealCoords) {
-    visualLines.sort((a, b) => b.y - a.y);
-  }
+  const orderedLines = orderVisualLinesForColumns(visualLines, hasRealCoords);
 
   const paragraphs: string[] = [];
   let currentPara = '';
   let prevLine: VisualLine | null = null;
 
-  for (const line of visualLines) {
+  for (const line of orderedLines) {
     if (!prevLine) {
       currentPara = line.text;
       prevLine = line;
       continue;
     }
 
+    const regionChanged = line.regionId !== prevLine.regionId;
     const verticalDrop = hasRealCoords ? Math.abs(prevLine.y - line.y) : line.height * 1.2;
     const refHeight = Math.max(prevLine.height, line.height, 10);
     const fontJump = Math.abs(prevLine.height - line.height) > refHeight * 0.14;
@@ -232,6 +420,7 @@ export function extractParagraphsFromTextItems(
     const bulletStart = /^(?:[-•*▪]|\d+[.)]|\([a-z0-9]+\))\s+/i.test(line.text);
 
     if (
+      regionChanged ||
       largeGap ||
       fontJump ||
       prevIsHeading ||

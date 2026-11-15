@@ -309,6 +309,40 @@ describe('DelimiterPromptCodec ("通用翻译" %% streaming & mismatch recovery)
       { id: 3, trans: '第三段上半\n\n第三段下半' },
     ]);
   });
+
+  it('strips leading %% delimiter artifacts without shifting slots and tracks emittedIds accurately across empty segments', () => {
+    const items = [
+      { id: 10, text: 'First' },
+      { id: 20, text: 'Second' },
+      { id: 30, text: 'Third' },
+    ];
+
+    // Batch decode with leading `%%` must align slot 0 -> id: 10
+    expect(
+      delimiterPromptCodec.decode('%%\n\n第一段\n\n%%\n\n第二段\n\n%%\n\n第三段', items),
+    ).toEqual([
+      { id: 10, trans: '第一段' },
+      { id: 20, trans: '第二段' },
+      { id: 30, trans: '第三段' },
+    ]);
+
+    // Streaming parser with leading `%%` and an empty middle segment must never shift IDs or skip unemitted items in finish()
+    const parser = delimiterPromptCodec.createStreamParser(items);
+    expect(parser.push('%%\n\n第一段')).toEqual([
+      { id: 10, trans: '第一段', partial: true },
+    ]);
+    // Second segment is empty (`%%\n\n%%`), third segment starts
+    expect(parser.push('\n\n%%\n\n\n\n%%\n\n第三段')).toEqual([
+      { id: 10, trans: '第一段' },
+      { id: 30, trans: '第三段', partial: true },
+    ]);
+    const done = parser.finish();
+    expect(done.newlyReady).toEqual([{ id: 30, trans: '第三段' }]);
+    expect(done.allItems).toEqual([
+      { id: 10, trans: '第一段' },
+      { id: 30, trans: '第三段' },
+    ]);
+  });
 });
 
 describe('JsonBatchCodec & SingleTextMtCodec', () => {
@@ -725,5 +759,45 @@ describe('v2.3.0 Intra-Item Streaming & Context Window Macros', () => {
       items: [{ id: 1, text: 'Hello' }],
     });
     expect(jsonWithoutCtx.userPrompt).toBe('[{"id":1,"src":"Hello"}]');
+  });
+
+  it('handles even/odd backslash parity at chunk boundaries, "text" key, and arbitrary JSON key ordering in stream parser', () => {
+    const items = [
+      { id: 201, text: 'C:\\Users\\u0041' },
+      { id: 202, text: 'Order test' },
+      { id: 203, text: 'Text alias test' },
+    ];
+    const parser = jsonBatchCodec.createStreamParser(items);
+
+    // Even trailing backslashes `\\\\` (`C:\\`) MUST remain valid escaped backslash `C:\` in partial preview!
+    expect(parser.push('[{"id":1,"trans":"C:\\\\')).toEqual([
+      { id: 201, trans: 'C:\\', partial: true },
+    ]);
+    // Even backslashes followed by `u00` (`\\\\u00`) is literal `\u00`, NOT an incomplete unicode escape!
+    expect(parser.push('Users\\\\u00')).toEqual([
+      { id: 201, trans: 'C:\\Users\\u00', partial: true },
+    ]);
+    // Complete item 1, and start item 2 with `"src"` containing escaped quotes BEFORE `"trans"`
+    expect(
+      parser.push('41"},{"id":2,"src":"Say \\"hi\\", friend","trans":"你好，'),
+    ).toEqual([
+      { id: 201, trans: 'C:\\Users\\u0041' },
+      { id: 202, trans: '你好，', partial: true },
+    ]);
+    // Complete item 2, and emit item 3 with `"text"` BEFORE `"id"`
+    expect(
+      parser.push('朋友"},{"text":"文本字段别名","id":3}]'),
+    ).toEqual([
+      { id: 202, trans: '你好，朋友' },
+      { id: 203, trans: '文本字段别名' },
+    ]);
+
+    const finished = parser.finish();
+    expect(finished.newlyReady).toEqual([]);
+    expect(finished.allItems).toEqual([
+      { id: 201, trans: 'C:\\Users\\u0041' },
+      { id: 202, trans: '你好，朋友' },
+      { id: 203, trans: '文本字段别名' },
+    ]);
   });
 });

@@ -49,7 +49,7 @@ export interface PromptsGlossaryTabProps {
   draft: MarginConfig;
   onMutate: (mutator: (next: MarginConfig) => void) => void;
   registerPendingFlush?: (fn: (() => void) | null) => void;
-  onEnsureSavedBeforeTest?: () => Promise<void>;
+  onEnsureSavedBeforeTest?: () => Promise<boolean>;
 }
 
 type PromptSlot =
@@ -465,7 +465,17 @@ export function PromptsGlossaryTab({
     const startedAt = performance.now();
     try {
       if (onEnsureSavedBeforeTest) {
-        await onEnsureSavedBeforeTest();
+        const savedOk = await onEnsureSavedBeforeTest();
+        if (!savedOk) {
+          setTrialResult({
+            ok: false,
+            error:
+              lang === 'en'
+                ? 'Could not save prompt settings before live trial.'
+                : '无法在在线试译前保存提示词配置，请先排查保存错误。',
+          });
+          return;
+        }
       }
       const res = await requestBatchTranslation({
         requestId: `studio-trial-${Date.now()}`,

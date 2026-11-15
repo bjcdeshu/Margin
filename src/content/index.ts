@@ -194,6 +194,8 @@ export class MarginContentController {
   private hydrationMaxTimeoutTimer: ReturnType<typeof setTimeout> | null = null;
   private lastHydrationCheckAt: number | null = null;
   private hydrationCheckCount = 0;
+  private lastObservedUrl = '';
+  private urlMutationObserver: MutationObserver | null = null;
   private unsubscribeStorage: (() => void) | null = null;
   private cleanupRuntimeMessage: (() => void) | null = null;
   private cleanupDomListeners: (() => void) | null = null;
@@ -501,10 +503,15 @@ export class MarginContentController {
       cmd.type === 'margin:cmd:toggle-mask' ||
       cmd.type === 'margin:cmd:translate-input'
     ) {
-      void this.handleCommand(
-        { type: cmd.type } as TabCommandMessage,
-        'cmd',
-      ).then((res) => {
+      const tabCmd: TabCommandMessage =
+        cmd.type === 'margin:cmd:toggle-page' &&
+        typeof (cmd as { targetActive?: unknown }).targetActive === 'boolean'
+          ? {
+              type: 'margin:cmd:toggle-page',
+              targetActive: (cmd as { targetActive: boolean }).targetActive,
+            }
+          : ({ type: cmd.type } as TabCommandMessage);
+      void this.handleCommand(tabCmd, 'cmd').then((res) => {
         sendResponse({
           ok: true,
           result: res,
@@ -525,6 +532,7 @@ export class MarginContentController {
     }
 
     this.mounted = true;
+    this.lastObservedUrl = currentUrl;
     this.hadRuntimeIdAtMount = Boolean(globalThis.chrome?.runtime?.id);
 
     if (!this.isCurrentUrlExcluded()) {
@@ -602,18 +610,21 @@ export class MarginContentController {
     };
 
     const onUrlChange = () => {
+      if (!this.mounted) return;
       if (!isExtensionContextValid(this.hadRuntimeIdAtMount)) {
         this.destroy({ contextInvalidated: true });
         return;
       }
 
+      this.lastObservedUrl = this.getUrl();
       this.renderer.invalidatePageContextCache();
       this.renderer.updateConfig(this.config);
 
       if (
-        (this.autoTranslated || !this.manuallyEnabled) &&
         this.renderer.isPageTranslationActive() &&
-        this.isCurrentUrlExcluded()
+        (this.isExplicitlyDomainExcluded() ||
+          ((this.autoTranslated || !this.manuallyEnabled) &&
+            this.isCurrentUrlExcluded()))
       ) {
         this.disablePageTranslation();
         return;
@@ -640,11 +651,46 @@ export class MarginContentController {
       }
     };
 
+    const checkUrlChanged = () => {
+      if (!this.mounted) return;
+      const nextUrl = this.getUrl();
+      if (nextUrl !== this.lastObservedUrl) {
+        onUrlChange();
+      }
+    };
+
+    const navTarget = (
+      win as Window & { navigation?: EventTarget | null }
+    ).navigation;
+    const onNavigateEvent = () => {
+      checkUrlChanged();
+      queueMicrotask(checkUrlChanged);
+      setTimeout(checkUrlChanged, 0);
+    };
+
+    if (typeof MutationObserver !== 'undefined' && this.doc.body) {
+      this.urlMutationObserver = new MutationObserver((mutations) => {
+        if (!this.mounted) return;
+        for (let i = 0; i < mutations.length; i++) {
+          if (!isMarginInternalMutation(mutations[i])) {
+            checkUrlChanged();
+            break;
+          }
+        }
+      });
+      this.urlMutationObserver.observe(this.doc.body, {
+        childList: true,
+        subtree: true,
+        characterData: true,
+      });
+    }
+
     win.addEventListener('keydown', onKeyDown, false);
     win.addEventListener('popstate', onUrlChange);
     win.addEventListener('hashchange', onUrlChange);
     win.addEventListener('yt-navigate-finish', onUrlChange);
     this.doc.addEventListener('yt-navigate-finish', onUrlChange);
+    navTarget?.addEventListener('navigate', onNavigateEvent);
 
     this.cleanupDomListeners = () => {
       win.removeEventListener('keydown', onKeyDown, false);
@@ -652,6 +698,9 @@ export class MarginContentController {
       win.removeEventListener('hashchange', onUrlChange);
       win.removeEventListener('yt-navigate-finish', onUrlChange);
       this.doc.removeEventListener('yt-navigate-finish', onUrlChange);
+      navTarget?.removeEventListener('navigate', onNavigateEvent);
+      this.urlMutationObserver?.disconnect();
+      this.urlMutationObserver = null;
     };
   }
 
@@ -719,6 +768,18 @@ export class MarginContentController {
     if (command.type === 'margin:cmd:clear-page-cache') {
       this.renderer.clearCache();
       return true;
+    }
+
+    if (
+      command.type === 'margin:cmd:toggle-page' &&
+      typeof command.targetActive === 'boolean'
+    ) {
+      if (this.renderer.isActive === command.targetActive) {
+        return this.renderer.isActive;
+      }
+      if (command.targetActive && this.isCurrentUrlExcluded()) {
+        return false;
+      }
     }
 
     if (this.isDuplicateCrossSourceTrigger(command.type, source)) {

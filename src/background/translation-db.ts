@@ -317,6 +317,8 @@ export class IndexedDbTranslationAdapter
 
     try {
       const tx = db.transaction(this.storeName, 'readonly');
+      const txDone = idbTransactionComplete(tx);
+      txDone.catch(() => {});
       const store = tx.objectStore(this.storeName);
 
       const records = await Promise.all(
@@ -324,7 +326,7 @@ export class IndexedDbTranslationAdapter
           idbRequestToPromise<TranslationDbRecord | undefined>(store.get(k)),
         ),
       );
-      await idbTransactionComplete(tx);
+      await txDone;
 
       for (const rec of records) {
         if (!rec) continue;
@@ -351,11 +353,13 @@ export class IndexedDbTranslationAdapter
   ): Promise<void> {
     try {
       const tx = db.transaction(this.storeName, 'readwrite');
+      const txDone = idbTransactionComplete(tx);
+      txDone.catch(() => {});
       const store = tx.objectStore(this.storeName);
       for (const key of keys) {
         store.delete(key);
       }
-      await idbTransactionComplete(tx);
+      await txDone;
     } catch {
       // Ignore opportunistic cleanup failures
     }
@@ -375,6 +379,8 @@ export class IndexedDbTranslationAdapter
 
     try {
       const tx = db.transaction(this.storeName, 'readwrite');
+      const txDone = idbTransactionComplete(tx);
+      txDone.catch(() => {});
       const store = tx.objectStore(this.storeName);
 
       for (const entry of entries) {
@@ -389,7 +395,7 @@ export class IndexedDbTranslationAdapter
         store.put(record);
       }
 
-      await idbTransactionComplete(tx);
+      await txDone;
       await this.pruneStoreIfNeeded(db, currentNow);
     } catch {
       // Never fail live translation RPCs due to IndexedDB storage quota/errors
@@ -402,6 +408,8 @@ export class IndexedDbTranslationAdapter
   ): Promise<void> {
     try {
       const tx = db.transaction(this.storeName, 'readwrite');
+      const txDone = idbTransactionComplete(tx);
+      txDone.catch(() => {});
       const store = tx.objectStore(this.storeName);
 
       // 1. Delete expired records via `byExpiresAt` index when IDBKeyRange is available
@@ -414,15 +422,22 @@ export class IndexedDbTranslationAdapter
         await new Promise<void>((resolve) => {
           const cursorReq = expIndex.openCursor(range);
           cursorReq.onsuccess = () => {
-            const cursor = cursorReq.result;
-            if (cursor) {
-              cursor.delete();
-              cursor.continue();
-            } else {
+            try {
+              const cursor = cursorReq.result;
+              if (cursor) {
+                cursor.delete();
+                cursor.continue();
+              } else {
+                resolve();
+              }
+            } catch {
               resolve();
             }
           };
-          cursorReq.onerror = () => resolve();
+          cursorReq.onerror = (event) => {
+            event?.preventDefault?.();
+            resolve();
+          };
         });
       }
 
@@ -434,20 +449,27 @@ export class IndexedDbTranslationAdapter
         await new Promise<void>((resolve) => {
           const cursorReq = updIndex.openCursor(null, 'next');
           cursorReq.onsuccess = () => {
-            const cursor = cursorReq.result;
-            if (cursor && toDelete > 0) {
-              cursor.delete();
-              toDelete--;
-              cursor.continue();
-            } else {
+            try {
+              const cursor = cursorReq.result;
+              if (cursor && toDelete > 0) {
+                cursor.delete();
+                toDelete--;
+                cursor.continue();
+              } else {
+                resolve();
+              }
+            } catch {
               resolve();
             }
           };
-          cursorReq.onerror = () => resolve();
+          cursorReq.onerror = (event) => {
+            event?.preventDefault?.();
+            resolve();
+          };
         });
       }
 
-      await idbTransactionComplete(tx);
+      await txDone;
     } catch {
       // Ignore pruning errors
     }
@@ -461,6 +483,8 @@ export class IndexedDbTranslationAdapter
     const currentNow = now ?? this.nowFn();
     try {
       const tx = db.transaction(this.storeName, 'readonly');
+      const txDone = idbTransactionComplete(tx);
+      txDone.catch(() => {});
       const store = tx.objectStore(this.storeName);
       if (
         typeof IDBKeyRange !== 'undefined' &&
@@ -470,11 +494,11 @@ export class IndexedDbTranslationAdapter
         const validCount = await idbRequestToPromise<number>(
           expIndex.count(IDBKeyRange.lowerBound(currentNow, true)),
         );
-        await idbTransactionComplete(tx);
+        await txDone;
         return validCount;
       }
       const countVal = await idbRequestToPromise<number>(store.count());
-      await idbTransactionComplete(tx);
+      await txDone;
       return countVal;
     } catch {
       return 0;
@@ -488,8 +512,10 @@ export class IndexedDbTranslationAdapter
 
     try {
       const tx = db.transaction(this.storeName, 'readwrite');
+      const txDone = idbTransactionComplete(tx);
+      txDone.catch(() => {});
       tx.objectStore(this.storeName).clear();
-      await idbTransactionComplete(tx);
+      await txDone;
     } catch {
       // Ignore clear errors
     }

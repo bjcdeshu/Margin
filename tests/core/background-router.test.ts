@@ -6,9 +6,11 @@ import {
   dispatchShortcutCommand,
   handleContextMenuClicked,
   handleRuntimeRpcRequest,
+  handleTranslateBatch,
   inFlightTranslations,
   parseVisionTranslationOutput,
   resetRouterTransientStateForTests,
+  TranslationLruCache,
 } from '../../src/background';
 import {
   buildDiagnosticSnapshot,
@@ -1108,5 +1110,575 @@ describe('MV3 Background Router, Vision BBox Parser, DNR Anti-403, Stream Port &
     );
     expect(res2).toEqual({ ok: true });
     expect(pendingWarmupFetch).toHaveBeenCalledTimes(1);
+  });
+
+  it('evaluates path-scoped glossaries in cache signatures using context.url ahead of context.domain (#127 #5)', async () => {
+    const config = createDefaultMarginConfig();
+    config.providers['path-glossary-ai'] = {
+      id: 'path-glossary-ai',
+      name: 'Path Glossary AI',
+      preset: 'openai',
+      protocol: 'openai-chat',
+      enabled: true,
+      baseUrl: 'https://gateway.example.com/v1',
+      apiKeys: ['sk-PATH_FAKE'],
+      model: 'gpt-4.1-mini',
+      models: ['gpt-4.1-mini'],
+      assistantId: 'builtin-yaml',
+      enableContext: true,
+      enableRichHtml: true,
+      stream: 'off',
+      rateLimitRps: 50,
+      maxConcurrency: 4,
+      temperaturePolicy: { mode: 'omit' },
+      thinkingPolicy: { mode: 'provider-default' },
+    };
+    config.routing.webpage = 'path-glossary-ai';
+    config.glossary = [
+      {
+        k: 'Agent',
+        v: '智能体（OrgA专有）',
+        domain: 'https://github.com/org-a/*',
+      },
+    ];
+    await saveMarginConfig(config);
+
+    let callNum = 0;
+    const fetchSpy = vi.fn(async (_url: RequestInfo | URL, init?: RequestInit) => {
+      callNum++;
+      const bodyStr = String(init?.body ?? '');
+      const hasOrgAGlossary = bodyStr.includes('智能体（OrgA专有）');
+      return jsonResponse({
+        choices: [
+          {
+            message: {
+              content: `<yaml>\n- id: 1\n  trans: ${hasOrgAGlossary ? '使用OrgA术语译文' : '通用译文'}-${callNum}\n</yaml>`,
+            },
+          },
+        ],
+      });
+    });
+
+    const env = {
+      fetchImpl: fetchSpy as unknown as typeof fetch,
+      pool: new ProviderExecutionPool(),
+    };
+
+    // 1. Translate on `org-a` path (with BOTH `domain` and `url` present in `context`)
+    const orgAResp = (await handleRuntimeRpcRequest(
+      {
+        type: 'margin:translate-batch',
+        payload: {
+          requestId: 'path-1',
+          scene: 'webpage',
+          fromLang: 'en',
+          toLang: 'zh-CN',
+          context: {
+            domain: 'github.com',
+            url: 'https://github.com/org-a/sdk/issues/1',
+          },
+          items: [{ id: 1, text: 'Deploy the Agent workflow.' }],
+        },
+      },
+      env,
+    )) as TranslateBatchResponse;
+    expect(orgAResp.ok).toBe(true);
+    expect(orgAResp.items[0]?.trans).toContain('使用OrgA术语译文');
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+
+    // 2. Translate identical text on `org-b` path -> MUST NOT hit `org-a`'s path-scoped cache entry!
+    const orgBResp = (await handleRuntimeRpcRequest(
+      {
+        type: 'margin:translate-batch',
+        payload: {
+          requestId: 'path-2',
+          scene: 'webpage',
+          fromLang: 'en',
+          toLang: 'zh-CN',
+          context: {
+            domain: 'github.com',
+            url: 'https://github.com/org-b/sdk/issues/1',
+          },
+          items: [{ id: 1, text: 'Deploy the Agent workflow.' }],
+        },
+      },
+      env,
+    )) as TranslateBatchResponse;
+    expect(orgBResp.ok).toBe(true);
+    expect(orgBResp.items[0]?.trans).toContain('通用译文');
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
+  });
+
+  it('ref-counts shared singleflight aborts across owner + subscribers, coalesces rescues via acquire-or-subscribe, surfaces partial-hit rescue errors, and aborts replaced duplicate stream requestIds (#127 #14 & #9)', async () => {
+    const config = createDefaultMarginConfig();
+    config.providers['sf-hardened'] = {
+      id: 'sf-hardened',
+      name: 'SF Hardened',
+      preset: 'openai',
+      protocol: 'openai-chat',
+      enabled: true,
+      baseUrl: 'https://gateway.example.com/v1',
+      apiKeys: ['sk-SF_HARDENED'],
+      model: 'gpt-4.1-mini',
+      models: ['gpt-4.1-mini'],
+      assistantId: 'builtin-yaml',
+      enableContext: false,
+      enableRichHtml: true,
+      stream: 'on',
+      rateLimitRps: 50,
+      maxConcurrency: 4,
+      temperaturePolicy: { mode: 'omit' },
+      thinkingPolicy: { mode: 'provider-default' },
+    };
+    config.routing.webpage = 'sf-hardened';
+    await saveMarginConfig(config);
+
+    // --- Part A: Owner abort does NOT kill live subscriber's upstream flight ---
+    let releaseSharedFetch!: () => void;
+    let upstreamSignalAborted = false;
+    const sharedGate = new Promise<void>((r) => {
+      releaseSharedFetch = r;
+    });
+    const sharedFetch = vi.fn(
+      async (_url: RequestInfo | URL, init?: RequestInit) => {
+        init?.signal?.addEventListener('abort', () => {
+          upstreamSignalAborted = true;
+        });
+        await sharedGate;
+        return jsonResponse({
+          choices: [
+            {
+              message: {
+                content: '<yaml>\n- id: 1\n  trans: 存活订阅者收到译文\n</yaml>',
+              },
+            },
+          ],
+        });
+      },
+    );
+
+    const ownerCtrl = new AbortController();
+    const subCtrl = new AbortController();
+    const pool = new ProviderExecutionPool();
+
+    const ownerPromise = handleTranslateBatch(
+      {
+        requestId: 'owner-1',
+        scene: 'webpage',
+        fromLang: 'en',
+        toLang: 'zh-CN',
+        items: [{ id: 1, text: 'Shared paragraph across two tabs' }],
+      },
+      config,
+      {
+        fetchImpl: sharedFetch as unknown as typeof fetch,
+        pool,
+        signal: ownerCtrl.signal,
+      },
+    );
+
+    await new Promise((r) => setTimeout(r, 10));
+    expect(inFlightTranslations.size).toBe(1);
+
+    const subPromise = handleTranslateBatch(
+      {
+        requestId: 'sub-1',
+        scene: 'webpage',
+        fromLang: 'en',
+        toLang: 'zh-CN',
+        items: [{ id: 7, text: 'Shared paragraph across two tabs' }],
+      },
+      config,
+      {
+        fetchImpl: sharedFetch as unknown as typeof fetch,
+        pool,
+        signal: subCtrl.signal,
+      },
+    );
+
+    await new Promise((r) => setTimeout(r, 10));
+
+    // Abort Tab 1 (owner) while Tab 2 (subscriber) is still waiting!
+    ownerCtrl.abort();
+    await expect(ownerPromise).rejects.toMatchObject({ name: 'AbortError' });
+    expect(upstreamSignalAborted).toBe(false);
+
+    releaseSharedFetch();
+    const subResult = await subPromise;
+    expect(sharedFetch).toHaveBeenCalledTimes(1);
+    expect(subResult.ok).toBe(true);
+    expect(subResult.items).toEqual([{ id: 7, trans: '存活订阅者收到译文' }]);
+    expect(inFlightTranslations.size).toBe(0);
+
+    // --- Part B: Concurrent subscribers rescuing an omitted item coalesce into 1 rescue fetch ---
+    backgroundTranslationCache.clear();
+    let rescueTestCall = 0;
+    const omitThenRescueFetch = vi.fn(async () => {
+      rescueTestCall++;
+      await new Promise((r) => setTimeout(r, 15));
+      if (rescueTestCall === 1) {
+        // Owner requested id 1 and id 2, but LLM omitted id 2!
+        return jsonResponse({
+          choices: [
+            {
+              message: {
+                content: '<yaml>\n- id: 1\n  trans: 首项译文\n</yaml>',
+              },
+            },
+          ],
+        });
+      }
+      return jsonResponse({
+        choices: [
+          {
+            message: {
+              content: '<yaml>\n- id: 2\n  trans: 救援合并译文\n</yaml>',
+            },
+          },
+        ],
+      });
+    });
+
+    const ownerPartial = handleTranslateBatch(
+      {
+        requestId: 'rescue-owner',
+        scene: 'webpage',
+        fromLang: 'en',
+        toLang: 'zh-CN',
+        items: [
+          { id: 1, text: 'Item One' },
+          { id: 2, text: 'Omitted Item Two' },
+        ],
+      },
+      config,
+      { fetchImpl: omitThenRescueFetch as unknown as typeof fetch, pool },
+    );
+
+    await new Promise((r) => setTimeout(r, 5));
+
+    // Two concurrent subscribers both waiting on `Omitted Item Two`
+    const subRescueA = handleTranslateBatch(
+      {
+        requestId: 'rescue-sub-a',
+        scene: 'webpage',
+        fromLang: 'en',
+        toLang: 'zh-CN',
+        items: [{ id: 2, text: 'Omitted Item Two' }],
+      },
+      config,
+      { fetchImpl: omitThenRescueFetch as unknown as typeof fetch, pool },
+    );
+    const subRescueB = handleTranslateBatch(
+      {
+        requestId: 'rescue-sub-b',
+        scene: 'webpage',
+        fromLang: 'en',
+        toLang: 'zh-CN',
+        items: [{ id: 2, text: 'Omitted Item Two' }],
+      },
+      config,
+      { fetchImpl: omitThenRescueFetch as unknown as typeof fetch, pool },
+    );
+
+    const [, resA, resB] = await Promise.all([
+      ownerPartial,
+      subRescueA,
+      subRescueB,
+    ]);
+    // 1 initial owner call + ONLY 1 coalesced rescue call (NOT 2 duplicate rescues!)
+    expect(omitThenRescueFetch).toHaveBeenCalledTimes(2);
+    expect(resA.ok).toBe(true);
+    expect(resB.ok).toBe(true);
+    expect(resA.items).toEqual([{ id: 2, trans: '救援合并译文' }]);
+    expect(resB.items).toEqual([{ id: 2, trans: '救援合并译文' }]);
+    expect(inFlightTranslations.size).toBe(0);
+
+    // --- Part C: Rescue failure is surfaced (`ok: false`) even when another item in the batch hit cache (`resolvedOutputs.size > 0`) ---
+    // Note: `'Item One'` is now cached from Part B!
+    let failRescueCall = 0;
+    const failRescueFetch = vi.fn(async () => {
+      failRescueCall++;
+      await new Promise((r) => setTimeout(r, 10));
+      if (failRescueCall === 1) {
+        return jsonResponse({ error: { message: 'Gateway down' } }, 500);
+      }
+      return jsonResponse({ error: { message: 'Rescue also failed' } }, 500);
+    });
+
+    const doomOwner = handleTranslateBatch(
+      {
+        requestId: 'doom-owner',
+        scene: 'webpage',
+        fromLang: 'en',
+        toLang: 'zh-CN',
+        items: [{ id: 9, text: 'Uncached doomed text' }],
+      },
+      config,
+      {
+        fetchImpl: failRescueFetch as unknown as typeof fetch,
+        pool,
+        retryBaseDelayMs: 0,
+      },
+    );
+    await new Promise((r) => setTimeout(r, 3));
+
+    const partialHitWithFailedRescue = await handleTranslateBatch(
+      {
+        requestId: 'partial-hit-sub',
+        scene: 'webpage',
+        fromLang: 'en',
+        toLang: 'zh-CN',
+        items: [
+          { id: 1, text: 'Item One' }, // hits cache (`resolvedOutputs.size === 1`)!
+          { id: 9, text: 'Uncached doomed text' }, // subscribes -> rescues -> fails!
+        ],
+      },
+      config,
+      {
+        fetchImpl: failRescueFetch as unknown as typeof fetch,
+        pool,
+        retryBaseDelayMs: 0,
+      },
+    );
+    await doomOwner;
+
+    expect(partialHitWithFailedRescue.ok).toBe(false);
+    expect(partialHitWithFailedRescue.error?.code).toBe('HTTP_500');
+
+    // --- Part D: Duplicate `requestId` on `attachStreamTranslationPort` aborts replaced controller & preserves new controller ---
+    const signalsSeen: AbortSignal[] = [];
+    let releaseSecondStream!: () => void;
+    const secondStreamGate = new Promise<void>((r) => {
+      releaseSecondStream = r;
+    });
+
+    const dupStreamFetch = vi.fn(
+      async (_url: RequestInfo | URL, init?: RequestInit) => {
+        const sig = init?.signal!;
+        signalsSeen.push(sig);
+        if (signalsSeen.length === 1) {
+          return new Promise<Response>((_, reject) => {
+            sig.addEventListener('abort', () => {
+              reject(new DOMException('Aborted', 'AbortError'));
+            });
+          });
+        }
+        await secondStreamGate;
+        const enc = new TextEncoder();
+        const rs = new ReadableStream<Uint8Array>({
+          start(ctrl) {
+            ctrl.enqueue(
+              enc.encode(
+                'data: {"choices":[{"delta":{"content":"<yaml>\\n- id: 1\\n  trans: 新流译文\\n</yaml>"}}]}\n\ndata: [DONE]\n\n',
+              ),
+            );
+            ctrl.close();
+          },
+        });
+        return new Response(rs, { status: 200 });
+      },
+    );
+
+    const portPosted: TranslateStreamPortMessage[] = [];
+    const portMsgListeners: Array<(m: unknown) => void> = [];
+    let resolvePortDone!: () => void;
+    const portDone = new Promise<void>((r) => {
+      resolvePortDone = r;
+    });
+
+    attachStreamTranslationPort(
+      {
+        name: BRAND.streamPortName,
+        postMessage: (msg: TranslateStreamPortMessage) => {
+          portPosted.push(msg);
+          if (msg.type === 'done' || msg.type === 'error') {
+            resolvePortDone();
+          }
+        },
+        disconnect: vi.fn(),
+        onMessage: {
+          addListener: (fn: (m: unknown) => void) => portMsgListeners.push(fn),
+        },
+        onDisconnect: { addListener: vi.fn() },
+      } as unknown as chrome.runtime.Port,
+      {
+        fetchImpl: dupStreamFetch as unknown as typeof fetch,
+        pool: new ProviderExecutionPool(),
+      },
+    );
+
+    portMsgListeners[0]!({
+      type: 'start',
+      payload: {
+        requestId: 'dup-req',
+        scene: 'webpage',
+        fromLang: 'en',
+        toLang: 'zh-CN',
+        items: [{ id: 1, text: 'First stream attempt' }],
+      },
+    } satisfies TranslateStreamPortMessage);
+
+    await new Promise((r) => setTimeout(r, 15));
+    expect(signalsSeen).toHaveLength(1);
+    expect(signalsSeen[0]!.aborted).toBe(false);
+
+    // Send second `start` with same `requestId: 'dup-req'` -> immediately aborts first flight!
+    portMsgListeners[0]!({
+      type: 'start',
+      payload: {
+        requestId: 'dup-req',
+        scene: 'webpage',
+        fromLang: 'en',
+        toLang: 'zh-CN',
+        items: [{ id: 1, text: 'Second stream attempt' }],
+      },
+    } satisfies TranslateStreamPortMessage);
+
+    expect(signalsSeen[0]!.aborted).toBe(true);
+    await new Promise((r) => setTimeout(r, 15));
+    expect(signalsSeen).toHaveLength(2);
+    // First flight's `finally` must NOT have deleted second flight's controller: verify by completing second flight cleanly
+    expect(signalsSeen[1]!.aborted).toBe(false);
+    releaseSecondStream();
+    await portDone;
+
+    const doneMsgs = portPosted.filter((m) => m.type === 'done');
+    expect(doneMsgs).toHaveLength(1);
+    if (doneMsgs[0]?.type === 'done') {
+      expect(doneMsgs[0].response.items).toEqual([
+        { id: 1, trans: '新流译文' },
+      ]);
+    }
+
+    // --- Part E: Storage `QUOTA_BYTES` errors on `appendDiagnosticSnapshot` never fail succeeded translations (#127 #9) ---
+    globalThis.chrome = {
+      storage: {
+        local: {
+          get: async (key: string) =>
+            key === BRAND.storageKeyConfig ? { [key]: config } : {},
+          set: async () => {
+            throw new Error('QUOTA_BYTES quota exceeded');
+          },
+        },
+      },
+    } as unknown as typeof chrome;
+
+    const quotaRes = (await handleRuntimeRpcRequest(
+      {
+        type: 'margin:translate-batch',
+        payload: {
+          requestId: 'quota-safe-1',
+          scene: 'input',
+          fromLang: 'en',
+          toLang: 'zh-CN',
+          items: [{ id: 1, text: 'Survives storage quota exhaustion' }],
+        },
+      },
+      {
+        fetchImpl: vi.fn(async () =>
+          jsonResponse({
+            choices: [
+              {
+                message: {
+                  content: '<yaml>\n- id: 1\n  trans: 配额满仍翻译成功\n</yaml>',
+                },
+              },
+            ],
+          }),
+        ) as unknown as typeof fetch,
+        pool: new ProviderExecutionPool(),
+      },
+    )) as TranslateBatchResponse;
+
+    expect(quotaRes.ok).toBe(true);
+    expect(quotaRes.items).toEqual([{ id: 1, trans: '配额满仍翻译成功' }]);
+
+    // --- Part F: `margin:clear-translation-cache` detaches active singleflight records so post-clear requests do not subscribe to pre-clear flights ---
+    let releasePreClearFlight!: () => void;
+    const preClearGate = new Promise<void>((r) => {
+      releasePreClearFlight = r;
+    });
+    let epochFetchCount = 0;
+    const epochFetch = vi.fn(async () => {
+      epochFetchCount += 1;
+      const callNo = epochFetchCount;
+      if (callNo === 1) {
+        await preClearGate;
+      }
+      return jsonResponse({
+        choices: [
+          {
+            message: {
+              content: `<yaml>\n- id: 1\n  trans: 第${callNo}代译文\n</yaml>`,
+            },
+          },
+        ],
+      });
+    });
+
+    globalThis.chrome = {
+      storage: {
+        local: {
+          get: async (key: string) =>
+            key === BRAND.storageKeyConfig ? { [key]: config } : {},
+          set: async () => undefined,
+        },
+      },
+    } as unknown as typeof chrome;
+
+    const sharedCache = new TranslationLruCache(64);
+    const sharedPool = new ProviderExecutionPool();
+    const preFlightPromise = handleRuntimeRpcRequest(
+      {
+        type: 'margin:translate-batch',
+        payload: {
+          requestId: 'epoch-pre-1',
+          scene: 'webpage',
+          fromLang: 'en',
+          toLang: 'zh-CN',
+          items: [{ id: 1, text: 'Epoch boundary test' }],
+        },
+      },
+      {
+        fetchImpl: epochFetch as unknown as typeof fetch,
+        pool: sharedPool,
+        translationCache: sharedCache,
+      },
+    ) as Promise<TranslateBatchResponse>;
+
+    await new Promise((r) => setTimeout(r, 15));
+    expect(epochFetchCount).toBe(1);
+
+    // Clear cache while pre-clear flight #1 is still in progress
+    await handleRuntimeRpcRequest(
+      { type: 'margin:clear-translation-cache' },
+      { translationCache: sharedCache },
+    );
+
+    // Post-clear request for identical text MUST NOT piggyback on detached pre-clear flight #1
+    const postFlightPromise = handleRuntimeRpcRequest(
+      {
+        type: 'margin:translate-batch',
+        payload: {
+          requestId: 'epoch-post-2',
+          scene: 'webpage',
+          fromLang: 'en',
+          toLang: 'zh-CN',
+          items: [{ id: 1, text: 'Epoch boundary test' }],
+        },
+      },
+      {
+        fetchImpl: epochFetch as unknown as typeof fetch,
+        pool: sharedPool,
+        translationCache: sharedCache,
+      },
+    ) as Promise<TranslateBatchResponse>;
+
+    const postRes = await postFlightPromise;
+    expect(epochFetchCount).toBe(2);
+    expect(postRes.items).toEqual([{ id: 1, trans: '第2代译文' }]);
+
+    releasePreClearFlight();
+    await preFlightPromise;
   });
 });

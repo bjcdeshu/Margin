@@ -597,6 +597,7 @@ export class InputQuickTranslator {
   private spaceTimestamps: number[] = [];
   private lastSpaceTarget: HTMLElement | null = null;
   private activeAbortController: AbortController | null = null;
+  private readonly activeCompositionTargets = new WeakSet<EventTarget>();
   private readonly undoSnapshots = new WeakMap<HTMLElement, UndoSnapshot>();
 
   private pillHost: HTMLElement | null = null;
@@ -638,12 +639,45 @@ export class InputQuickTranslator {
       this.spaceTimestamps = [];
     };
 
+    const resolveEventTargets = (ev: Event): EventTarget[] => {
+      if (typeof ev.composedPath === 'function') {
+        const path = ev.composedPath();
+        if (path.length > 0) {
+          return path;
+        }
+      }
+      return ev.target ? [ev.target] : [];
+    };
+
+    const onCompositionStart = (ev: Event) => {
+      const targets = resolveEventTargets(ev);
+      if (targets[0]) {
+        this.activeCompositionTargets.add(targets[0]);
+      }
+      if (ev.target) {
+        this.activeCompositionTargets.add(ev.target);
+      }
+      this.spaceTimestamps = [];
+    };
+    const onCompositionEnd = (ev: Event) => {
+      for (const t of resolveEventTargets(ev)) {
+        this.activeCompositionTargets.delete(t);
+      }
+      if (ev.target) {
+        this.activeCompositionTargets.delete(ev.target);
+      }
+    };
+
     win.addEventListener('keydown', onKeyDown, true);
     win.addEventListener('pointerdown', onPointerDown, true);
+    win.addEventListener('compositionstart', onCompositionStart, true);
+    win.addEventListener('compositionend', onCompositionEnd, true);
 
     this.cleanupListeners = () => {
       win.removeEventListener('keydown', onKeyDown, true);
       win.removeEventListener('pointerdown', onPointerDown, true);
+      win.removeEventListener('compositionstart', onCompositionStart, true);
+      win.removeEventListener('compositionend', onCompositionEnd, true);
     };
   }
 
@@ -810,8 +844,12 @@ export class InputQuickTranslator {
     explicitSourceText?: string,
   ): Promise<boolean> {
     if (!this.config.input.enabled || this.isUrlExcluded?.()) return false;
+    if (!editable.isConnected || this.activeCompositionTargets.has(editable)) {
+      return false;
+    }
 
-    const rawText = explicitSourceText ?? readEditableText(editable);
+    const baselineRawText = readEditableText(editable);
+    const rawText = explicitSourceText ?? baselineRawText;
     const sourceText = rawText.trim();
     if (!sourceText) return false;
 
@@ -822,6 +860,30 @@ export class InputQuickTranslator {
 
     const controller = new AbortController();
     this.activeAbortController = controller;
+
+    let editedOrComposingDuringFlight = false;
+    const abortOnUserEdit = () => {
+      editedOrComposingDuringFlight = true;
+      if (this.activeAbortController === controller) {
+        this.activeAbortController = null;
+      }
+      controller.abort();
+      this.hidePill();
+    };
+    const onFlightCompositionStart = () => {
+      this.activeCompositionTargets.add(editable);
+      editable.addEventListener(
+        'compositionend',
+        () => {
+          this.activeCompositionTargets.delete(editable);
+        },
+        { once: true },
+      );
+      abortOnUserEdit();
+    };
+    editable.addEventListener('input', abortOnUserEdit);
+    editable.addEventListener('compositionstart', onFlightCompositionStart);
+    editable.addEventListener('compositionupdate', abortOnUserEdit);
 
     this.showPill(editable, 'Margin · Translating…', false);
 
@@ -858,6 +920,16 @@ export class InputQuickTranslator {
         return false;
       }
 
+      if (
+        editedOrComposingDuringFlight ||
+        !editable.isConnected ||
+        this.activeCompositionTargets.has(editable) ||
+        readEditableText(editable) !== baselineRawText
+      ) {
+        this.hidePill();
+        return false;
+      }
+
       if (!response.ok || !response.items[0]?.trans?.trim()) {
         this.showTransientError(
           editable,
@@ -882,13 +954,19 @@ export class InputQuickTranslator {
       this.hidePill();
       return true;
     } catch (err) {
-      if (controller.signal.aborted) {
+      if (controller.signal.aborted || editedOrComposingDuringFlight) {
         return false;
       }
       const message = err instanceof Error ? err.message : 'Translation failed';
       this.showTransientError(editable, message);
       return false;
     } finally {
+      editable.removeEventListener('input', abortOnUserEdit);
+      editable.removeEventListener(
+        'compositionstart',
+        onFlightCompositionStart,
+      );
+      editable.removeEventListener('compositionupdate', abortOnUserEdit);
       if (this.activeAbortController === controller) {
         this.activeAbortController = null;
       }

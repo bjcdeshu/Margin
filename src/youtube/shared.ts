@@ -201,7 +201,7 @@ export interface YoutubeDomSegmentStyle {
 }
 
 export type YoutubeExtendedBridgeMessage =
-  | YoutubeMainBridgeMessage
+  | (YoutubeMainBridgeMessage & { seeked?: boolean })
   | {
       source: typeof BRAND.ytBridgeSourceMain;
       type: 'subtitle-toggle-request';
@@ -243,29 +243,187 @@ export function isTimedTextUrl(urlLike: string): boolean {
   }
 }
 
+export function extractTimedTextTrackIdentity(trackUrl?: string): string {
+  if (!trackUrl) return '';
+  try {
+    const parsed = new URL(trackUrl, 'https://www.youtube.com');
+    const vssId =
+      parsed.searchParams.get('vss_id') ??
+      parsed.searchParams.get('vssId') ??
+      '';
+    const kind = parsed.searchParams.get('kind') ?? '';
+    const name = parsed.searchParams.get('name') ?? '';
+    const lang = parsed.searchParams.get('lang') ?? '';
+    const tlang = parsed.searchParams.get('tlang') ?? '';
+    return [vssId, kind, name, lang, tlang]
+      .map((part) => part.trim())
+      .join('|');
+  } catch {
+    return '';
+  }
+}
+
+function hashCueContentFnv1a(cues: readonly SubtitleCue[]): string {
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < cues.length; i += 1) {
+    const cue = cues[i];
+    const entry = `${cue.tStartMs}:${cue.dDurationMs}:${cue.text}\n`;
+    for (let j = 0; j < entry.length; j += 1) {
+      hash ^= entry.charCodeAt(j);
+      hash = Math.imul(hash, 0x01000193);
+    }
+  }
+  return (hash >>> 0).toString(36);
+}
+
 export function buildSourceTrackFingerprint(
   videoId: string,
   langCode: string,
   cues: readonly SubtitleCue[],
+  trackUrl?: string,
 ): string {
   const firstStart = cues[0]?.tStartMs ?? 0;
   const lastStart = cues[cues.length - 1]?.tStartMs ?? 0;
-  return `${videoId}::${langCode || 'auto'}::${cues.length}::${firstStart}::${lastStart}`;
+  const trackIdentity = extractTimedTextTrackIdentity(trackUrl);
+  const contentHash = hashCueContentFnv1a(cues);
+  return `${videoId}::${langCode || 'auto'}::${trackIdentity}::${cues.length}::${firstStart}::${lastStart}::${contentHash}`;
+}
+
+const HTML_ENTITY_MAP: Readonly<Record<string, string>> = {
+  amp: '&',
+  lt: '<',
+  gt: '>',
+  quot: '"',
+  apos: "'",
+  nbsp: ' ',
+  ndash: '\u2013',
+  mdash: '\u2014',
+  hellip: '\u2026',
+  lsquo: '\u2018',
+  rsquo: '\u2019',
+  ldquo: '\u201C',
+  rdquo: '\u201D',
+  copy: '\u00A9',
+  reg: '\u00AE',
+  trade: '\u2122',
+  shy: '',
+  lrm: '',
+  rlm: '',
+  zwsp: '',
+};
+
+export function decodeSubtitleEntities(raw: string): string {
+  return String(raw ?? '').replace(
+    /&(#x[0-9a-fA-F]+|#\d+|[a-zA-Z]+);/g,
+    (full, entity: string) => {
+      if (entity.startsWith('#x') || entity.startsWith('#X')) {
+        const code = Number.parseInt(entity.slice(2), 16);
+        return Number.isFinite(code) &&
+          code > 0 &&
+          code <= 0x10ffff &&
+          (code < 0xd800 || code > 0xdfff)
+          ? String.fromCodePoint(code)
+          : full;
+      }
+      if (entity.startsWith('#')) {
+        const code = Number.parseInt(entity.slice(1), 10);
+        return Number.isFinite(code) &&
+          code > 0 &&
+          code <= 0x10ffff &&
+          (code < 0xd800 || code > 0xdfff)
+          ? String.fromCodePoint(code)
+          : full;
+      }
+      const mapped = HTML_ENTITY_MAP[entity.toLowerCase()];
+      return mapped !== undefined ? mapped : full;
+    },
+  );
+}
+
+const CDATA_WRAPPER_RE = /<!\[CDATA\[([\s\S]*?)\]\]>/g;
+const RUBY_RT_BLOCK_RE =
+  /<rt\b[^<>]*>[\s\S]*?(?:<\/\s*rt\s*>|(?=<\/\s*ruby\s*>|<rt\b))/gi;
+const RUBY_RP_BLOCK_RE =
+  /<rp\b[^<>]*>[\s\S]*?(?:<\/\s*rp\s*>|(?=<\/\s*ruby\s*>|<rt\b|<rp\b))/gi;
+const SUBTITLE_BR_TAG_RE =
+  /<br\b(?:(?:[\s;]+|(?<=["']))[a-zA-Z_:][\w:.-]*(?:\s*=\s*(?:"[^<>"]*"|'[^<>']*'|[^\s"'<>\/=;]+))?)*\s*\/?>/gi;
+const WEBVTT_TIMESTAMP_TAG_RE = /<\d{1,3}:\d{2}(?::\d{2})?[.,]\d{1,3}>/g;
+const ASS_OVERRIDE_BLOCK_RE = /\{\\[a-zA-Z0-9][^}\n]*\}/g;
+const SUBTITLE_CLOSE_TAG_RE =
+  /<\/\s*(?:b|i|u|s|strong|em|small|big|sub|sup|mark|font|span|ruby|c|v|lang|rt|rp)\s*>/gi;
+const SUBTITLE_VOICE_OR_LANG_OPEN_TAG_RE =
+  /<(?:v|lang)\b(?:\.[^\s.<>\/]+)*(?:\s+(?:(?!&&|\|\|)[^<>\r\n])*)?\s*\/?>/gi;
+const SUBTITLE_INLINE_OPEN_TAG_RE =
+  /<(?:b|i|u|s|strong|em|small|big|sub|sup|mark|font|span|ruby|c|rt|rp)\b(?:\.[^\s.<>\/=;]+)*(?:(?:[\s;]+|(?<=["']))[a-zA-Z_:][\w:.-]*(?:\s*=\s*(?:"[^<>"]*"|'[^<>']*'|[^\s"'<>\/=;]+))?)*\s*\/?>/gi;
+
+function stripSubtitleTagLayer(input: string, brReplacement: string): string {
+  return input
+    .replace(CDATA_WRAPPER_RE, '$1')
+    .replace(RUBY_RT_BLOCK_RE, '')
+    .replace(RUBY_RP_BLOCK_RE, '')
+    .replace(SUBTITLE_BR_TAG_RE, brReplacement)
+    .replace(WEBVTT_TIMESTAMP_TAG_RE, '')
+    .replace(ASS_OVERRIDE_BLOCK_RE, '')
+    .replace(SUBTITLE_CLOSE_TAG_RE, '')
+    .replace(SUBTITLE_VOICE_OR_LANG_OPEN_TAG_RE, '')
+    .replace(SUBTITLE_INLINE_OPEN_TAG_RE, '');
+}
+
+export interface SanitizeSubtitleMarkupOptions {
+  /**
+   * When true, preserves intentional `\n` line breaks and converts `<br>` tags into `\n`.
+   */
+  preserveLineBreaks?: boolean;
+  /**
+   * When false, preserves leading/trailing single spaces (for raw rolling-cue fragments).
+   * Defaults to `true`.
+   */
+  trim?: boolean;
+}
+
+/**
+ * Surgically strips SRT/WebVTT/HTML/SRV3/ASS subtitle formatting markup and decodes HTML/XML entities
+ * while preserving legitimate code/math angle brackets (`vector<int>`, `Map<string, number>`, `a < b && c > d`).
+ */
+export function sanitizeSubtitleMarkup(
+  raw: unknown,
+  options?: SanitizeSubtitleMarkupOptions,
+): string {
+  if (raw === null || raw === undefined) return '';
+  const source = String(raw);
+  if (!source) return '';
+
+  const preserveLineBreaks = Boolean(options?.preserveLineBreaks);
+  const brReplacement = preserveLineBreaks ? '\n' : ' ';
+
+  const firstPass = stripSubtitleTagLayer(source, brReplacement);
+  const decoded = decodeSubtitleEntities(firstPass);
+  const cleaned = stripSubtitleTagLayer(decoded, brReplacement).replace(
+    /[\u200B-\u200D\uFEFF]/g,
+    '',
+  );
+
+  if (preserveLineBreaks) {
+    return cleaned
+      .replace(/\r\n?/g, '\n')
+      .split('\n')
+      .map((line) => line.replace(/[\t\f\v ]+/g, ' ').trim())
+      .filter(Boolean)
+      .join('\n')
+      .trim();
+  }
+
+  const collapsed = cleaned
+    .replace(/\r?\n/g, ' ')
+    .replace(/[\t\f\v ]+/g, ' ');
+  return options?.trim === false ? collapsed : collapsed.trim();
 }
 
 /**
  * Cleans subtitle cue text while preserving intentional internal line breaks.
  */
 export function cleanPipCueText(value: unknown): string {
-  if (value === null || value === undefined) return '';
-  return String(value)
-    .replace(/[\u200B-\u200D\uFEFF]/g, '')
-    .replace(/\r\n?/g, '\n')
-    .split('\n')
-    .map((line) => line.replace(/[\t\f\v ]+/g, ' ').trim())
-    .filter(Boolean)
-    .join('\n')
-    .trim();
+  return sanitizeSubtitleMarkup(value, { preserveLineBreaks: true });
 }
 
 function toFiniteOrNull(value: unknown): number | null {

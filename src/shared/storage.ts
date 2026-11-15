@@ -16,6 +16,47 @@ import type {
 const CAPABILITY_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
 const memoryFallback = new Map<string, unknown>();
 const memoryListeners = new Set<(config: MarginConfig) => void>();
+const storageKeyLocks = new Map<string, Promise<void>>();
+
+function runWithOptionalWebLock<T>(
+  key: string,
+  task: () => Promise<T>,
+): Promise<T> {
+  try {
+    const locks = globalThis.navigator?.locks;
+    if (locks && typeof locks.request === 'function') {
+      return locks.request(`margin:storage:${key}`, () => task()) as Promise<T>;
+    }
+  } catch {
+    // Fall back to in-process lock queue when Web Locks API is unavailable
+  }
+  return task();
+}
+
+function withStorageKeyLock<T>(
+  key: string,
+  task: () => Promise<T>,
+): Promise<T> {
+  const prev = storageKeyLocks.get(key) ?? Promise.resolve();
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const tail = prev.then(
+    () => gate,
+    () => gate,
+  );
+  storageKeyLocks.set(key, tail);
+
+  const invoke = () => runWithOptionalWebLock(key, task);
+  const run = prev.then(invoke, invoke);
+  return run.finally(() => {
+    release();
+    if (storageKeyLocks.get(key) === tail) {
+      storageKeyLocks.delete(key);
+    }
+  });
+}
 
 function hasChromeStorage(): boolean {
   try {
@@ -291,21 +332,29 @@ export function backfillStoredConfig(stored: MarginConfig): {
   return { config: stored, mutated };
 }
 
-export async function getMarginConfig(): Promise<MarginConfig> {
+async function readAndBackfillMarginConfigUnlocked(): Promise<MarginConfig> {
   const stored = await rawGet<MarginConfig>(BRAND.storageKeyConfig);
   if (!stored || stored.schemaVersion !== 2) {
     const defaults = createDefaultMarginConfig();
-    await rawSet(BRAND.storageKeyConfig, defaults);
+    try {
+      await rawSet(BRAND.storageKeyConfig, defaults);
+    } catch {
+      // Best-effort initial backfill write: never block config reads on storage quota errors
+    }
     return defaults;
   }
   const { config, mutated } = backfillStoredConfig(stored);
   if (mutated) {
-    await rawSet(BRAND.storageKeyConfig, config);
+    try {
+      await rawSet(BRAND.storageKeyConfig, config);
+    } catch {
+      // Best-effort migration backfill write: never block config reads on storage quota errors
+    }
   }
   return config;
 }
 
-export async function saveMarginConfig(config: MarginConfig): Promise<void> {
+async function saveMarginConfigUnlocked(config: MarginConfig): Promise<void> {
   await rawSet(BRAND.storageKeyConfig, config);
   if (!hasChromeStorage()) {
     for (const listener of memoryListeners) {
@@ -314,14 +363,41 @@ export async function saveMarginConfig(config: MarginConfig): Promise<void> {
   }
 }
 
+export async function getMarginConfig(): Promise<MarginConfig> {
+  if (!storageKeyLocks.has(BRAND.storageKeyConfig)) {
+    const stored = await rawGet<MarginConfig>(BRAND.storageKeyConfig);
+    if (
+      stored &&
+      stored.schemaVersion === 2 &&
+      !storageKeyLocks.has(BRAND.storageKeyConfig)
+    ) {
+      const { config, mutated } = backfillStoredConfig(clonePlainValue(stored));
+      if (!mutated) {
+        return config;
+      }
+    }
+  }
+  return withStorageKeyLock(BRAND.storageKeyConfig, () =>
+    readAndBackfillMarginConfigUnlocked(),
+  );
+}
+
+export async function saveMarginConfig(config: MarginConfig): Promise<void> {
+  return withStorageKeyLock(BRAND.storageKeyConfig, () =>
+    saveMarginConfigUnlocked(config),
+  );
+}
+
 export async function updateMarginConfig(
   mutator: (draft: MarginConfig) => MarginConfig | void,
 ): Promise<MarginConfig> {
-  const current = await getMarginConfig();
-  const draft = clonePlainValue(current);
-  const next = mutator(draft) ?? draft;
-  await saveMarginConfig(next);
-  return next;
+  return withStorageKeyLock(BRAND.storageKeyConfig, async () => {
+    const current = await readAndBackfillMarginConfigUnlocked();
+    const draft = clonePlainValue(current);
+    const next = mutator(draft) ?? draft;
+    await saveMarginConfigUnlocked(next);
+    return next;
+  });
 }
 
 export function onMarginConfigChanged(
@@ -351,8 +427,9 @@ export function onMarginConfigChanged(
   };
 }
 
-export async function getCapabilityCache(): Promise<ModelCapabilityMap> {
-  const raw = (await rawGet<ModelCapabilityMap>(BRAND.storageKeyCapabilityCache)) ?? {};
+async function readPrunedCapabilityCacheUnlocked(): Promise<ModelCapabilityMap> {
+  const raw =
+    (await rawGet<ModelCapabilityMap>(BRAND.storageKeyCapabilityCache)) ?? {};
   const now = Date.now();
   const pruned: ModelCapabilityMap = {};
   for (const [k, entry] of Object.entries(raw)) {
@@ -363,37 +440,71 @@ export async function getCapabilityCache(): Promise<ModelCapabilityMap> {
   return pruned;
 }
 
+export async function getCapabilityCache(): Promise<ModelCapabilityMap> {
+  if (storageKeyLocks.has(BRAND.storageKeyCapabilityCache)) {
+    return withStorageKeyLock(BRAND.storageKeyCapabilityCache, () =>
+      readPrunedCapabilityCacheUnlocked(),
+    );
+  }
+  return readPrunedCapabilityCacheUnlocked();
+}
+
 export async function recordModelCapability(
   capabilityKey: string,
   entry: ModelCapabilityEntry,
 ): Promise<void> {
-  const cache = await getCapabilityCache();
-  cache[capabilityKey] = {
-    ...cache[capabilityKey],
-    ...entry,
-  };
-  await rawSet(BRAND.storageKeyCapabilityCache, cache);
+  try {
+    await withStorageKeyLock(BRAND.storageKeyCapabilityCache, async () => {
+      const cache = await readPrunedCapabilityCacheUnlocked();
+      cache[capabilityKey] = {
+        ...cache[capabilityKey],
+        ...entry,
+      };
+      await rawSet(BRAND.storageKeyCapabilityCache, cache);
+    });
+  } catch {
+    // Best-effort capability persistence: never fail live translations on storage quota errors
+  }
 }
 
 export async function clearCapabilityCache(): Promise<void> {
-  await rawSet(BRAND.storageKeyCapabilityCache, {});
+  return withStorageKeyLock(BRAND.storageKeyCapabilityCache, () =>
+    rawSet(BRAND.storageKeyCapabilityCache, {}),
+  );
+}
+
+async function readDiagnosticsLogUnlocked(): Promise<DiagnosticSnapshot[]> {
+  return (await rawGet<DiagnosticSnapshot[]>(BRAND.storageKeyDiagnostics)) ?? [];
 }
 
 export async function getDiagnosticsLog(): Promise<DiagnosticSnapshot[]> {
-  return (await rawGet<DiagnosticSnapshot[]>(BRAND.storageKeyDiagnostics)) ?? [];
+  if (storageKeyLocks.has(BRAND.storageKeyDiagnostics)) {
+    return withStorageKeyLock(BRAND.storageKeyDiagnostics, () =>
+      readDiagnosticsLogUnlocked(),
+    );
+  }
+  return readDiagnosticsLogUnlocked();
 }
 
 export async function appendDiagnosticSnapshot(
   snapshot: DiagnosticSnapshot,
   maxEntries = 50,
 ): Promise<void> {
-  const existing = await getDiagnosticsLog();
-  const next = [snapshot, ...existing].slice(0, maxEntries);
-  await rawSet(BRAND.storageKeyDiagnostics, next);
+  try {
+    await withStorageKeyLock(BRAND.storageKeyDiagnostics, async () => {
+      const existing = await readDiagnosticsLogUnlocked();
+      const next = [snapshot, ...existing].slice(0, maxEntries);
+      await rawSet(BRAND.storageKeyDiagnostics, next);
+    });
+  } catch {
+    // Best-effort telemetry: never fail live translations on storage quota errors
+  }
 }
 
 export async function clearDiagnosticsLog(): Promise<void> {
-  await rawSet(BRAND.storageKeyDiagnostics, []);
+  return withStorageKeyLock(BRAND.storageKeyDiagnostics, () =>
+    rawSet(BRAND.storageKeyDiagnostics, []),
+  );
 }
 
 function pinHappyDomMutationObserverCallbacksForTests(): void {
@@ -443,5 +554,6 @@ function pinHappyDomMutationObserverCallbacksForTests(): void {
 export function resetMemoryStorageForTests(): void {
   memoryFallback.clear();
   memoryListeners.clear();
+  storageKeyLocks.clear();
   pinHappyDomMutationObserverCallbacksForTests();
 }

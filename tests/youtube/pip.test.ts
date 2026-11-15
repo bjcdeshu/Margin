@@ -14,6 +14,7 @@ import {
 } from '../../src/youtube/main-entry';
 import {
   clampSeekTime,
+  cleanPipCueText,
   computePipDimensions,
   normalizeActiveCueState,
   PIP_BUTTON_ID,
@@ -22,6 +23,7 @@ import {
   type PipCapableVideoElement,
 } from '../../src/youtube/pip-player';
 import {
+  buildSourceTrackFingerprint,
   normalizeSubtitleTargetLang,
   parseYoutubeNativeCaptionSettings,
   resolveEffectiveNativeThemeVariables,
@@ -1191,5 +1193,401 @@ describe('YouTube Bilingual Document PiP & Guardrail 2 Fallback', () => {
 
     isolatedCtrl.destroy();
     mainCtrl.destroy();
+  });
+
+  it('sanitizes subtitle markup in cleanPipCueText & normalizeActiveCueState while preserving intentional line breaks and code angle brackets', () => {
+    expect(cleanPipCueText('<b>结果我们错了</b>\n<i>而且错得很离谱</i>')).toBe(
+      '结果我们错了\n而且错得很离谱',
+    );
+    expect(cleanPipCueText('Hello<br>World')).toBe('Hello\nWorld');
+    expect(cleanPipCueText('{\\an8}<font color="#ff0">Top line</font><br/>Second line')).toBe(
+      'Top line\nSecond line',
+    );
+    expect(
+      cleanPipCueText('<ruby>漢字<rp>(</rp><rt>かんじ</rt><rp>)</rp></ruby>\nvector<int> && a < b && c > d'),
+    ).toBe('漢字\nvector<int> && a < b && c > d');
+
+    expect(
+      normalizeActiveCueState({
+        original: '<b>vector<int></b>',
+        translated: 'vector<int>',
+        mode: 'bilingual',
+      }),
+    ).toMatchObject({
+      original: 'vector<int>',
+      translated: '',
+    });
+  });
+
+  it('ignores late previous-video timedtext responses and only merges matching tlang tracks (Finding #8) + disambiguates same-language tracks (Finding #14b)', async () => {
+    vi.useRealTimers();
+    const happyWin = window as unknown as {
+      happyDOM?: { setURL: (url: string) => void };
+    };
+    const setPageUrl = (url: string) => {
+      if (happyWin.happyDOM?.setURL) {
+        happyWin.happyDOM.setURL(url);
+      } else {
+        window.location.href = url;
+      }
+    };
+
+    // Fingerprint disambiguates same-language tracks even with identical timestamps/length
+    const autoCues = [{ tStartMs: 0, dDurationMs: 2000, text: 'we were wrong' }];
+    const creatorCues = [{ tStartMs: 0, dDurationMs: 2000, text: 'We were wrong.' }];
+    expect(
+      buildSourceTrackFingerprint(
+        'vidB',
+        'en',
+        autoCues,
+        'https://www.youtube.com/api/timedtext?v=vidB&lang=en&kind=asr&vss_id=a.en',
+      ),
+    ).not.toBe(
+      buildSourceTrackFingerprint(
+        'vidB',
+        'en',
+        creatorCues,
+        'https://www.youtube.com/api/timedtext?v=vidB&lang=en&name=CC1&vss_id=.en-US',
+      ),
+    );
+
+    setPageUrl('https://www.youtube.com/watch?v=vidA');
+    const playerEl = document.createElement('div');
+    playerEl.id = 'movie_player';
+    playerEl.className = 'html5-video-player';
+    const rightControls = document.createElement('div');
+    rightControls.className = 'ytp-right-controls';
+    const video = createMockVideo();
+    video.currentTime = 0.5;
+    playerEl.append(video, rightControls);
+    document.body.appendChild(playerEl);
+
+    let resolveLateVidAFetch!: (res: Response) => void;
+    window.fetch = vi.fn((input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes('v=vidA')) {
+        return new Promise<Response>((resolve) => {
+          resolveLateVidAFetch = resolve;
+        });
+      }
+      if (url.includes('tlang=es')) {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              events: [{ tStartMs: 0, dDurationMs: 3000, segs: [{ utf8: 'Estábamos equivocados' }] }],
+            }),
+            { status: 200 },
+          ),
+        );
+      }
+      if (url.includes('tlang=zh-Hans')) {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              events: [{ tStartMs: 0, dDurationMs: 3000, segs: [{ utf8: '官方中文字幕' }] }],
+            }),
+            { status: 200 },
+          ),
+        );
+      }
+      if (url.includes('vss_id=.en-US')) {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              events: [{ tStartMs: 0, dDurationMs: 3000, segs: [{ utf8: 'Creator English' }] }],
+            }),
+            { status: 200 },
+          ),
+        );
+      }
+      return Promise.resolve(
+        new Response(
+          JSON.stringify({
+            events: [{ tStartMs: 0, dDurationMs: 3000, segs: [{ utf8: 'Auto English' }] }],
+          }),
+          { status: 200 },
+        ),
+      );
+    });
+
+    const cfg: MarginConfig = { ...createDefaultMarginConfig(), targetLang: 'zh-CN' };
+    const mainCtrl = createYoutubeMainController();
+    const isolatedCtrl = createSubtitleIsolatedController({
+      loadConfig: async () => cfg,
+      subscribeConfig: () => () => {},
+      translateBatch: async (req) => ({
+        ok: true,
+        requestId: req.requestId,
+        providerId: 'mock',
+        model: 'mock',
+        items: req.items.map((it) => ({ id: it.id, trans: `AI译:${it.text}` })),
+        diagnostic: {} as never,
+      }),
+    });
+
+    mainCtrl.start();
+    await isolatedCtrl.start();
+    await new Promise((r) => setTimeout(r, 25));
+
+    // Start slow vidA timedtext fetch, then navigate SPA to vidB before vidA responds
+    const pendingVidA = window.fetch(
+      'https://www.youtube.com/api/timedtext?v=vidA&lang=en&fmt=json3',
+    );
+    setPageUrl('https://www.youtube.com/watch?v=vidB');
+    window.dispatchEvent(new Event('yt-navigate-finish'));
+
+    // Capture vidB auto-generated English track
+    await window.fetch(
+      'https://www.youtube.com/api/timedtext?v=vidB&lang=en&kind=asr&vss_id=a.en&fmt=json3',
+    );
+    window.postMessage(
+      {
+        source: BRAND.ytBridgeSourceMain,
+        type: 'playhead-tick',
+        videoId: 'vidB',
+        currentTimeMs: 500,
+        paused: false,
+      } satisfies YoutubeMainBridgeMessage,
+      '*',
+    );
+    await new Promise((r) => setTimeout(r, 40));
+    expect(isolatedCtrl.getCues()[0]).toMatchObject({
+      text: 'Auto English',
+      trans: 'AI译:Auto English',
+    });
+
+    // Late vidA timedtext response resolves now -> MUST NOT clobber vidB!
+    resolveLateVidAFetch(
+      new Response(
+        JSON.stringify({
+          events: [{ tStartMs: 0, dDurationMs: 3000, segs: [{ utf8: 'Stale Video A' }] }],
+        }),
+        { status: 200 },
+      ),
+    );
+    await pendingVidA;
+    window.postMessage(
+      {
+        source: BRAND.ytBridgeSourceMain,
+        type: 'playhead-tick',
+        videoId: 'vidB',
+        currentTimeMs: 600,
+        paused: false,
+      } satisfies YoutubeMainBridgeMessage,
+      '*',
+    );
+    await new Promise((r) => setTimeout(r, 35));
+    expect(isolatedCtrl.getCues()[0]).toMatchObject({
+      text: 'Auto English',
+      trans: 'AI译:Auto English',
+    });
+
+    // Switch same-language track on vidB from auto-generated to creator-uploaded English (US)
+    await window.fetch(
+      'https://www.youtube.com/api/timedtext?v=vidB&lang=en&name=CC1&vss_id=.en-US&fmt=json3',
+    );
+    await new Promise((r) => setTimeout(r, 40));
+    expect(isolatedCtrl.getCues()[0]).toMatchObject({
+      text: 'Creator English',
+      trans: 'AI译:Creator English',
+    });
+
+    // Mismatched tlang=es arrives -> MUST be ignored (keeps zh-CN translation!)
+    await window.fetch(
+      'https://www.youtube.com/api/timedtext?v=vidB&lang=en&tlang=es&fmt=json3',
+    );
+    await new Promise((r) => setTimeout(r, 35));
+    expect(isolatedCtrl.getCues()[0]?.trans).toBe('AI译:Creator English');
+
+    // Matching tlang=zh-Hans arrives -> normalized 'zh-CN' matches config.targetLang -> merges!
+    await window.fetch(
+      'https://www.youtube.com/api/timedtext?v=vidB&lang=en&tlang=zh-Hans&fmt=json3',
+    );
+    await new Promise((r) => setTimeout(r, 35));
+    expect(isolatedCtrl.getCues()[0]?.trans).toBe('官方中文字幕');
+
+    isolatedCtrl.destroy();
+    mainCtrl.destroy();
+  });
+
+  it('prefers showing HTML5 TextTrack without forcing unrelated disabled tracks and reloads on track change or loadedmetadata (Finding #14c)', async () => {
+    vi.useRealTimers();
+    const happyWin = window as unknown as {
+      happyDOM?: { setURL: (url: string) => void };
+    };
+    happyWin.happyDOM?.setURL('https://academy.example.org/lesson');
+
+    const trackListeners = new Map<string, Set<() => void>>();
+    const frDisabledTrack = {
+      id: 't-fr',
+      kind: 'subtitles',
+      language: 'fr',
+      label: 'Français',
+      mode: 'disabled' as TextTrackMode,
+      cues: [{ startTime: 0, endTime: 4, text: 'Bonjour' }],
+    };
+    const enShowingTrack = {
+      id: 't-en',
+      kind: 'subtitles',
+      language: 'en',
+      label: 'English',
+      mode: 'showing' as TextTrackMode,
+      cues: [{ startTime: 0, endTime: 4, text: 'Hello class' }],
+    };
+    const deTrack = {
+      id: 't-de',
+      kind: 'subtitles',
+      language: 'de',
+      label: 'Deutsch',
+      mode: 'disabled' as TextTrackMode,
+      cues: [{ startTime: 0, endTime: 4, text: 'Hallo Kurs' }],
+    };
+
+    const mockTextTracks = Object.assign([frDisabledTrack, enShowingTrack, deTrack], {
+      addEventListener: (evt: string, cb: () => void) => {
+        if (!trackListeners.has(evt)) trackListeners.set(evt, new Set());
+        trackListeners.get(evt)!.add(cb);
+      },
+      removeEventListener: (evt: string, cb: () => void) => {
+        trackListeners.get(evt)?.delete(cb);
+      },
+    });
+
+    const video = createMockVideo();
+    let activeSrc = 'https://academy.example.org/video-1.mp4';
+    Object.defineProperty(video, 'currentSrc', {
+      get: () => activeSrc,
+      configurable: true,
+    });
+    video.currentTime = 1.0;
+    Object.defineProperty(video, 'textTracks', {
+      value: mockTextTracks,
+      configurable: true,
+    });
+    document.body.appendChild(video);
+
+    const isolated = createSubtitleIsolatedController({
+      loadConfig: async () => createDefaultMarginConfig(),
+      subscribeConfig: () => () => {},
+      translateBatch: async (req) => ({
+        ok: true,
+        requestId: req.requestId,
+        providerId: 'mock',
+        model: 'mock',
+        items: req.items.map((i) => ({ id: i.id, trans: `译:${i.text}` })),
+        diagnostic: {} as never,
+      }),
+    });
+
+    await isolated.start();
+    await new Promise((r) => setTimeout(r, 40));
+
+    // 1. Selects `showing` English track, leaving unrelated French/German tracks `disabled`!
+    expect(frDisabledTrack.mode).toBe('disabled');
+    expect(deTrack.mode).toBe('disabled');
+    expect(isolated.getCues()[0]).toMatchObject({
+      text: 'Hello class',
+      trans: '译:Hello class',
+    });
+
+    // 2. User switches track to German (`showing`) -> `change` event reloads new track
+    enShowingTrack.mode = 'disabled';
+    deTrack.mode = 'showing';
+    trackListeners.get('change')?.forEach((fn) => fn());
+    await new Promise((r) => setTimeout(r, 40));
+    expect(isolated.getCues()[0]).toMatchObject({
+      text: 'Hallo Kurs',
+      trans: '译:Hallo Kurs',
+    });
+
+    // 3. Playlist swaps `currentSrc` and dispatches `loadedmetadata` -> reloads updated cues
+    activeSrc = 'https://academy.example.org/video-2.mp4';
+    deTrack.cues = [{ startTime: 0, endTime: 4, text: 'Zweite Lektion' }];
+    video.dispatchEvent(new Event('loadedmetadata'));
+    await new Promise((r) => setTimeout(r, 40));
+    expect(isolated.getCues()[0]).toMatchObject({
+      text: 'Zweite Lektion',
+      trans: '译:Zweite Lektion',
+    });
+
+    isolated.destroy();
+  });
+
+  it('replays only the active base source track after switching captions A -> B -> A in YoutubeMainController', async () => {
+    vi.useRealTimers();
+    const happyWin = window as unknown as {
+      happyDOM?: { setURL: (url: string) => void };
+    };
+    happyWin.happyDOM?.setURL('https://www.youtube.com/watch?v=switchABAVid');
+
+    const capturedMessages: YoutubeMainBridgeMessage[] = [];
+    const onMsg = (ev: MessageEvent) => {
+      if (
+        ev.data?.source === BRAND.ytBridgeSourceMain &&
+        ev.data?.type === 'caption-track-captured'
+      ) {
+        capturedMessages.push(ev.data as YoutubeMainBridgeMessage);
+      }
+    };
+    window.addEventListener('message', onMsg);
+
+    const origFetch = window.fetch;
+    window.fetch = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      const lang = url.includes('lang=ja') ? 'ja' : 'en';
+      return new Response(
+        JSON.stringify({
+          events: [
+            {
+              tStartMs: 500,
+              dDurationMs: 2000,
+              segs: [{ utf8: lang === 'ja' ? '日本語字幕' : 'English caption' }],
+            },
+          ],
+        }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      );
+    }) as unknown as typeof fetch;
+
+    const mainCtrl = createYoutubeMainController();
+    mainCtrl.start();
+
+    try {
+      // User selects EN -> switches to JA -> switches back to EN
+      await window.fetch(
+        'https://www.youtube.com/api/timedtext?v=switchABAVid&lang=en&fmt=json3',
+      );
+      await window.fetch(
+        'https://www.youtube.com/api/timedtext?v=switchABAVid&lang=ja&fmt=json3',
+      );
+      await window.fetch(
+        'https://www.youtube.com/api/timedtext?v=switchABAVid&lang=en&fmt=json3',
+      );
+      await new Promise((r) => setTimeout(r, 25));
+
+      capturedMessages.length = 0;
+
+      // Trigger `subtitle-config-update` from ISOLATED world -> must replay ONLY the active EN base track!
+      window.postMessage(
+        {
+          source: BRAND.ytBridgeSourceIsolated,
+          type: 'subtitle-config-update',
+          settings: createDefaultMarginConfig().subtitles,
+        },
+        '*',
+      );
+      await new Promise((r) => setTimeout(r, 25));
+
+      expect(capturedMessages).toHaveLength(1);
+      expect(capturedMessages[0]).toMatchObject({
+        type: 'caption-track-captured',
+        videoId: 'switchABAVid',
+        langCode: 'en',
+      });
+    } finally {
+      mainCtrl.destroy();
+      window.fetch = origFetch;
+      window.removeEventListener('message', onMsg);
+    }
   });
 });

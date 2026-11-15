@@ -425,10 +425,20 @@ export function tokenizeParagraph(
       }
       if (node.nodeType !== Node.ELEMENT_NODE) return;
       const el = node as Element;
-      const upperTag = el.tagName.toUpperCase();
       if (
         el.hasAttribute('data-margin-injected') ||
-        el.hasAttribute('data-margin-host') ||
+        el.hasAttribute('data-margin-host')
+      ) {
+        return;
+      }
+      if (el.getAttribute('data-margin-orig-wrap') === 'true') {
+        for (let i = 0; i < el.childNodes.length; i++) {
+          collectPlain(el.childNodes[i]);
+        }
+        return;
+      }
+      const upperTag = el.tagName.toUpperCase();
+      if (
         BLOCK_BOUNDARY_TAGS.has(upperTag) ||
         isExcludedElement(el, { insideParagraph: true })
       ) {
@@ -481,6 +491,10 @@ export function tokenizeParagraph(
         el.hasAttribute('data-margin-injected') ||
         el.hasAttribute('data-margin-host')
       ) {
+        continue;
+      }
+      if (el.getAttribute('data-margin-orig-wrap') === 'true') {
+        out += serializeNodes(el.childNodes);
         continue;
       }
 
@@ -544,6 +558,98 @@ function createPlainFragment(doc: Document, cleanText: string): DocumentFragment
   return frag;
 }
 
+function cleanFallbackTextSegment(
+  rawSeg: string,
+  trimStart: boolean,
+  trimEnd: boolean,
+): string {
+  const withoutTags = rawSeg
+    .replace(/<\/?m\d+(?:\s+[^>]*?)?\s*\/?>/gi, '')
+    .replace(/<\/?m\d+[^\s>]*$/gi, '');
+  let cleaned = unescapeLiteralMarkerInRawText(withoutTags).replace(
+    / {2,}/g,
+    ' ',
+  );
+  if (trimStart) {
+    cleaned = cleaned.replace(/^\s+/, '');
+  }
+  if (trimEnd) {
+    cleaned = cleaned.replace(/\s+$/, '');
+  }
+  return cleaned;
+}
+
+function createFallbackFragmentPreservingAtomics(
+  doc: Document,
+  translatedText: string,
+  tokenized: TokenizedParagraph,
+): DocumentFragment {
+  let hasAtomicTokens = false;
+  for (const desc of tokenized.tokens.values()) {
+    if (desc.kind === 'atomic') {
+      hasAtomicTokens = true;
+      break;
+    }
+  }
+  if (!hasAtomicTokens) {
+    return createPlainFragment(doc, stripResidualMarkers(translatedText));
+  }
+
+  const atomicRegex = /<m(\d+)(?:\s*\/>|><\/m\1>)/g;
+  const usedAtomicIds = new Set<number>();
+  const matches: Array<{
+    start: number;
+    end: number;
+    descriptor: Extract<RichTokenDescriptor, { kind: 'atomic' }>;
+  }> = [];
+
+  let m: RegExpExecArray | null;
+  while ((m = atomicRegex.exec(translatedText)) !== null) {
+    const id = Number(m[1]);
+    const desc = tokenized.tokens.get(id);
+    if (desc && desc.kind === 'atomic' && !usedAtomicIds.has(id)) {
+      usedAtomicIds.add(id);
+      matches.push({
+        start: m.index,
+        end: m.index + m[0].length,
+        descriptor: desc,
+      });
+    }
+  }
+
+  if (matches.length === 0) {
+    return createPlainFragment(doc, stripResidualMarkers(translatedText));
+  }
+
+  const frag = doc.createDocumentFragment();
+  let cursor = 0;
+
+  for (let idx = 0; idx < matches.length; idx++) {
+    const hit = matches[idx];
+    const seg = cleanFallbackTextSegment(
+      translatedText.slice(cursor, hit.start),
+      idx === 0,
+      false,
+    );
+    if (seg.length > 0) {
+      frag.appendChild(doc.createTextNode(seg));
+    }
+    frag.appendChild(cloneAtomicNodeSafely(hit.descriptor.originalElement, doc));
+    cursor = hit.end;
+  }
+
+  const tail = cleanFallbackTextSegment(
+    translatedText.slice(cursor),
+    false,
+    true,
+  );
+  if (tail.length > 0) {
+    frag.appendChild(doc.createTextNode(tail));
+  }
+
+  return frag;
+}
+
 /**
  * Reconstructs translated DOM nodes strictly via `cloneNode(false)` + `document.createTextNode(...)`.
  *
@@ -585,7 +691,11 @@ export function reconstructRichDom(
   let match: RegExpExecArray | null;
 
   const fallback = (): ReconstructedRichDom => ({
-    fragment: createPlainFragment(doc, stripResidualMarkers(translatedText)),
+    fragment: createFallbackFragmentPreservingAtomics(
+      doc,
+      translatedText,
+      tokenized,
+    ),
     fallbackPlain: true,
   });
 

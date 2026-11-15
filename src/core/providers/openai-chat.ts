@@ -6,7 +6,12 @@ import {
   DEFAULT_SSE_IDLE_TIMEOUT_MS,
   createLinkedTimeoutScope,
 } from './timeout';
-import { type AiCompletionRequestParams, ProviderHttpError } from './types';
+import {
+  type AiCompletionRequestParams,
+  ProviderHttpError,
+  ProviderTruncatedResponseError,
+  describeBodyMetadata,
+} from './types';
 
 function extractOpenAiContentString(content: unknown): string {
   if (typeof content === 'string') {
@@ -227,7 +232,8 @@ export async function executeOpenAiChatCall(
       // Headers arrived; switch from connect timer to per-chunk SSE idle timer
       scope.clearTimer();
       let fullContent = '';
-      await readSseStream(
+      let finishReason: string | null = null;
+      const sseSummary = await readSseStream(
         response,
         (frame) => {
           const trimmed = frame.data.trim();
@@ -249,6 +255,12 @@ export async function executeOpenAiChatCall(
           const choices = parsed.choices;
           if (!Array.isArray(choices) || choices.length === 0) return;
           const firstChoice = choices[0] as Record<string, unknown> | undefined;
+          if (
+            typeof firstChoice?.finish_reason === 'string' &&
+            firstChoice.finish_reason.length > 0
+          ) {
+            finishReason = firstChoice.finish_reason;
+          }
           const deltaObj = firstChoice?.delta as
             | Record<string, unknown>
             | undefined;
@@ -264,6 +276,27 @@ export async function executeOpenAiChatCall(
         streamIdleTimeoutMs,
       );
 
+      if (finishReason === 'length' || finishReason === 'content_filter') {
+        throw new ProviderTruncatedResponseError({
+          reason: finishReason,
+          protocol: 'openai-chat',
+          httpStatus: response.status,
+        });
+      }
+
+      const hasTerminalStop =
+        sseSummary.sawDone ||
+        finishReason === 'stop' ||
+        finishReason === 'end_turn' ||
+        finishReason === 'stop_sequence';
+      if (!hasTerminalStop) {
+        throw new ProviderTruncatedResponseError({
+          reason: 'premature-eof',
+          protocol: 'openai-chat',
+          httpStatus: response.status,
+        });
+      }
+
       return { content: fullContent, httpStatus: response.status };
     }
 
@@ -274,7 +307,9 @@ export async function executeOpenAiChatCall(
     try {
       json = JSON.parse(rawText) as Record<string, unknown>;
     } catch {
-      throw new Error(`Invalid JSON from OpenAI-compatible endpoint: ${rawText.slice(0, 200)}`);
+      throw new Error(
+        `Invalid JSON from OpenAI-compatible endpoint (${describeBodyMetadata(rawText, response)})`,
+      );
     }
 
     if (json.error && !Array.isArray(json.choices)) {
@@ -290,6 +325,18 @@ export async function executeOpenAiChatCall(
     const firstChoice = Array.isArray(choices)
       ? (choices[0] as Record<string, unknown> | undefined)
       : undefined;
+    const finishReason =
+      typeof firstChoice?.finish_reason === 'string'
+        ? firstChoice.finish_reason
+        : null;
+    if (finishReason === 'length' || finishReason === 'content_filter') {
+      throw new ProviderTruncatedResponseError({
+        reason: finishReason,
+        protocol: 'openai-chat',
+        httpStatus: response.status,
+      });
+    }
+
     const message = firstChoice?.message as Record<string, unknown> | undefined;
     const content = extractOpenAiContentString(
       message?.content ?? firstChoice?.text ?? '',

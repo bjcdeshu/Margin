@@ -1,4 +1,7 @@
 import type { SubtitleCue, YoutubeRawJson3Event } from '@shared/types';
+import { decodeSubtitleEntities, sanitizeSubtitleMarkup } from './shared';
+
+export { decodeSubtitleEntities, sanitizeSubtitleMarkup };
 
 export const FALLBACK_CUE_DURATION_MS = 3_000;
 export const MIN_CUE_DURATION_MS = 100;
@@ -47,9 +50,7 @@ function extractRawEventText(event: YoutubeRawJson3Event | null | undefined): st
 }
 
 function cleanCueLineText(text: string): string {
-  return String(text ?? '')
-    .replace(/\r?\n/g, ' ')
-    .trim();
+  return sanitizeSubtitleMarkup(text);
 }
 
 /**
@@ -119,13 +120,20 @@ export function normalizeYoutubeEvents(input: YoutubeJson3Input): SubtitleCue[] 
         previous.tStartMs + Math.max(previous.dDurationMs || 0, APPEND_PROXIMITY_FLOOR_MS);
 
     if (event.aAppend === 1 && previous && (sameWindow || nearPrevious)) {
-      const previousClean = cleanCueLineText(previous.text);
-      const currentClean = cleanCueLineText(event.text);
-
-      if (currentClean.startsWith(previousClean)) {
-        previous.text = event.text;
-      } else if (!previousClean.endsWith(currentClean)) {
+      const hasSplitTagSeam =
+        (/<[a-zA-Z/\d][^<>]*$/.test(previous.text) && /^[^<>]*>/.test(event.text)) ||
+        /<(?:ruby|r[tp])\b[^<>]*>(?![\s\S]*?<\/\s*(?:ruby|r[tp])\s*>)/i.test(previous.text);
+      if (hasSplitTagSeam) {
         previous.text += event.text;
+      } else {
+        const previousClean = cleanCueLineText(previous.text);
+        const currentClean = cleanCueLineText(event.text);
+
+        if (currentClean && currentClean.startsWith(previousClean)) {
+          previous.text = event.text;
+        } else if (!currentClean || !previousClean.endsWith(currentClean)) {
+          previous.text += event.text;
+        }
       }
 
       const appendEnd = event.tStartMs + event.dDurationMs - previous.tStartMs;
@@ -280,47 +288,12 @@ export function mergeAlignedSubtitleTrack(
   };
 }
 
-const HTML_ENTITY_MAP: Readonly<Record<string, string>> = {
-  amp: '&',
-  lt: '<',
-  gt: '>',
-  quot: '"',
-  apos: "'",
-  nbsp: ' ',
-  lrm: '',
-  rlm: '',
-};
-
-export function decodeSubtitleEntities(raw: string): string {
-  return String(raw ?? '').replace(
-    /&(#x[0-9a-fA-F]+|#\d+|[a-zA-Z]+);/g,
-    (full, entity: string) => {
-      if (entity.startsWith('#x') || entity.startsWith('#X')) {
-        const code = Number.parseInt(entity.slice(2), 16);
-        return Number.isFinite(code) && code > 0 ? String.fromCodePoint(code) : full;
-      }
-      if (entity.startsWith('#')) {
-        const code = Number.parseInt(entity.slice(1), 10);
-        return Number.isFinite(code) && code > 0 ? String.fromCodePoint(code) : full;
-      }
-      const mapped = HTML_ENTITY_MAP[entity.toLowerCase()];
-      return mapped !== undefined ? mapped : full;
-    },
-  );
-}
-
 /**
- * Strips WebVTT / HTML inline cue markup (`<c.color>`, `<v Speaker>`, `<00:01.200>`, `<rt>...</rt>`)
- * and normalizes whitespace.
+ * Strips WebVTT / HTML / SRT / ASS inline cue markup (`<c.color>`, `<v Speaker>`, `<00:01.200>`, `<rt>...</rt>`, `<b>`, `{\an8}`)
+ * and normalizes whitespace while preserving non-tag code/math angle brackets.
  */
 export function stripVttMarkup(raw: string): string {
-  const withoutRt = String(raw ?? '').replace(/<rt\b[^>]*>[\s\S]*?<\/rt>/gi, '');
-  const withoutTags = withoutRt.replace(/<[^>]+>/g, '');
-  return decodeSubtitleEntities(withoutTags)
-    .replace(/[\u200B-\u200D\uFEFF]/g, '')
-    .replace(/\r?\n/g, ' ')
-    .replace(/[\t\f\v ]+/g, ' ')
-    .trim();
+  return sanitizeSubtitleMarkup(raw);
 }
 
 /**
@@ -502,8 +475,9 @@ export function parseYoutubeTimedTextPayload(rawBody: string): YoutubeRawJson3Ev
   if (trimmed.startsWith('<')) {
     const events: YoutubeRawJson3Event[] = [];
 
-    // SRV3 `<p t="1200" d="3400">...</p>`
-    const pRegex = /<p\b([^>]*)>([\s\S]*?)<\/p>/gi;
+    // SRV3 `<p t="1200" d="3400">...</p>` (ignoring self-closing `<p .../>` spacers)
+    const pRegex = /<p\b([^>]*?)(?<!\/)>([\s\S]*?)<\/p>/gi;
+    const rawInners: string[] = [];
     let pMatch: RegExpExecArray | null;
     while ((pMatch = pRegex.exec(trimmed)) !== null) {
       const attrs = pMatch[1];
@@ -513,19 +487,34 @@ export function parseYoutubeTimedTextPayload(rawBody: string): YoutubeRawJson3Ev
       const dMatch = /\bd="(\d+)"/i.exec(attrs);
       const wMatch = /\bw="(\d+)"/i.exec(attrs);
       const aMatch = /\ba="(\d+)"/i.exec(attrs);
-      const text = decodeSubtitleEntities(inner.replace(/<[^>]+>/g, ''));
+      rawInners.push(inner);
       events.push({
         tStartMs: Number(tMatch[1]),
         dDurationMs: dMatch ? Number(dMatch[1]) : 0,
         wWinId: wMatch ? Number(wMatch[1]) : undefined,
         aAppend: aMatch ? Number(aMatch[1]) : undefined,
-        text,
+        text: '',
       });
     }
-    if (events.length > 0) return events;
+    if (events.length > 0) {
+      for (let i = 0; i < events.length; i += 1) {
+        const current = events[i];
+        const next = events[i + 1];
+        const rawInner = rawInners[i] ?? '';
+        if (current.aAppend === 1 || next?.aAppend === 1) {
+          // Defer ruby/inline tag stripping until `normalizeYoutubeEvents` stitches rolling `a="1"` seams
+          current.text = decodeSubtitleEntities(
+            rawInner.replace(/<\/?s\b[^>]*>/gi, ''),
+          );
+        } else {
+          current.text = sanitizeSubtitleMarkup(rawInner);
+        }
+      }
+      return events;
+    }
 
-    // Legacy `<text start="1.25" dur="2.5">...</text>`
-    const textRegex = /<text\b([^>]*)>([\s\S]*?)<\/text>/gi;
+    // Legacy `<text start="1.25" dur="2.5">...</text>` (ignoring self-closing `<text .../>`)
+    const textRegex = /<text\b([^>]*?)(?<!\/)>([\s\S]*?)<\/text>/gi;
     let tNodeMatch: RegExpExecArray | null;
     while ((tNodeMatch = textRegex.exec(trimmed)) !== null) {
       const attrs = tNodeMatch[1];
@@ -533,7 +522,7 @@ export function parseYoutubeTimedTextPayload(rawBody: string): YoutubeRawJson3Ev
       const startMatch = /\bstart="([\d.]+)"/i.exec(attrs);
       if (!startMatch) continue;
       const durMatch = /\bdur="([\d.]+)"/i.exec(attrs);
-      const text = decodeSubtitleEntities(inner.replace(/<[^>]+>/g, ''));
+      const text = sanitizeSubtitleMarkup(inner);
       events.push({
         tStartMs: Math.round(Number(startMatch[1]) * 1000),
         dDurationMs: durMatch ? Math.round(Number(durMatch[1]) * 1000) : 0,

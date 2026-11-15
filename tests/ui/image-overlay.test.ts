@@ -1,8 +1,11 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { createDefaultMarginConfig } from '@shared/constants';
 import { SHADOW_HOST_RESET_CSS } from '@shared/shadow-styles';
+import { resetMemoryStorageForTests, saveMarginConfig } from '@shared/storage';
 import type { TranslateImageResponse } from '@shared/types';
 import {
   captureImageDataUrl,
+  initMarginImageTranslator,
   mountVisionImageOverlay,
   scaleVisionBoxToPixels,
 } from '../../src/media/image-entry';
@@ -216,5 +219,190 @@ describe('Vision-LLM Image Overlay & 3-Tier Anti-403 Capture', () => {
     );
     expect(fallbackCard?.textContent).toContain('整图双语摘要译文');
     fallbackController.destroy();
+  });
+
+  it('registers capturing passive scroll listener and auto-destroys overlay when targetImg disconnects', async () => {
+    const addListenerSpy = vi.spyOn(window, 'addEventListener');
+    const img = document.createElement('img');
+    document.body.appendChild(img);
+    vi.spyOn(img, 'getBoundingClientRect').mockReturnValue({
+      top: 20,
+      left: 10,
+      width: 300,
+      height: 200,
+      right: 310,
+      bottom: 220,
+      x: 10,
+      y: 20,
+      toJSON: () => ({}),
+    });
+
+    const controller = mountVisionImageOverlay({
+      targetImg: img,
+      response: {
+        ok: true,
+        requestId: 'req-scroll',
+        providerId: 'openai-1',
+        model: 'gpt-6-luna',
+        regions: [{ box: [100, 100, 300, 500], src: 'Hello', trans: '你好' }],
+        diagnostic: makeDiagnostic(),
+      },
+      uiColorMode: 'paper',
+      interfaceLang: 'zh-CN',
+    });
+
+    const scrollRegistration = addListenerSpy.mock.calls.find(
+      (call) => call[0] === 'scroll',
+    );
+    expect(scrollRegistration).toBeDefined();
+    expect(scrollRegistration?.[2]).toEqual({ capture: true, passive: true });
+    expect(document.body.contains(controller.host)).toBe(true);
+
+    // Removing targetImg from DOM automatically tears down the overlay host!
+    img.remove();
+    await new Promise((r) => setTimeout(r, 10));
+    expect(document.body.contains(controller.host)).toBe(false);
+  });
+
+  it('blocks window CustomEvent and untrusted senders in production mode, guards concurrent/src-mutated runs, and tears down all overlays on destroyImageTranslator()', async () => {
+    resetMemoryStorageForTests();
+    await saveMarginConfig(createDefaultMarginConfig());
+
+    const origChrome = (globalThis as Record<string, unknown>).chrome;
+    const runtimeMessageListeners = new Set<
+      (msg: unknown, sender?: chrome.runtime.MessageSender) => void
+    >();
+    let imageRpcCalls = 0;
+    let holdFirstRpc: (() => void) | null = null;
+
+    (globalThis as Record<string, unknown>).chrome = {
+      runtime: {
+        id: 'ext-trusted-id',
+        onMessage: {
+          addListener: (
+            fn: (msg: unknown, sender?: chrome.runtime.MessageSender) => void,
+          ) => runtimeMessageListeners.add(fn),
+          removeListener: (
+            fn: (msg: unknown, sender?: chrome.runtime.MessageSender) => void,
+          ) => runtimeMessageListeners.delete(fn),
+        },
+        sendMessage: vi.fn(async (msg: { type: string }) => {
+          if (msg.type === 'margin:translate-image') {
+            imageRpcCalls += 1;
+            if (holdFirstRpc) {
+              const waitPromise = new Promise<void>((resolve) => {
+                const prev = holdFirstRpc!;
+                holdFirstRpc = () => {
+                  prev();
+                  resolve();
+                };
+              });
+              await waitPromise;
+            }
+            return {
+              ok: true,
+              requestId: `img-res-${imageRpcCalls}`,
+              providerId: 'openai-1',
+              model: 'gpt-6-luna',
+              regions: [
+                {
+                  box: [100, 100, 300, 500],
+                  src: 'Panel',
+                  trans: `译文 #${imageRpcCalls}`,
+                },
+              ],
+              diagnostic: makeDiagnostic(),
+            };
+          }
+          return { ok: true };
+        }),
+      },
+    };
+
+    vi.spyOn(HTMLCanvasElement.prototype, 'getContext').mockReturnValue({
+      drawImage: vi.fn(),
+    } as unknown as CanvasRenderingContext2D);
+    vi.spyOn(HTMLCanvasElement.prototype, 'toDataURL').mockReturnValue(
+      'data:image/webp;base64,UklGRiIAAABXRUJQVlA4IBYAAAAwAQCdASoBAAEADsD+JaQAA3AAAAAA',
+    );
+
+    const img = document.createElement('img');
+    Object.defineProperty(img, 'complete', { value: true });
+    Object.defineProperty(img, 'naturalWidth', { value: 400 });
+    Object.defineProperty(img, 'naturalHeight', { value: 300 });
+    img.src = 'https://cdn.example.com/manga-page-1.jpg';
+    vi.spyOn(img, 'getBoundingClientRect').mockReturnValue({
+      top: 30,
+      left: 30,
+      width: 400,
+      height: 300,
+      right: 430,
+      bottom: 330,
+      x: 30,
+      y: 30,
+      toJSON: () => ({}),
+    });
+    document.body.appendChild(img);
+
+    let destroyFn: (() => void) | null = null;
+    try {
+      destroyFn = initMarginImageTranslator({ forceProductionMode: true });
+
+      // 1. Page-dispatched window CustomEvent MUST be ignored in production mode!
+      window.dispatchEvent(
+        new CustomEvent('margin:cmd:translate-context-image', {
+          detail: { srcUrl: img.src },
+        }),
+      );
+      await new Promise((r) => setTimeout(r, 15));
+      expect(imageRpcCalls).toBe(0);
+
+      // 2. Runtime message from untrusted/missing sender.id MUST be rejected in production mode!
+      for (const fn of runtimeMessageListeners) {
+        fn(
+          { type: 'margin:cmd:translate-context-image', srcUrl: img.src },
+          { id: 'foreign-extension-id' } as chrome.runtime.MessageSender,
+        );
+      }
+      await new Promise((r) => setTimeout(r, 15));
+      expect(imageRpcCalls).toBe(0);
+
+      // 3. Overlapping trusted commands on the same <img> never mount duplicate overlays
+      holdFirstRpc = () => {};
+      for (const fn of runtimeMessageListeners) {
+        fn(
+          { type: 'margin:cmd:translate-context-image', srcUrl: img.src },
+          { id: 'ext-trusted-id' } as chrome.runtime.MessageSender,
+        );
+      }
+      await new Promise((r) => setTimeout(r, 10));
+
+      const releaseFirst = holdFirstRpc;
+      holdFirstRpc = null;
+      // Trigger second run on same image before first finishes
+      for (const fn of runtimeMessageListeners) {
+        fn(
+          { type: 'margin:cmd:translate-context-image', srcUrl: img.src },
+          { id: 'ext-trusted-id' } as chrome.runtime.MessageSender,
+        );
+      }
+      releaseFirst?.();
+      await new Promise((r) => setTimeout(r, 25));
+
+      const mountedOverlays = document.querySelectorAll(
+        '[data-margin-injected="image-overlay"]',
+      );
+      expect(mountedOverlays).toHaveLength(1);
+
+      // 4. destroyImageTranslator() enumerates activeOverlays Map and removes all mounted overlays!
+      destroyFn();
+      destroyFn = null;
+      expect(
+        document.querySelectorAll('[data-margin-injected="image-overlay"]'),
+      ).toHaveLength(0);
+    } finally {
+      destroyFn?.();
+      (globalThis as Record<string, unknown>).chrome = origChrome;
+    }
   });
 });

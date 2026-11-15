@@ -72,6 +72,7 @@ export function createYoutubeMainController(
   let scanPending = false;
   let destroyed = false;
   let autoFetchAttemptedForVideo = '';
+  let latestSourceTrackUrl = '';
 
   const capturedTracksByUrl = new Map<string, CapturedTrackRecord>();
   const cleanupFns: Array<() => void> = [];
@@ -107,15 +108,62 @@ export function createYoutubeMainController(
     );
   }
 
+  function hasTranslatedTrackParam(trackUrl: string): boolean {
+    try {
+      const parsed = new URL(trackUrl, 'https://www.youtube.com');
+      return Boolean(parsed.searchParams.get('tlang'));
+    } catch {
+      return false;
+    }
+  }
+
+  function resolveActiveYoutubeVideoId(): string {
+    const urlVid = extractYoutubeVideoId(win.location?.href ?? '');
+    if (urlVid) return urlVid;
+    const moviePlayer = doc.getElementById('movie_player') as
+      | (HTMLElement & {
+          getVideoData?: () => { video_id?: string };
+          getPlayerResponse?: () => { videoDetails?: { videoId?: string } };
+        })
+      | null;
+    try {
+      const dataVid = moviePlayer?.getVideoData?.()?.video_id;
+      if (typeof dataVid === 'string' && dataVid) return dataVid;
+      const respVid = moviePlayer?.getPlayerResponse?.()?.videoDetails?.videoId;
+      if (typeof respVid === 'string' && respVid) return respVid;
+    } catch {
+      // Ignore player API inspection errors
+    }
+    return currentVideoId;
+  }
+
+  function syncActiveVideoId(nextVideoId: string): void {
+    if (!nextVideoId || nextVideoId === currentVideoId) return;
+    currentVideoId = nextVideoId;
+    autoFetchAttemptedForVideo = '';
+    latestSourceTrackUrl = '';
+    for (const [key, existing] of capturedTracksByUrl.entries()) {
+      if (existing.videoId !== nextVideoId) {
+        capturedTracksByUrl.delete(key);
+      }
+    }
+    pipPlayer.clearCueImmediately();
+  }
+
   function handleCapturedTimedText(trackUrl: string, rawBody: string): void {
     if (destroyed || !rawBody) return;
     const events = parseYoutubeTimedTextPayload(rawBody);
     if (events.length === 0) return;
 
-    const videoId =
-      extractYoutubeVideoId(trackUrl) ||
-      extractYoutubeVideoId(win.location?.href ?? '') ||
-      currentVideoId;
+    const trackVideoId = extractYoutubeVideoId(trackUrl);
+    const activeVideoId = resolveActiveYoutubeVideoId();
+
+    // Guard against late previous-video timedtext responses after SPA navigation
+    if (trackVideoId && activeVideoId && trackVideoId !== activeVideoId) {
+      return;
+    }
+
+    const videoId = trackVideoId || activeVideoId;
     if (!videoId) return;
 
     const langCode = extractLangFromTimedTextUrl(trackUrl);
@@ -126,13 +174,17 @@ export function createYoutubeMainController(
       events,
     };
 
-    // Prune tracks from older videos
+    // Prune tracks from older videos and refresh LRU/selection order
     for (const [key, existing] of capturedTracksByUrl.entries()) {
       if (existing.videoId !== videoId) {
         capturedTracksByUrl.delete(key);
       }
     }
+    capturedTracksByUrl.delete(trackUrl);
     capturedTracksByUrl.set(trackUrl, record);
+    if (!hasTranslatedTrackParam(trackUrl)) {
+      latestSourceTrackUrl = trackUrl;
+    }
 
     postBridgeMessage({
       source: BRAND.ytBridgeSourceMain,
@@ -254,7 +306,7 @@ export function createYoutubeMainController(
       return;
     }
     const hasCapturedForVideo = Array.from(capturedTracksByUrl.values()).some(
-      (rec) => rec.videoId === videoId,
+      (rec) => rec.videoId === videoId && !hasTranslatedTrackParam(rec.trackUrl),
     );
     if (hasCapturedForVideo) return;
 
@@ -304,8 +356,8 @@ export function createYoutubeMainController(
     }
   }
 
-  function emitPlayheadTick(video: HTMLVideoElement): void {
-    const vid = extractYoutubeVideoId(win.location?.href ?? '') || currentVideoId;
+  function emitPlayheadTick(video: HTMLVideoElement, seeked = false): void {
+    const vid = resolveActiveYoutubeVideoId();
     if (!vid) return;
     postBridgeMessage({
       source: BRAND.ytBridgeSourceMain,
@@ -313,6 +365,7 @@ export function createYoutubeMainController(
       videoId: vid,
       currentTimeMs: Math.max(0, Math.round((video.currentTime || 0) * 1000)),
       paused: Boolean(video.paused),
+      ...(seeked ? { seeked: true } : {}),
     });
   }
 
@@ -327,17 +380,25 @@ export function createYoutubeMainController(
     boundVideo = candidate;
     if (!candidate) return;
 
-    const onMediaEvent = () => emitPlayheadTick(candidate);
-    const events = ['timeupdate', 'seeking', 'seeked', 'play', 'pause', 'loadedmetadata'];
-    for (const evt of events) {
+    const onMediaEvent = () => emitPlayheadTick(candidate, false);
+    const onSeekEvent = () => emitPlayheadTick(candidate, true);
+    const syncEvents = ['timeupdate', 'play', 'pause', 'loadedmetadata'];
+    const seekEvents = ['seeking', 'seeked'];
+    for (const evt of syncEvents) {
       candidate.addEventListener(evt, onMediaEvent);
     }
+    for (const evt of seekEvents) {
+      candidate.addEventListener(evt, onSeekEvent);
+    }
     detachVideoListeners = () => {
-      for (const evt of events) {
+      for (const evt of syncEvents) {
         candidate.removeEventListener(evt, onMediaEvent);
       }
+      for (const evt of seekEvents) {
+        candidate.removeEventListener(evt, onSeekEvent);
+      }
     };
-    emitPlayheadTick(candidate);
+    emitPlayheadTick(candidate, false);
   }
 
   function createActiveUnderlineBar(): SVGRectElement {
@@ -690,11 +751,7 @@ export function createYoutubeMainController(
   function scanPage(): void {
     if (destroyed) return;
     const nextVideoId = extractYoutubeVideoId(win.location?.href ?? '');
-    if (nextVideoId && nextVideoId !== currentVideoId) {
-      currentVideoId = nextVideoId;
-      autoFetchAttemptedForVideo = '';
-      pipPlayer.clearCueImmediately();
-    }
+    syncActiveVideoId(nextVideoId);
 
     ensurePlayerButtons();
     bindActiveVideo();
@@ -727,7 +784,11 @@ export function createYoutubeMainController(
     if (nextVideoId !== currentVideoId && pipPlayer.isActive()) {
       void pipPlayer.close();
     }
-    pipPlayer.clearCueImmediately();
+    if (nextVideoId) {
+      syncActiveVideoId(nextVideoId);
+    } else {
+      pipPlayer.clearCueImmediately();
+    }
     scheduleScan();
     setTimeout(scheduleScan, 450);
   }
@@ -759,20 +820,34 @@ export function createYoutubeMainController(
       syncPlayerButtons();
       syncNativeCaptionStyleFromPlayer(true);
 
-      // Replay any early `document_start` captured caption tracks for the active video
-      const activeVid =
-        extractYoutubeVideoId(win.location?.href ?? '') || currentVideoId;
-      for (const record of capturedTracksByUrl.values()) {
-        if (!activeVid || record.videoId === activeVid) {
-          postBridgeMessage({
-            source: BRAND.ytBridgeSourceMain,
-            type: 'caption-track-captured',
-            videoId: record.videoId,
-            langCode: record.langCode,
-            trackUrl: record.trackUrl,
-            events: record.events,
-          });
-        }
+      // Replay only the active/most-recent base source track (plus any translated tracks) for the active video
+      const activeVid = resolveActiveYoutubeVideoId();
+      const videoRecords = Array.from(capturedTracksByUrl.values()).filter(
+        (record) => !activeVid || record.videoId === activeVid,
+      );
+      const baseRecords = videoRecords.filter(
+        (record) => !hasTranslatedTrackParam(record.trackUrl),
+      );
+      const translatedRecords = videoRecords.filter((record) =>
+        hasTranslatedTrackParam(record.trackUrl),
+      );
+      const activeBaseRecord =
+        (latestSourceTrackUrl
+          ? baseRecords.find((record) => record.trackUrl === latestSourceTrackUrl)
+          : undefined) ?? baseRecords[baseRecords.length - 1];
+      const matchingRecords = [
+        ...(activeBaseRecord ? [activeBaseRecord] : []),
+        ...translatedRecords,
+      ];
+      for (const record of matchingRecords) {
+        postBridgeMessage({
+          source: BRAND.ytBridgeSourceMain,
+          type: 'caption-track-captured',
+          videoId: record.videoId,
+          langCode: record.langCode,
+          trackUrl: record.trackUrl,
+          events: record.events,
+        });
       }
 
       if (subtitlesEnabled && activeVid) {

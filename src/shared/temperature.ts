@@ -18,7 +18,10 @@ const STRICT_MODEL_KEYWORD_RE =
   /(?:codex|reasoner|thinking|\br1\b|\bqwq\b)/i;
 
 const UNSUPPORTED_TEMP_ERROR_RE =
-  /\btemperature\b|unsupported[_\s-]?parameter|unsupported[_\s-]?value|only the default \(1\) value is supported/i;
+  /\btemperature\b|only the default \(1\) value is supported/i;
+
+const EXPLICIT_OTHER_UNSUPPORTED_PARAM_RE =
+  /"param"\s*:\s*"(?:reasoning_effort|reasoningEffort|thinking|enable_thinking|thinking_budget)"|(?:unsupported|unknown|unrecognized)[_\s-]?parameter['":\s]+(?:reasoning_effort|reasoningEffort|thinking|enable_thinking|thinking_budget)\b/i;
 
 const UNSUPPORTED_REASONING_EFFORT_ERROR_RE =
   /\breasoning[_\s-]?effort\b|\breasoningEffort\b/i;
@@ -141,7 +144,9 @@ export function shouldStripTemperatureAndRetry(
 ): boolean {
   if (!sentPayloadHadTemperature) return false;
   if (httpStatus !== 400 && httpStatus !== 422) return false;
-  return UNSUPPORTED_TEMP_ERROR_RE.test(String(errorBodyText ?? ''));
+  const body = String(errorBodyText ?? '');
+  if (EXPLICIT_OTHER_UNSUPPORTED_PARAM_RE.test(body)) return false;
+  return UNSUPPORTED_TEMP_ERROR_RE.test(body);
 }
 
 export function shouldStripReasoningEffortAndRetry(

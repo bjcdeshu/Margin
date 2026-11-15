@@ -614,4 +614,69 @@ describe('selection-popover: Shadow isolation, trigger modes, <a> link safety, w
       (globalThis as Record<string, unknown>).chrome = origChrome;
     }
   });
+
+  it('aborts and restarts active selection translation when targetLang changes while popover card is open', async () => {
+    const config = createDefaultMarginConfig();
+    config.selection.enabled = true;
+    config.selection.triggerMode = 'instant';
+    config.targetLang = 'zh-CN';
+
+    const calls: Array<{
+      toLang: string;
+      signal: AbortSignal;
+      resolve: (res: TranslateBatchResponse) => void;
+    }> = [];
+
+    const popover = new SelectionPopover({
+      config,
+      transport: (req, _cb, signal) =>
+        new Promise<TranslateBatchResponse>((resolve) => {
+          calls.push({ toLang: req.toLang, signal, resolve });
+        }),
+    });
+    popover.mount();
+
+    popover.presentForSelection('Speculative decoding throughput', { x: 60, y: 80 });
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.toLang).toBe('zh-CN');
+    expect(calls[0]?.signal.aborted).toBe(false);
+
+    // Switch targetLang to Japanese while zh-CN request is still pending
+    const nextCfg = structuredClone(config);
+    nextCfg.targetLang = 'ja';
+    popover.updateConfig(nextCfg);
+
+    expect(calls[0]?.signal.aborted).toBe(true);
+    expect(calls).toHaveLength(2);
+    expect(calls[1]?.toLang).toBe('ja');
+
+    // Stale zh-CN resolution MUST be ignored; ja resolution renders cleanly under `→ ja`
+    calls[0]!.resolve({
+      ok: true,
+      requestId: 'stale-zh',
+      providerId: 'google-free',
+      model: 'gtx',
+      items: [{ id: 1, trans: '投机解码吞吐量' }],
+      diagnostic: mockSelectionDiag(),
+    });
+    await new Promise((r) => setTimeout(r, 5));
+    expect(popover.currentTranslation).not.toBe('投机解码吞吐量');
+
+    calls[1]!.resolve({
+      ok: true,
+      requestId: 'fresh-ja',
+      providerId: 'google-free',
+      model: 'gtx',
+      items: [{ id: 1, trans: '投機的デコーディングのスループット' }],
+      diagnostic: mockSelectionDiag(),
+    });
+    await new Promise((r) => setTimeout(r, 10));
+
+    const shadow = popover.getShadowRoot()!;
+    const langPill = shadow.querySelector('.lang-pill');
+    expect(langPill?.textContent).toContain('ja');
+    expect(popover.currentTranslation).toBe('投機的デコーディングのスループット');
+
+    popover.destroy();
+  });
 });

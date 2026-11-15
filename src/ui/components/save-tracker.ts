@@ -141,6 +141,10 @@ export class SaveTracker {
     return { ...this.state };
   }
 
+  getSnapshot(): SaveTrackerState & { saving: boolean } {
+    return { ...this.state, saving: this.isSaving() };
+  }
+
   isSaving(): boolean {
     return this.pendingSnapshot !== null && this.state.status === 'saving';
   }

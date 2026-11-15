@@ -6,6 +6,8 @@ import type {
 
 export const REDACTED_PLACEHOLDER = '<REDACTED>';
 
+const REDACTED_URL_SENTINEL = '__margin_redacted_sentinel__';
+
 const SENSITIVE_HEADER_NAME_RE =
   /^(?:authorization|proxy-authorization|x-api-key|api-key|x-goog-api-key|x-auth-token|x-access-token|cookie|set-cookie)$|(?:api[-_]?key|auth|token|secret|password|credential)/i;
 
@@ -20,6 +22,10 @@ const SENSITIVE_QUERY_PARAM_RE =
 
 const EMBEDDED_API_KEY_SEGMENT_RE = /^(?:sk-[A-Za-z0-9_-]{8,}|dplx_[A-Za-z0-9_-]{6,})$/;
 
+function restoreRedactedSentinel(value: string): string {
+  return value.split(REDACTED_URL_SENTINEL).join(REDACTED_PLACEHOLDER);
+}
+
 /**
  * Redacts embedded credentials, query tokens, and private DeepLX path tokens
  * from a provider URL while preserving origin, port, safe route prefixes, and
@@ -28,14 +34,25 @@ const EMBEDDED_API_KEY_SEGMENT_RE = /^(?:sk-[A-Za-z0-9_-]{8,}|dplx_[A-Za-z0-9_-]
 export function redactProviderUrl(rawUrl: string, isDeeplxProvider: boolean): string {
   const trimmed = String(rawUrl ?? '').trim();
   if (!trimmed) return trimmed;
-  if (trimmed.includes(REDACTED_PLACEHOLDER)) return trimmed;
+
+  const sentinelUrl = trimmed
+    .split(REDACTED_PLACEHOLDER)
+    .join(REDACTED_URL_SENTINEL)
+    .replace(/%3credacted%3e/gi, REDACTED_URL_SENTINEL);
 
   let parsed: URL;
-  const hasExplicitScheme = /^[a-zA-Z][a-zA-Z\d+.-]*:\/\//.test(trimmed);
+  const hasExplicitScheme = /^[a-zA-Z][a-zA-Z\d+.-]*:\/\//.test(sentinelUrl);
   try {
-    parsed = new URL(hasExplicitScheme ? trimmed : `https://${trimmed}`);
+    parsed = new URL(hasExplicitScheme ? sentinelUrl : `https://${sentinelUrl}`);
   } catch {
-    return trimmed.replace(/\bsk-[A-Za-z0-9_-]{8,}\b/g, REDACTED_PLACEHOLDER);
+    const fallback = sentinelUrl
+      .replace(/(https?:\/\/)([^/\s@]+)@/gi, `$1${REDACTED_PLACEHOLDER}@`)
+      .replace(
+        /([?&](?:key|api[-_]?key|x[-_]?api[-_]?key|token|access[-_]?token|auth|auth[-_]?key|auth[-_]?token|secret|password)=)[^&#\s]*/gi,
+        `$1${REDACTED_PLACEHOLDER}`,
+      )
+      .replace(/\b(?:sk-[A-Za-z0-9_-]{8,}|dplx_[A-Za-z0-9_-]{6,})\b/g, REDACTED_PLACEHOLDER);
+    return restoreRedactedSentinel(fallback);
   }
 
   const hostLooksDeeplx = /deeplx/i.test(parsed.hostname);
@@ -48,8 +65,15 @@ export function redactProviderUrl(rawUrl: string, isDeeplxProvider: boolean): st
   const trailingSlash = parsed.pathname.length > 1 && parsed.pathname.endsWith('/');
   const rawSegments = parsed.pathname.split('/').filter((seg) => seg.length > 0);
   const redactedSegments = rawSegments.map((seg) => {
-    if (seg === REDACTED_PLACEHOLDER || seg === '%3CREDACTED%3E') {
+    if (
+      seg === REDACTED_URL_SENTINEL ||
+      seg === REDACTED_PLACEHOLDER ||
+      /%3credacted%3e/i.test(seg)
+    ) {
       return REDACTED_PLACEHOLDER;
+    }
+    if (seg.includes(REDACTED_URL_SENTINEL)) {
+      return restoreRedactedSentinel(seg);
     }
     if (EMBEDDED_API_KEY_SEGMENT_RE.test(seg)) {
       return REDACTED_PLACEHOLDER;
@@ -67,10 +91,17 @@ export function redactProviderUrl(rawUrl: string, isDeeplxProvider: boolean): st
 
   const queryParts: string[] = [];
   parsed.searchParams.forEach((value, key) => {
-    if (SENSITIVE_QUERY_PARAM_RE.test(key) || EMBEDDED_API_KEY_SEGMENT_RE.test(value)) {
-      queryParts.push(`${encodeURIComponent(key)}=${REDACTED_PLACEHOLDER}`);
+    const cleanKey = restoreRedactedSentinel(encodeURIComponent(key));
+    if (
+      SENSITIVE_QUERY_PARAM_RE.test(key) ||
+      EMBEDDED_API_KEY_SEGMENT_RE.test(value) ||
+      value === REDACTED_URL_SENTINEL
+    ) {
+      queryParts.push(`${cleanKey}=${REDACTED_PLACEHOLDER}`);
     } else {
-      queryParts.push(`${encodeURIComponent(key)}=${encodeURIComponent(value)}`);
+      queryParts.push(
+        `${cleanKey}=${restoreRedactedSentinel(encodeURIComponent(value))}`,
+      );
     }
   });
 
@@ -78,7 +109,9 @@ export function redactProviderUrl(rawUrl: string, isDeeplxProvider: boolean): st
   const authPrefix = hadUserInfo ? `${REDACTED_PLACEHOLDER}@` : '';
   const schemePrefix = hasExplicitScheme ? `${parsed.protocol}//` : '';
 
-  return `${schemePrefix}${authPrefix}${parsed.host}${rebuiltPath}${queryString}${parsed.hash}`;
+  return restoreRedactedSentinel(
+    `${schemePrefix}${authPrefix}${parsed.host}${rebuiltPath}${queryString}${parsed.hash}`,
+  );
 }
 
 function redactProviderSecrets(provider: ProviderConfig): void {

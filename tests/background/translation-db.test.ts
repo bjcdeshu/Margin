@@ -1,11 +1,15 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   attachStreamTranslationPort,
+  computeAssistantPromptFingerprint,
   DEFAULT_PERSISTENT_TTL_MS,
   handleRuntimeRpcRequest,
   IndexedDbTranslationAdapter,
   InMemoryPersistenceAdapter,
+  makeTranslationCacheKey,
   TranslationLruCache,
+  type TranslationDbRecord,
+  type TranslationPersistenceAdapter,
 } from '../../src/background';
 import { ProviderExecutionPool } from '../../src/core/providers';
 import { BRAND } from '@shared/brand';
@@ -354,5 +358,457 @@ describe('2-Tier Persistent Translation Database (L1 LRU + L2 Persistence)', () 
       persistentEntries: 0,
       dbAvailable: true,
     });
+  });
+
+  it('serializes makeTranslationCacheKey unambiguously across :: delimiters, endpoint/protocol, temperature/thinking policies, and single-text AI assistant prompts (#127 #13)', () => {
+    const baseParams = {
+      providerId: 'prov',
+      protocol: 'openai-chat' as const,
+      endpoint: 'https://api.example.com/v1/chat/completions',
+      model: 'gpt-4.1-mini',
+      codecId: 'yaml',
+      scene: 'webpage' as const,
+      fromLang: 'en',
+      toLang: 'zh-CN',
+      sourceText: 'Hello :: world',
+    };
+
+    // 1. Delimiter collision prevention (`::` inside fields never produces identical keys)
+    const kDelimA = makeTranslationCacheKey({
+      ...baseParams,
+      providerId: 'prov::x',
+      model: 'm1',
+    });
+    const kDelimB = makeTranslationCacheKey({
+      ...baseParams,
+      providerId: 'prov',
+      model: 'x::m1',
+    });
+    expect(kDelimA).not.toBe(kDelimB);
+    expect(() => JSON.parse(kDelimA)).not.toThrow();
+
+    // 2. Endpoint & protocol changes invalidate cache key
+    const kDifferentEndpoint = makeTranslationCacheKey({
+      ...baseParams,
+      endpoint: 'https://proxy.example.org/v1/chat/completions',
+    });
+    const kDifferentProtocol = makeTranslationCacheKey({
+      ...baseParams,
+      protocol: 'anthropic-messages',
+    });
+    expect(kDifferentEndpoint).not.toBe(makeTranslationCacheKey(baseParams));
+    expect(kDifferentProtocol).not.toBe(makeTranslationCacheKey(baseParams));
+
+    // 3. Temperature & thinking policy changes invalidate cache key
+    const kTempCustom = makeTranslationCacheKey({
+      ...baseParams,
+      temperaturePolicy: { mode: 'custom', value: 0.7 },
+    });
+    const kThinkingEnabled = makeTranslationCacheKey({
+      ...baseParams,
+      thinkingPolicy: { mode: 'enabled', budgetTokens: 2048 },
+    });
+    const kThinkingBudgetChanged = makeTranslationCacheKey({
+      ...baseParams,
+      thinkingPolicy: { mode: 'enabled', budgetTokens: 4096 },
+    });
+    expect(kTempCustom).not.toBe(makeTranslationCacheKey(baseParams));
+    expect(kThinkingEnabled).not.toBe(makeTranslationCacheKey(baseParams));
+    expect(kThinkingBudgetChanged).not.toBe(kThinkingEnabled);
+
+    // 4. Custom AI assistant prompts on `single-text` codec produce distinct fingerprints (not hardcoded `p0`)
+    const cfg = createDefaultMarginConfig();
+    const singleTextAstA = {
+      ...structuredClone(cfg.assistants['builtin-yaml']),
+      id: 'ast-single',
+      codec: 'single-text' as const,
+      systemPrompt: 'Translate poetically.',
+      prompt: '{{text}}',
+    };
+    const singleTextAstB = {
+      ...singleTextAstA,
+      systemPrompt: 'Translate literally for legal review.',
+    };
+
+    const fpA = computeAssistantPromptFingerprint(
+      singleTextAstA,
+      'webpage',
+      'single-text',
+    );
+    const fpB = computeAssistantPromptFingerprint(
+      singleTextAstB,
+      'webpage',
+      'single-text',
+    );
+    expect(fpA).not.toBe('p0');
+    expect(fpA).not.toBe(fpB);
+    expect(computeAssistantPromptFingerprint(undefined, 'webpage', 'single-text')).toBe(
+      'p0',
+    );
+
+    expect(
+      makeTranslationCacheKey({
+        ...baseParams,
+        codecId: 'single-text',
+        assistant: singleTextAstA,
+      }),
+    ).not.toBe(
+      makeTranslationCacheKey({
+        ...baseParams,
+        codecId: 'single-text',
+        assistant: singleTextAstB,
+      }),
+    );
+  });
+
+  it('fences L2 getMany promotions and pre-clear upstream setMany writes via monotonic clearEpoch (#127 #13)', async () => {
+    let releaseL2Get!: () => void;
+    const l2GetGate = new Promise<void>((r) => {
+      releaseL2Get = r;
+    });
+
+    const slowBacking = new Map<string, string>([['k-stale', '旧译文']]);
+    const slowAdapter: TranslationPersistenceAdapter = {
+      isAvailable: true,
+      async getMany(keys) {
+        await l2GetGate;
+        const out = new Map<string, string>();
+        for (const k of keys) {
+          const v = slowBacking.get(k);
+          if (v !== undefined) out.set(k, v);
+        }
+        return out;
+      },
+      async putMany(entries) {
+        for (const e of entries) {
+          slowBacking.set(e.key, e.value);
+        }
+      },
+      async count() {
+        return slowBacking.size;
+      },
+      async clear() {
+        slowBacking.clear();
+      },
+    };
+
+    const cache = new TranslationLruCache(32, slowAdapter);
+
+    // 1. Start `getMany` before `clearAll()`, then clear while L2 read is still suspended
+    const pendingRead = cache.getMany(['k-stale']);
+    await cache.clearAll();
+    // Simulate stale snapshot already read before clear resolving after `clearAll()`
+    slowBacking.set('k-stale', '旧译文');
+    const staleSnapshot = await (async () => {
+      releaseL2Get();
+      return pendingRead;
+    })();
+    slowBacking.clear();
+
+    expect(staleSnapshot.size).toBe(0);
+    expect(cache.size).toBe(0);
+    expect(cache.get('k-stale')).toBeUndefined();
+
+    // 2. Start an upstream `margin:translate-batch` BEFORE `margin:clear-translation-cache`, finish fetch AFTER clear
+    const memAdapter = new InMemoryPersistenceAdapter();
+    const rpcCache = new TranslationLruCache(32, memAdapter);
+    const config = createDefaultMarginConfig();
+    config.providers['slow-ai'] = {
+      id: 'slow-ai',
+      name: 'Slow AI',
+      preset: 'openai',
+      protocol: 'openai-chat',
+      enabled: true,
+      baseUrl: 'https://api.openai.com/v1/chat/completions',
+      apiKeys: ['sk-TEST'],
+      model: 'gpt-4.1-mini',
+      models: ['gpt-4.1-mini'],
+      assistantId: 'builtin-yaml',
+      enableContext: false,
+      enableRichHtml: true,
+      stream: 'off',
+      rateLimitRps: 50,
+      maxConcurrency: 4,
+      temperaturePolicy: { mode: 'omit' },
+      thinkingPolicy: { mode: 'provider-default' },
+    };
+    config.routing.webpage = 'slow-ai';
+    await saveMarginConfig(config);
+
+    let releaseUpstream!: () => void;
+    const upstreamGate = new Promise<void>((r) => {
+      releaseUpstream = r;
+    });
+    const fetchMock = vi.fn(async () => {
+      await upstreamGate;
+      return jsonResponse({
+        choices: [
+          {
+            message: {
+              content: '<yaml>\n- id: 1\n  trans: 清空前的在途译文\n</yaml>',
+            },
+          },
+        ],
+      });
+    });
+
+    const env = {
+      fetchImpl: fetchMock as unknown as typeof fetch,
+      pool: new ProviderExecutionPool(),
+      translationCache: rpcCache,
+    };
+
+    const inFlightBatch = handleRuntimeRpcRequest(
+      {
+        type: 'margin:translate-batch',
+        payload: {
+          requestId: 'pre-clear-batch',
+          scene: 'webpage',
+          fromLang: 'en',
+          toLang: 'zh-CN',
+          items: [{ id: 1, text: 'In-flight before clear' }],
+        },
+      },
+      env,
+    ) as Promise<TranslateBatchResponse>;
+
+    await new Promise((r) => setTimeout(r, 15));
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    // Clear cache while upstream call is mid-flight!
+    await handleRuntimeRpcRequest(
+      { type: 'margin:clear-translation-cache' },
+      env,
+    );
+
+    releaseUpstream();
+    const batchResp = await inFlightBatch;
+    // Live caller still gets its translation, while cleared L1 + L2 are NEVER repopulated!
+    expect(batchResp.ok).toBe(true);
+    expect(batchResp.items).toEqual([{ id: 1, trans: '清空前的在途译文' }]);
+    expect(await rpcCache.getStats()).toEqual({
+      memoryEntries: 0,
+      persistentEntries: 0,
+      dbAvailable: true,
+    });
+  });
+
+  it('registers IndexedDB txDone before awaiting requests and prevents cursor error default tx abort (#127 #7)', async () => {
+    const records = new Map<string, TranslationDbRecord>();
+    let simulateCursorErrorOnExpiry = true;
+
+    // Mock IDB where `tx.oncomplete` fires synchronously inside the final request's `onsuccess`
+    // (BEFORE any `await idbRequestToPromise(...)` continuation resumes) AND uncanceled `onerror` aborts `tx`!
+    const fakeDb = {
+      objectStoreNames: { contains: () => true },
+      onversionchange: null as (() => void) | null,
+      close: vi.fn(),
+      transaction: (_storeName: string, _mode: IDBTransactionMode) => {
+        let pendingRequests = 0;
+        let aborted = false;
+        const tx: Record<string, unknown> = {
+          error: null,
+          oncomplete: null as (() => void) | null,
+          onerror: null as (() => void) | null,
+          onabort: null as (() => void) | null,
+        };
+
+        const finishRequest = () => {
+          pendingRequests--;
+          if (pendingRequests === 0 && !aborted) {
+            queueMicrotask(() => {
+              if (pendingRequests === 0 && !aborted) {
+                (tx.oncomplete as (() => void) | null)?.();
+              }
+            });
+          }
+        };
+
+        const makeReq = <T>(compute: () => T) => {
+          pendingRequests++;
+          const req: Record<string, unknown> = {
+            result: undefined as unknown as T,
+            error: null,
+            onsuccess: null as (() => void) | null,
+            onerror: null as ((ev: Event) => void) | null,
+          };
+          queueMicrotask(() => {
+            req.result = compute();
+            (req.onsuccess as (() => void) | null)?.();
+            finishRequest();
+          });
+          return req as unknown as IDBRequest<T>;
+        };
+
+        tx.objectStore = () => ({
+          indexNames: {
+            contains: (name: string) =>
+              name === 'byExpiresAt' || name === 'byUpdatedAt',
+          },
+          get: (k: string) => makeReq(() => records.get(k)),
+          put: (rec: TranslationDbRecord) =>
+            makeReq(() => {
+              records.set(rec.key, rec);
+              return rec.key;
+            }),
+          delete: (k: string) =>
+            makeReq(() => {
+              records.delete(k);
+            }),
+          clear: () =>
+            makeReq(() => {
+              records.clear();
+            }),
+          count: () => makeReq(() => records.size),
+          index: (indexName: string) => ({
+            count: () => makeReq(() => records.size),
+            openCursor: () => {
+              pendingRequests++;
+              const req: Record<string, unknown> = {
+                result: null,
+                error: new Error('Transient cursor failure'),
+                onsuccess: null as (() => void) | null,
+                onerror: null as ((ev: Event) => void) | null,
+              };
+              queueMicrotask(() => {
+                if (
+                  indexName === 'byExpiresAt' &&
+                  simulateCursorErrorOnExpiry
+                ) {
+                  let defaultPrevented = false;
+                  const ev = {
+                    preventDefault: () => {
+                      defaultPrevented = true;
+                    },
+                  } as unknown as Event;
+                  (req.onerror as ((e: Event) => void) | null)?.(ev);
+                  pendingRequests--;
+                  if (!defaultPrevented) {
+                    aborted = true;
+                    tx.error = new Error('Uncanceled cursor error aborted tx');
+                    (tx.onabort as (() => void) | null)?.();
+                    return;
+                  }
+                  if (pendingRequests === 0 && !aborted) {
+                    (tx.oncomplete as (() => void) | null)?.();
+                  }
+                  return;
+                }
+                (req.onsuccess as (() => void) | null)?.();
+                finishRequest();
+              });
+              return req as unknown as IDBRequest<IDBCursorWithValue | null>;
+            },
+          }),
+        });
+
+        return tx as unknown as IDBTransaction;
+      },
+    };
+
+    const fakeFactory = {
+      open: () => {
+        const openReq: Record<string, unknown> = {
+          result: fakeDb,
+          onupgradeneeded: null,
+          onsuccess: null,
+          onerror: null,
+          onblocked: null,
+        };
+        queueMicrotask(() => {
+          (openReq.onsuccess as (() => void) | null)?.();
+        });
+        return openReq as unknown as IDBOpenDBRequest;
+      },
+    } as unknown as IDBFactory;
+
+    // Ensure `IDBKeyRange` exists in Node test environment so `pruneStoreIfNeeded` & `count` exercise index branches
+    const origKeyRange = (globalThis as Record<string, unknown>).IDBKeyRange;
+    (globalThis as Record<string, unknown>).IDBKeyRange = {
+      upperBound: (v: number) => ({ upper: v }),
+      lowerBound: (v: number) => ({ lower: v }),
+    };
+
+    try {
+      const idbAdapter = new IndexedDbTranslationAdapter({
+        idbFactory: fakeFactory,
+        maxEntries: 5,
+      });
+
+      // None of `putMany` (including `pruneStoreIfNeeded` with cursor error + `total <= maxEntries`), `getMany`, `count`, or `clear` may hang!
+      await Promise.race([
+        (async () => {
+          await idbAdapter.putMany([{ key: 'idb-1', value: '持久化译文' }], 1000);
+          const got = await idbAdapter.getMany(['idb-1'], 1001);
+          expect(got.get('idb-1')).toBe('持久化译文');
+          simulateCursorErrorOnExpiry = false;
+          expect(await idbAdapter.count(1001)).toBe(1);
+          await idbAdapter.clear();
+          expect(await idbAdapter.count(1001)).toBe(0);
+        })(),
+        new Promise<never>((_, reject) =>
+          setTimeout(
+            () => reject(new Error('IndexedDB adapter hung on txDone!')),
+            500,
+          ),
+        ),
+      ]);
+    } finally {
+      (globalThis as Record<string, unknown>).IDBKeyRange = origKeyRange;
+    }
+  });
+
+  it('serializes persistence writes and clearAll in FIFO order so slow pre-clear putMany never clobbers post-clear entries', async () => {
+    const store = new Map<string, string>();
+    let releaseFirstPut!: () => void;
+    const firstPutGate = new Promise<void>((resolve) => {
+      releaseFirstPut = resolve;
+    });
+    let putCallCount = 0;
+
+    const slowAdapter: TranslationPersistenceAdapter = {
+      isAvailable: true,
+      async getMany(keys) {
+        const out = new Map<string, string>();
+        for (const k of keys) {
+          const v = store.get(k);
+          if (v !== undefined) out.set(k, v);
+        }
+        return out;
+      },
+      async putMany(entries) {
+        putCallCount += 1;
+        if (putCallCount === 1) {
+          await firstPutGate;
+        }
+        for (const e of entries) {
+          store.set(e.key, e.value);
+        }
+      },
+      async clear() {
+        store.clear();
+      },
+      async count() {
+        return store.size;
+      },
+    };
+
+    const cache = new TranslationLruCache(16, slowAdapter);
+
+    // 1. Start slow pre-clear write, then immediately call clearAll() + post-clear setMany()
+    const preClearPromise = cache.setMany([{ key: 'k-stale', value: '旧译文' }]);
+    const clearPromise = cache.clearAll();
+    const postClearPromise = cache.setMany([{ key: 'k-fresh', value: '新译文' }]);
+
+    // Release slow pre-clear putMany: FIFO queue ensures `put(stale) -> clear() -> put(fresh)`!
+    releaseFirstPut();
+    await Promise.all([preClearPromise, clearPromise, postClearPromise]);
+
+    expect(store.has('k-stale')).toBe(false);
+    expect(store.get('k-fresh')).toBe('新译文');
+    cache.evictMemoryOnly();
+    const hydrated = await cache.getMany(['k-stale', 'k-fresh']);
+    expect(hydrated.has('k-stale')).toBe(false);
+    expect(hydrated.get('k-fresh')).toBe('新译文');
   });
 });

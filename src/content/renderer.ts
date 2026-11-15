@@ -26,12 +26,15 @@ import type {
 } from '@shared/types';
 import { resolveThemeForUrl } from '@shared/url-match';
 import {
+  BLOCK_BOUNDARY_TAGS,
   extractFocalThreadContext,
   extractPageContext,
   extractParagraphBlocks,
   findClosestParagraphBlock,
   findFirstDirectBlockBoundaryChild,
+  hasNestedBlockChildren,
   inferDomainStyleGuide,
+  isAtomicInlineElement,
 } from './dom-walker';
 import {
   applyEffectiveHostTextStyle,
@@ -507,6 +510,10 @@ export class LruTranslationCache {
     this.store.set(key, value);
   }
 
+  delete(key: string): boolean {
+    return this.store.delete(key);
+  }
+
   clear(): void {
     this.store.clear();
   }
@@ -866,6 +873,36 @@ function hashGlossaryFingerprint(entries: readonly GlossaryEntry[]): string {
   return (h >>> 0).toString(36);
 }
 
+function hashAssistantFingerprint(
+  assistant: MarginConfig['assistants'][string] | undefined,
+): string {
+  if (!assistant) return '0';
+  const envEntries = assistant.env
+    ? Object.entries(assistant.env).sort(([a], [b]) =>
+        a < b ? -1 : a > b ? 1 : 0,
+      )
+    : [];
+  const payload = JSON.stringify([
+    assistant.codec ?? '',
+    assistant.separator ?? '',
+    assistant.temperaturePolicy ?? null,
+    assistant.systemPrompt ?? '',
+    assistant.multipleSystemPrompt ?? '',
+    assistant.prompt ?? '',
+    assistant.multiplePrompt ?? '',
+    assistant.inputPrompt ?? '',
+    assistant.selectionPrompt ?? '',
+    assistant.subtitlePrompt ?? '',
+    envEntries,
+  ]);
+  let h = 2166136261;
+  for (let i = 0; i < payload.length; i++) {
+    h ^= payload.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return (h >>> 0).toString(36);
+}
+
 let requestSeq = 0;
 function nextRequestId(scene: string): string {
   requestSeq += 1;
@@ -913,11 +950,12 @@ export class WebpageRenderer {
   private lastScrollCheckAt = 0;
 
   private observedBlocks = new WeakSet<HTMLElement>();
-  private readonly inFlightBlocks = new WeakSet<HTMLElement>();
+  private inFlightBlocks = new WeakSet<HTMLElement>();
   private readonly inFlightBlockSet = new Set<HTMLElement>();
   private readonly translatedBlockSet = new Set<HTMLElement>();
   private readonly failedBlockTasks = new Map<HTMLElement, PreparedBlockTask>();
-  private readonly inFlightBlockPromises = new WeakMap<HTMLElement, Promise<void>>();
+  private inFlightBlockPromises = new WeakMap<HTMLElement, Promise<void>>();
+  private sessionGen = 0;
   private readonly mountedMeta = new WeakMap<HTMLElement, MountedBlockMeta>();
   private readonly unclampedStyles = new WeakMap<HTMLElement, SavedUnclampStyle>();
   private readonly pendingViewportQueue = new Map<HTMLElement, QueuedViewportEntry>();
@@ -979,12 +1017,36 @@ export class WebpageRenderer {
     return this.maskRevealedGlobally;
   }
 
-  getPageState(): TabPageState {
+  private pruneDisconnectedNodes(): void {
+    for (const node of Array.from(this.ownedInjectedNodes)) {
+      if (!node.isConnected) {
+        this.ownedInjectedNodes.delete(node);
+      }
+    }
+    for (const wrapper of Array.from(this.ownedOrigWrappers)) {
+      if (!wrapper.isConnected) {
+        this.ownedOrigWrappers.delete(wrapper);
+      }
+    }
+    for (const blk of Array.from(this.failedBlockTasks.keys())) {
+      if (!blk.isConnected) {
+        this.failedBlockTasks.delete(blk);
+      }
+    }
     for (const blk of Array.from(this.translatedBlockSet)) {
       if (!blk.isConnected || !this.hasMountedTranslation(blk)) {
         this.translatedBlockSet.delete(blk);
       }
     }
+    for (const blk of Array.from(this.inFlightBlockSet)) {
+      if (!blk.isConnected) {
+        this.inFlightBlockSet.delete(blk);
+      }
+    }
+  }
+
+  getPageState(): TabPageState {
+    this.pruneDisconnectedNodes();
     return {
       active: this.active,
       inFlightBlocks: this.inFlightBlockSet.size + this.pendingViewportQueue.size,
@@ -1118,9 +1180,13 @@ export class WebpageRenderer {
     const provider = this.config.providers[providerId];
     const model = provider?.model ?? '';
     const assistantId = provider?.assistantId ?? '';
+    const assistant = assistantId
+      ? this.config.assistants[assistantId]
+      : undefined;
+    const assistantFp = hashAssistantFingerprint(assistant);
     const glossaryFp = hashGlossaryFingerprint(this.config.glossary);
     const packsFp = (this.config.enabledGlossaryPacks ?? []).join(',');
-    return `${providerId}:${model}:${assistantId}:${this.config.sourceLang}->${this.config.targetLang}:${enableRichHtml ? '1' : '0'}:${glossaryFp}:${packsFp}:${tokenizedText}`;
+    return `${providerId}:${model}:${assistantId}:${assistantFp}:${this.config.sourceLang}->${this.config.targetLang}:${enableRichHtml ? '1' : '0'}:${glossaryFp}:${packsFp}:${tokenizedText}`;
   }
 
   private getPageContext(
@@ -1672,6 +1738,7 @@ export class WebpageRenderer {
             this.runInternalDomMutation(() => {
               for (const task of failed) {
                 this.clearBlockInjectedElements(task.block);
+                this.unwrapOriginalContent(task.block);
                 this.mountBlockLoadingIndicator(
                   task.block,
                   task.tokenized.plainTextLength,
@@ -1831,59 +1898,80 @@ export class WebpageRenderer {
   }
 
   private wrapOriginalContentForTargetOnly(blockEl: HTMLElement): void {
-    for (let i = 0; i < blockEl.children.length; i++) {
-      if (blockEl.children[i].getAttribute('data-margin-orig-wrap') === 'true') {
-        return;
+    const childSnapshot = Array.from(blockEl.childNodes);
+    const runs: ChildNode[][] = [];
+    let currentRun: ChildNode[] = [];
+
+    const flushRun = () => {
+      if (currentRun.length === 0) return;
+      const hasMeaningfulNode = currentRun.some(
+        (n) =>
+          n.nodeType === Node.ELEMENT_NODE ||
+          (n.nodeType === Node.TEXT_NODE && Boolean(n.nodeValue?.trim())),
+      );
+      if (hasMeaningfulNode) {
+        runs.push(currentRun);
       }
-    }
+      currentRun = [];
+    };
 
-    const firstNestedBlock = findFirstDirectBlockBoundaryChild(blockEl);
-    const wrapper = this.doc.createElement('span');
-    wrapper.className = 'margin-orig-source';
-    wrapper.setAttribute('data-margin-orig-wrap', 'true');
-    wrapper.hidden = true;
-    wrapper.style.setProperty('display', 'none', 'important');
-
-    const nodesToMove: ChildNode[] = [];
-    for (let i = 0; i < blockEl.childNodes.length; i++) {
-      const child = blockEl.childNodes[i];
-      if (child === firstNestedBlock) {
-        break;
+    for (const child of childSnapshot) {
+      if (child.nodeType === Node.ELEMENT_NODE) {
+        const el = child as Element;
+        if (
+          el.hasAttribute('data-margin-injected') ||
+          el.hasAttribute('data-margin-host') ||
+          el.getAttribute('data-margin-orig-wrap') === 'true'
+        ) {
+          flushRun();
+          continue;
+        }
+        const tag = el.tagName.toUpperCase();
+        if (
+          !isAtomicInlineElement(el, { insideParagraph: true }) &&
+          (BLOCK_BOUNDARY_TAGS.has(tag) || hasNestedBlockChildren(el))
+        ) {
+          flushRun();
+          continue;
+        }
       }
-      if (
-        child.nodeType === Node.ELEMENT_NODE &&
-        (child as Element).hasAttribute('data-margin-injected')
-      ) {
-        continue;
+      currentRun.push(child);
+    }
+    flushRun();
+
+    for (const run of runs) {
+      const anchor = run[0];
+      if (!anchor || anchor.parentNode !== blockEl) continue;
+      const wrapper = this.doc.createElement('span');
+      wrapper.className = 'margin-orig-source';
+      wrapper.setAttribute('data-margin-orig-wrap', 'true');
+      wrapper.hidden = true;
+      wrapper.style.setProperty('display', 'none', 'important');
+
+      blockEl.insertBefore(wrapper, anchor);
+      for (const node of run) {
+        wrapper.appendChild(node);
       }
-      nodesToMove.push(child);
+      this.ownedOrigWrappers.add(wrapper);
     }
-
-    if (nodesToMove.length === 0) return;
-
-    for (const node of nodesToMove) {
-      wrapper.appendChild(node);
-    }
-
-    this.ownedOrigWrappers.add(wrapper);
-    blockEl.insertBefore(wrapper, blockEl.firstChild);
   }
 
   private unwrapOriginalContent(blockEl: HTMLElement): void {
-    let wrapper: Element | null = null;
+    const wrappers: Element[] = [];
     for (let i = 0; i < blockEl.children.length; i++) {
       if (blockEl.children[i].getAttribute('data-margin-orig-wrap') === 'true') {
-        wrapper = blockEl.children[i];
-        break;
+        wrappers.push(blockEl.children[i]);
       }
     }
-    if (!wrapper) return;
+    if (wrappers.length === 0) return;
 
-    while (wrapper.firstChild) {
-      blockEl.insertBefore(wrapper.firstChild, wrapper);
+    for (const wrapper of wrappers) {
+      while (wrapper.firstChild) {
+        blockEl.insertBefore(wrapper.firstChild, wrapper);
+      }
+      this.ownedOrigWrappers.delete(wrapper);
+      wrapper.remove();
     }
-    this.ownedOrigWrappers.delete(wrapper);
-    wrapper.remove();
   }
 
   private clearBlockInjectedElements(blockEl: HTMLElement): void {
@@ -2021,6 +2109,7 @@ export class WebpageRenderer {
           for (const t of batchTasks) {
             this.failedBlockTasks.delete(t.block);
             this.clearBlockInjectedElements(t.block);
+            this.unwrapOriginalContent(t.block);
             this.mountBlockLoadingIndicator(
               t.block,
               t.tokenized.plainTextLength,
@@ -2037,8 +2126,9 @@ export class WebpageRenderer {
         if (!task.block.isConnected || this.hasMountedTranslation(task.block)) {
           continue;
         }
-        const effectiveStyle = resolveEffectiveHostTextStyle(task.block);
         this.clearBlockInjectedElements(task.block);
+        this.unwrapOriginalContent(task.block);
+        const effectiveStyle = resolveEffectiveHostTextStyle(task.block);
         this.failedBlockTasks.set(task.block, task);
 
         const btn = this.doc.createElement('button');
@@ -2113,6 +2203,7 @@ export class WebpageRenderer {
   ): Promise<void> {
     if (batchTasks.length === 0) return;
 
+    const batchSessionGen = this.sessionGen;
     const scene = batchTasks[0].scene;
     const resolvedPriority: RequestPriority =
       options.priority ?? (scene === 'hover' ? -1 : 0);
@@ -2376,6 +2467,9 @@ export class WebpageRenderer {
       }
     };
 
+    let transportSettled = false;
+    const provisionalStreamedSlots = new Set<number>();
+
     const applyOutputItem = (item: BatchItemOutput) => {
       if (p1Tracker) {
         p1Tracker.hasReceivedAnyItem = true;
@@ -2404,6 +2498,9 @@ export class WebpageRenderer {
 
       const isFirstRenderForSlot = prevTrans === undefined;
       renderedTransBySlot.set(item.id, item.trans);
+      if (!transportSettled) {
+        provisionalStreamedSlots.add(item.id);
+      }
 
       if (!task.block.isConnected) {
         this.cache.set(task.cacheKey, {
@@ -2431,6 +2528,7 @@ export class WebpageRenderer {
           this.runInternalDomMutation(() => {
             if (!this.hasMountedTranslation(task.block)) {
               this.clearBlockInjectedElements(task.block);
+              this.unwrapOriginalContent(task.block);
               this.restoreUnclampedForBlock(task.block);
             }
           });
@@ -2464,6 +2562,29 @@ export class WebpageRenderer {
       }
     };
 
+    const cleanupAbortedBatchTasks = () => {
+      cancelPendingSlotRafs();
+      if (p1Tracker?.abortedByFastScroll || batchSessionGen !== this.sessionGen) {
+        return;
+      }
+      this.runInternalDomMutation(() => {
+        for (const task of batchTasks) {
+          if (
+            !renderedTransBySlot.has(
+              requestItems.find((it) => slotMap.get(it.id) === task)?.id ?? -1,
+            )
+          ) {
+            this.observedBlocks.delete(task.block);
+            if (!this.hasMountedTranslation(task.block)) {
+              this.clearBlockInjectedElements(task.block);
+              this.unwrapOriginalContent(task.block);
+              this.restoreUnclampedForBlock(task.block);
+            }
+          }
+        }
+      });
+    };
+
     try {
       const response = await this.transport(
         payload,
@@ -2480,11 +2601,37 @@ export class WebpageRenderer {
         abortController.signal,
         preferStream,
       );
+      transportSettled = true;
 
-      if (abortController.signal.aborted) return;
+      if (abortController.signal.aborted) {
+        cleanupAbortedBatchTasks();
+        return;
+      }
 
       if (!response.ok) {
         cancelPendingSlotRafs();
+        if (
+          response.error?.code === 'TRUNCATED_RESPONSE' &&
+          provisionalStreamedSlots.size > 0
+        ) {
+          this.runInternalDomMutation(() => {
+            for (const slotId of provisionalStreamedSlots) {
+              renderedTransBySlot.delete(slotId);
+              const task = slotMap.get(slotId);
+              if (!task) continue;
+              this.cache.delete(task.cacheKey);
+              if (scene === 'webpage' && this.sessionDoneBlocks > 0) {
+                this.sessionDoneBlocks -= 1;
+              }
+              if (task.block.isConnected) {
+                this.clearBlockInjectedElements(task.block);
+                this.unwrapOriginalContent(task.block);
+                this.restoreUnclampedForBlock(task.block);
+              }
+            }
+          });
+          provisionalStreamedSlots.clear();
+        }
         const unrendered = batchTasks.filter(
           (_, idx) => !renderedTransBySlot.has(idx + 1),
         );
@@ -2511,26 +2658,12 @@ export class WebpageRenderer {
         );
       }
     } catch (err) {
-      cancelPendingSlotRafs();
       if (abortController.signal.aborted) {
-        if (p1Tracker?.abortedByFastScroll) {
-          return;
-        }
-        this.runInternalDomMutation(() => {
-          for (const task of batchTasks) {
-            if (
-              !renderedTransBySlot.has(
-                requestItems.find((it) => slotMap.get(it.id) === task)?.id ?? -1,
-              )
-            ) {
-              this.observedBlocks.delete(task.block);
-              if (!this.hasMountedTranslation(task.block)) {
-                this.clearBlockInjectedElements(task.block);
-                this.restoreUnclampedForBlock(task.block);
-              }
-            }
-          }
-        });
+        cleanupAbortedBatchTasks();
+        return;
+      }
+      cancelPendingSlotRafs();
+      if (batchSessionGen !== this.sessionGen) {
         return;
       }
       const msg = err instanceof Error ? err.message : String(err);
@@ -2541,18 +2674,20 @@ export class WebpageRenderer {
     } finally {
       cancelPendingSlotRafs();
       this.activeControllers.delete(abortController);
-      if (p1Tracker) {
-        this.inFlightP1Batches.delete(p1Tracker);
-      }
-      for (const task of batchTasks) {
-        this.inFlightBlocks.delete(task.block);
-        this.inFlightBlockSet.delete(task.block);
-        this.inFlightBlockPromises.delete(task.block);
-      }
-      if (scene === 'webpage') {
-        this.refreshStatusPill();
-        if (this.active && staleMidFlightBlocks.size > 0) {
-          this.scanAndRegisterSpaRoots(Array.from(staleMidFlightBlocks));
+      if (batchSessionGen === this.sessionGen) {
+        if (p1Tracker) {
+          this.inFlightP1Batches.delete(p1Tracker);
+        }
+        for (const task of batchTasks) {
+          this.inFlightBlocks.delete(task.block);
+          this.inFlightBlockSet.delete(task.block);
+          this.inFlightBlockPromises.delete(task.block);
+        }
+        if (scene === 'webpage') {
+          this.refreshStatusPill();
+          if (this.active && staleMidFlightBlocks.size > 0) {
+            this.scanAndRegisterSpaRoots(Array.from(staleMidFlightBlocks));
+          }
         }
       }
     }
@@ -2812,6 +2947,7 @@ export class WebpageRenderer {
         for (const block of evictedBlocks) {
           if (!this.hasMountedTranslation(block)) {
             this.clearBlockInjectedElements(block);
+            this.unwrapOriginalContent(block);
             this.restoreUnclampedForBlock(block);
           }
           this.observedBlocks.delete(block);
@@ -2970,6 +3106,7 @@ export class WebpageRenderer {
           this.observedBlocks.delete(task.block);
           if (!this.hasMountedTranslation(task.block)) {
             this.clearBlockInjectedElements(task.block);
+            this.unwrapOriginalContent(task.block);
             this.restoreUnclampedForBlock(task.block);
           }
           if (task.block.isConnected && !this.hasMountedTranslation(task.block)) {
@@ -3069,6 +3206,7 @@ export class WebpageRenderer {
         this.intersectionObserver?.unobserve(block);
         this.runInternalDomMutation(() => {
           this.clearBlockInjectedElements(block);
+          this.unwrapOriginalContent(block);
           this.restoreUnclampedForBlock(block);
         });
       }
@@ -3237,6 +3375,7 @@ export class WebpageRenderer {
   }
 
   private scanAndRegisterSpaRoots(roots: readonly ParentNode[]): void {
+    this.pruneDisconnectedNodes();
     if (typeof Node === 'undefined' || typeof Element === 'undefined') return;
     const discovered = new Set<HTMLElement>();
     const staleCheckCandidates = new Set<HTMLElement>();
@@ -3345,10 +3484,14 @@ export class WebpageRenderer {
           }
         }
 
-        if (m.removedNodes.length > 0 && effectiveTargetEl) {
+        if (m.removedNodes.length > 0) {
           for (let i = 0; i < m.removedNodes.length; i++) {
             const removed = m.removedNodes[i];
+            if (removed.nodeType === Node.ELEMENT_NODE) {
+              hasExternalMutation = true;
+            }
             if (
+              effectiveTargetEl &&
               removed.nodeType === Node.ELEMENT_NODE &&
               (removed as Element).getAttribute('data-margin-injected') ===
                 'true'
@@ -3358,8 +3501,9 @@ export class WebpageRenderer {
               break;
             }
             if (
+              effectiveTargetEl &&
               effectiveTargetEl.closest('[data-margin-translated="true"]') !==
-              null
+                null
             ) {
               this.pendingSpaRoots.add(effectiveTargetEl);
               hasExternalMutation = true;
@@ -3403,7 +3547,9 @@ export class WebpageRenderer {
     if (hasExternalMutation && this.spaMutationTimer === null) {
       this.spaMutationTimer = setTimeout(() => {
         this.spaMutationTimer = null;
-        if (!this.active || this.pendingSpaRoots.size === 0) return;
+        if (!this.active) return;
+        this.pruneDisconnectedNodes();
+        if (this.pendingSpaRoots.size === 0) return;
         const roots = Array.from(this.pendingSpaRoots);
         this.pendingSpaRoots.clear();
         this.scanAndRegisterSpaRoots(roots);
@@ -3684,8 +3830,11 @@ export class WebpageRenderer {
     this.mutationObserver?.disconnect();
     this.mutationObserver = null;
 
-    // Reset observedBlocks so re-enabling page translation or switching language re-observes cleanly!
+    // Reset observedBlocks & in-flight maps + advance sessionGen so re-enabling page translation or switching language re-observes cleanly!
+    this.sessionGen += 1;
     this.observedBlocks = new WeakSet<HTMLElement>();
+    this.inFlightBlocks = new WeakSet<HTMLElement>();
+    this.inFlightBlockPromises = new WeakMap<HTMLElement, Promise<void>>();
 
     for (const ctrl of Array.from(this.activeControllers)) {
       ctrl.abort();
@@ -3812,10 +3961,7 @@ export class WebpageRenderer {
       providerId,
       provider?.model ?? '',
       provider?.assistantId ?? '',
-      assistant?.codec ?? '',
-      assistant?.systemPrompt ?? '',
-      assistant?.prompt ?? '',
-      assistant?.multiplePrompt ?? '',
+      hashAssistantFingerprint(assistant),
       hashGlossaryFingerprint(cfg.glossary),
       (cfg.enabledGlossaryPacks ?? []).join(','),
     ]);

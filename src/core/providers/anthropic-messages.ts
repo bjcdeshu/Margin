@@ -5,7 +5,12 @@ import {
   DEFAULT_SSE_IDLE_TIMEOUT_MS,
   createLinkedTimeoutScope,
 } from './timeout';
-import { type AiCompletionRequestParams, ProviderHttpError } from './types';
+import {
+  type AiCompletionRequestParams,
+  ProviderHttpError,
+  ProviderTruncatedResponseError,
+  describeBodyMetadata,
+} from './types';
 
 export const ANTHROPIC_API_VERSION = '2023-06-01';
 
@@ -56,8 +61,8 @@ export function buildAnthropicMessagesRequestBody(params: {
       ? (thinkingPolicy.budgetTokens ?? 2048)
       : 2048;
   const maxTokens = thinkingEnabled
-    ? Math.max(8192, budgetTokens + 4096)
-    : 4096;
+    ? Math.max(8192, budgetTokens + 8192)
+    : 8192;
 
   const userContent = imageDataUrl
     ? [
@@ -166,20 +171,25 @@ export async function executeAnthropicMessagesCall(
     if (stream) {
       scope.clearTimer();
       let fullContent = '';
-      await readSseStream(
+      let stopReason: string | null = null;
+      let sawMessageStop = false;
+
+      const sseSummary = await readSseStream(
         response,
         (frame) => {
           if (frame.event === 'message_stop') {
-            return 'stop';
+            sawMessageStop = true;
           }
           const trimmed = frame.data.trim();
-          if (!trimmed) return;
+          if (!trimmed) {
+            return sawMessageStop ? 'stop' : undefined;
+          }
 
           let parsed: Record<string, unknown>;
           try {
             parsed = JSON.parse(trimmed) as Record<string, unknown>;
           } catch {
-            return;
+            return sawMessageStop ? 'stop' : undefined;
           }
 
           const eventType = String(parsed.type ?? frame.event ?? '');
@@ -191,11 +201,26 @@ export async function executeAnthropicMessagesCall(
               usedApiKey: apiKey,
             });
           }
-          if (eventType === 'message_stop') {
+
+          const delta = parsed.delta as Record<string, unknown> | undefined;
+          const msgObj = parsed.message as Record<string, unknown> | undefined;
+          const candidateStopReason =
+            typeof delta?.stop_reason === 'string' && delta.stop_reason
+              ? delta.stop_reason
+              : typeof parsed.stop_reason === 'string' && parsed.stop_reason
+                ? parsed.stop_reason
+                : typeof msgObj?.stop_reason === 'string' && msgObj.stop_reason
+                  ? msgObj.stop_reason
+                  : null;
+          if (candidateStopReason) {
+            stopReason = candidateStopReason;
+          }
+
+          if (eventType === 'message_stop' || sawMessageStop) {
+            sawMessageStop = true;
             return 'stop';
           }
           if (eventType === 'content_block_delta') {
-            const delta = parsed.delta as Record<string, unknown> | undefined;
             if (delta?.type === 'text_delta' && typeof delta.text === 'string') {
               fullContent += delta.text;
               onDelta?.(delta.text);
@@ -207,6 +232,28 @@ export async function executeAnthropicMessagesCall(
         streamIdleTimeoutMs,
       );
 
+      if (stopReason === 'max_tokens' || stopReason === 'refusal') {
+        throw new ProviderTruncatedResponseError({
+          reason: stopReason,
+          protocol: 'anthropic-messages',
+          httpStatus: response.status,
+        });
+      }
+
+      const hasTerminalStop =
+        sawMessageStop ||
+        sseSummary.sawDone ||
+        stopReason === 'end_turn' ||
+        stopReason === 'stop_sequence' ||
+        stopReason === 'stop';
+      if (!hasTerminalStop) {
+        throw new ProviderTruncatedResponseError({
+          reason: 'premature-eof',
+          protocol: 'anthropic-messages',
+          httpStatus: response.status,
+        });
+      }
+
       return { content: fullContent, httpStatus: response.status };
     }
 
@@ -217,7 +264,9 @@ export async function executeAnthropicMessagesCall(
     try {
       json = JSON.parse(rawText) as Record<string, unknown>;
     } catch {
-      throw new Error(`Invalid JSON from Anthropic endpoint: ${rawText.slice(0, 200)}`);
+      throw new Error(
+        `Invalid JSON from Anthropic endpoint (${describeBodyMetadata(rawText, response)})`,
+      );
     }
 
     if (json.type === 'error' || json.error) {
@@ -226,6 +275,16 @@ export async function executeAnthropicMessagesCall(
         bodyText: JSON.stringify(json.error ?? json),
         endpoint,
         usedApiKey: apiKey,
+      });
+    }
+
+    const stopReason =
+      typeof json.stop_reason === 'string' ? json.stop_reason : null;
+    if (stopReason === 'max_tokens' || stopReason === 'refusal') {
+      throw new ProviderTruncatedResponseError({
+        reason: stopReason,
+        protocol: 'anthropic-messages',
+        httpStatus: response.status,
       });
     }
 

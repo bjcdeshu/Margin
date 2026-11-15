@@ -9,6 +9,7 @@ import {
   parseWebVtt,
   parseWebVttTimestamp,
   parseYoutubeTimedTextPayload,
+  stripVttMarkup,
 } from '../../src/youtube/timeline';
 
 /**
@@ -256,6 +257,163 @@ cue-2
     expect(cues).toEqual([
       { tStartMs: 500, dDurationMs: 1200, text: 'Hello & welcome' },
       { tStartMs: 2000, dDurationMs: 1500, text: 'Part 1 Part 2' },
+    ]);
+  });
+
+  it('strips creator-uploaded HTML/SRT/VTT/ASS markup across JSON3 single seg, split segs, and rolling aAppend=1 cues', () => {
+    const cues = normalizeYoutubeEvents([
+      // 1. Single seg with <b>...</b> and ASS {\an8}
+      {
+        tStartMs: 0,
+        dDurationMs: 1500,
+        segs: [{ utf8: '{\\an8}<b>We were wrong, not a little</b>' }],
+      },
+      // 2. Tags split across segs[] (including attribute tag & <br>)
+      {
+        tStartMs: 2000,
+        dDurationMs: 1800,
+        segs: [
+          { utf8: '<b>We ' },
+          { utf8: 'were</b> <font ' },
+          { utf8: 'color="#ff0">Hello<br>World</font>' },
+        ],
+      },
+      // 3. Tags split across rolling aAppend === 1 cues
+      {
+        tStartMs: 4000,
+        dDurationMs: 600,
+        wWinId: 2,
+        segs: [{ utf8: '<b>We were' }],
+      },
+      {
+        tStartMs: 4500,
+        dDurationMs: 900,
+        wWinId: 2,
+        aAppend: 1,
+        segs: [{ utf8: ' wrong</b>' }],
+      },
+      // 4. Closing tag token itself split across rolling aAppend === 1 seam
+      {
+        tStartMs: 6000,
+        dDurationMs: 500,
+        wWinId: 3,
+        segs: [{ utf8: '<i>Split seam</' }],
+      },
+      {
+        tStartMs: 6400,
+        dDurationMs: 700,
+        wWinId: 3,
+        aAppend: 1,
+        segs: [{ utf8: 'i>' }],
+      },
+      // 5. Tag-only noise cue dropped cleanly without emitting empty cue
+      {
+        tStartMs: 8000,
+        dDurationMs: 500,
+        segs: [{ utf8: '{\\b1}<b>   </b>{\\b0}' }],
+      },
+    ]);
+
+    expect(cues).toEqual([
+      {
+        tStartMs: 0,
+        dDurationMs: 1500,
+        text: 'We were wrong, not a little',
+      },
+      {
+        tStartMs: 2000,
+        dDurationMs: 1800,
+        text: 'We were Hello World',
+      },
+      {
+        tStartMs: 4000,
+        dDurationMs: 1400,
+        text: 'We were wrong',
+        wWinId: 2,
+      },
+      {
+        tStartMs: 6000,
+        dDurationMs: 1100,
+        text: 'Split seam',
+        wWinId: 3,
+      },
+    ]);
+  });
+
+  it('sanitizes XML-escaped &lt;b&gt;, <font>, <br/>, <rt>/<rp>, and ASS overrides in SRV3 & legacy XML', () => {
+    const srv3 = [
+      '<timedtext><body>',
+      '<p t="0" d="400" wp="1"/>',
+      '<p t="500" d="1500">&lt;b&gt;We were wrong, not a little&lt;/b&gt;</p>',
+      '<p t="2200" d="1600">{\\an8}&lt;font color=&quot;#ff0&quot;&gt;Hello&lt;br/&gt;World&lt;/font&gt;</p>',
+      '<p t="4000" d="1500">&lt;ruby&gt;漢字&lt;rp&gt;(&lt;/rp&gt;&lt;rt&gt;かんじ&lt;/rt&gt;&lt;rp&gt;)&lt;/rp&gt;&lt;/ruby&gt; &lt;00:11.200&gt;test</p>',
+      '<p t="6000" d="500" w="1">&lt;b&gt;We were</p>',
+      '<p t="6400" d="800" w="1" a="1"> wrong&lt;/b&gt;</p>',
+      '</body></timedtext>',
+    ].join('');
+
+    const srv3Events = parseYoutubeTimedTextPayload(srv3);
+    expect(srv3Events[0]?.text).toBe('We were wrong, not a little');
+    expect(srv3Events[1]?.text).toBe('Hello World');
+    expect(srv3Events[2]?.text).toBe('漢字 test');
+
+    const srv3Cues = normalizeYoutubeEvents(srv3Events);
+    expect(srv3Cues).toEqual([
+      { tStartMs: 500, dDurationMs: 1500, text: 'We were wrong, not a little' },
+      { tStartMs: 2200, dDurationMs: 1600, text: 'Hello World' },
+      { tStartMs: 4000, dDurationMs: 1500, text: '漢字 test' },
+      { tStartMs: 6000, dDurationMs: 1200, text: 'We were wrong', wWinId: 1 },
+    ]);
+
+    const legacyXml = `<transcript><text start="1.0" dur="2.5">{\\pos(192,220)}&lt;u&gt;Legacy&lt;/u&gt;&lt;br&gt;&lt;strong&gt;Caption&lt;/strong&gt;</text></transcript>`;
+    const legacyEvents = parseYoutubeTimedTextPayload(legacyXml);
+    expect(legacyEvents).toEqual([
+      { tStartMs: 1000, dDurationMs: 2500, text: 'Legacy Caption' },
+    ]);
+  });
+
+  it('preserves legitimate programming/math angle brackets across JSON3, WebVTT, TextTrack, and SRV3', () => {
+    const codeLine = 'std::vector<int> & Map<string, number>: a < b && c > d';
+    const compactMath = 'Loop while 0<i && i<n or a<b && c>d or a<v && b>c';
+
+    expect(stripVttMarkup(`<b>Note:</b> ${codeLine}`)).toBe(`Note: ${codeLine}`);
+    expect(stripVttMarkup(compactMath)).toBe(compactMath);
+
+    const json3Cues = normalizeYoutubeEvents([
+      { tStartMs: 0, dDurationMs: 2000, segs: [{ utf8: `<b>${codeLine}</b>` }] },
+      { tStartMs: 2500, dDurationMs: 2000, segs: [{ utf8: compactMath }] },
+    ]);
+    expect(json3Cues.map((c) => c.text)).toEqual([codeLine, compactMath]);
+
+    const vtt = `WEBVTT
+
+00:00.000 --> 00:02.000
+<v Instructor>Use <b>vector<int></b> and Map<string, number> when a < b && c > d</v>
+`;
+    expect(parseWebVtt(vtt)[0]?.text).toBe(
+      'Use vector<int> and Map<string, number> when a < b && c > d',
+    );
+
+    expect(
+      extractTextTrackCues([
+        { startTime: 0, endTime: 2, text: '<i>Check</i> vector<int> && a < b && c > d' },
+      ])[0]?.text,
+    ).toBe('Check vector<int> && a < b && c > d');
+
+    const srv3Code = `<timedtext><body><p t="0" d="2000">&lt;b&gt;vector&lt;int&gt;&lt;/b&gt; &amp;&amp; a &lt; b &amp;&amp; c &gt; d</p></body></timedtext>`;
+    expect(normalizeYoutubeEvents(parseYoutubeTimedTextPayload(srv3Code))[0]?.text).toBe(
+      'vector<int> && a < b && c > d',
+    );
+  });
+
+  it('stitches split <ruby><rt> furigana across rolling SRV3 a="1" append cues before stripping <rt>', () => {
+    const rollingRubySrv3 = `<timedtext><body>
+      <p t="1000" d="2000" w="1">&lt;ruby&gt;漢字&lt;rt&gt;かん</p>
+      <p t="1500" d="1500" w="1" a="1">じ&lt;/rt&gt;&lt;/ruby&gt;を学ぶ</p>
+    </body></timedtext>`;
+    const cues = normalizeYoutubeEvents(parseYoutubeTimedTextPayload(rollingRubySrv3));
+    expect(cues).toEqual([
+      { tStartMs: 1000, dDurationMs: 2000, text: '漢字を学ぶ', wWinId: 1 },
     ]);
   });
 });

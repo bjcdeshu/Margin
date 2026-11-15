@@ -21,6 +21,7 @@ import type {
   ProviderPreset,
   SelectionTriggerMode,
   SubtitleStylePreset,
+  SubtitleTranslationTint,
   TemperaturePolicy,
   ThemePatternRule,
   ThinkingPolicy,
@@ -1473,6 +1474,30 @@ function importNativeMarginV2(
       sub.stylePreset === 'warm-paper'
     ) {
       config.subtitles.stylePreset = sub.stylePreset as SubtitleStylePreset;
+    }
+    if (sub.bgOpacityPercent === null) {
+      config.subtitles.bgOpacityPercent = null;
+    } else if (
+      sub.bgOpacityPercent !== undefined &&
+      (typeof sub.bgOpacityPercent !== 'string' ||
+        sub.bgOpacityPercent.trim() !== '')
+    ) {
+      const parsedOpacity = Number(sub.bgOpacityPercent);
+      if (Number.isFinite(parsedOpacity)) {
+        config.subtitles.bgOpacityPercent = Math.max(
+          0,
+          Math.min(100, Math.round(parsedOpacity)),
+        );
+      }
+    }
+    if (
+      sub.translationTint === 'follow' ||
+      sub.translationTint === 'warm-ivory' ||
+      sub.translationTint === 'amber' ||
+      sub.translationTint === 'cyan'
+    ) {
+      config.subtitles.translationTint =
+        sub.translationTint as SubtitleTranslationTint;
     }
     if (sub.position === 'bottom' || sub.position === 'top') {
       config.subtitles.position = sub.position;

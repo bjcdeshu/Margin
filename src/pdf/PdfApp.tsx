@@ -9,7 +9,7 @@ import {
 import {
   getMarginConfig,
   onMarginConfigChanged,
-  saveMarginConfig,
+  updateMarginConfig,
 } from '@shared/storage';
 import type {
   MarginConfig,
@@ -41,6 +41,29 @@ interface PageTranslationState {
   visionRegions?: VisionBoxRegion[];
   visionFallbackText?: string;
   error?: string;
+}
+
+export function validateRemotePdfUrl(rawUrl: string): string | null {
+  const trimmed = rawUrl.trim();
+  if (!trimmed) return null;
+  try {
+    const parsed = new URL(trimmed);
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+      return null;
+    }
+    return trimmed;
+  } catch {
+    return null;
+  }
+}
+
+export function isRunningInFrame(): boolean {
+  if (typeof window === 'undefined') return false;
+  try {
+    return window.top !== window.self;
+  } catch {
+    return true;
+  }
 }
 
 let pdfjsPromise: Promise<typeof import('pdfjs-dist')> | null = null;
@@ -87,6 +110,10 @@ function PdfPageRow({
 }: PdfPageRowProps) {
   const rowRef = useRef<HTMLElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const mountedRef = useRef(true);
+  const transGenRef = useRef(0);
+  const visionGenRef = useRef(0);
+  const prevLangPairRef = useRef(`${sourceLang}::${targetLang}`);
   const [inView, setInView] = useState(pageNumber <= 2);
   const [state, setState] = useState<PageTranslationState>({
     extracted: false,
@@ -96,6 +123,28 @@ function PdfPageRow({
     translatingText: false,
     visionLoading: false,
   });
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      transGenRef.current += 1;
+      visionGenRef.current += 1;
+    };
+  }, []);
+
+  useEffect(() => {
+    const nextPair = `${sourceLang}::${targetLang}`;
+    if (prevLangPairRef.current === nextPair) return;
+    prevLangPairRef.current = nextPair;
+    visionGenRef.current += 1;
+    setState((prev) => ({
+      ...prev,
+      visionLoading: false,
+      visionRegions: undefined,
+      visionFallbackText: undefined,
+    }));
+  }, [sourceLang, targetLang]);
 
   useEffect(() => {
     const el = rowRef.current;
@@ -121,11 +170,18 @@ function PdfPageRow({
   const translateParagraphBatch = useCallback(
     async (paragraphs: string[]) => {
       if (paragraphs.length === 0) return;
-      setState((prev) => ({ ...prev, translatingText: true, error: undefined }));
+      const gen = ++transGenRef.current;
+      setState((prev) => ({
+        ...prev,
+        translations: {},
+        translatingText: true,
+        error: undefined,
+      }));
 
       const chunkSize = 10;
       try {
         for (let offset = 0; offset < paragraphs.length; offset += chunkSize) {
+          if (!mountedRef.current || gen !== transGenRef.current) return;
           const slice = paragraphs.slice(offset, offset + chunkSize);
           const response = await requestBatchTranslation({
             requestId: `pdf-p${pageNumber}-${offset}-${Date.now()}`,
@@ -139,6 +195,8 @@ function PdfPageRow({
               title: docTitle,
             },
           });
+
+          if (!mountedRef.current || gen !== transGenRef.current) return;
 
           if (!response.ok) {
             setState((prev) => ({
@@ -157,28 +215,36 @@ function PdfPageRow({
           });
         }
       } catch (err) {
-        setState((prev) => ({
-          ...prev,
-          error: err instanceof Error ? err.message : String(err),
-        }));
+        if (mountedRef.current && gen === transGenRef.current) {
+          setState((prev) => ({
+            ...prev,
+            error: err instanceof Error ? err.message : String(err),
+          }));
+        }
       } finally {
-        setState((prev) => ({ ...prev, translatingText: false }));
+        if (mountedRef.current && gen === transGenRef.current) {
+          setState((prev) => ({ ...prev, translatingText: false }));
+        }
       }
     },
     [pageNumber, sourceLang, targetLang, docUrl, docTitle],
   );
 
-  // Render Canvas & Extract Text once visible
+  // Render Canvas once visible (cancels in-flight renderTask on rapid zoom/unmount)
   useEffect(() => {
     if (!inView) return;
     let cancelled = false;
+    let renderTask: { promise: Promise<unknown>; cancel?: () => void } | null = null;
 
     void (async () => {
       try {
         const page = await pdfDoc.getPage(pageNumber);
         if (cancelled) return;
 
-        const dpr = typeof window !== 'undefined' ? Math.min(window.devicePixelRatio || 1, 2) : 1;
+        const dpr =
+          typeof window !== 'undefined'
+            ? Math.min(window.devicePixelRatio || 1, 2)
+            : 1;
         const viewport = page.getViewport({ scale: zoom });
         const canvas = canvasRef.current;
 
@@ -190,27 +256,52 @@ function PdfPageRow({
           const ctx = canvas.getContext('2d');
           if (ctx) {
             ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-            await page.render({ canvasContext: ctx, viewport }).promise;
+            renderTask = page.render({ canvasContext: ctx, viewport });
+            await renderTask.promise;
           }
         }
-
-        if (!state.extracted && !cancelled) {
-          const content = await page.getTextContent();
-          if (cancelled) return;
-          const extracted = extractParagraphsFromTextItems(
-            content.items as unknown as RawPdfTextItem[],
-          );
+      } catch (err) {
+        const errName = (err as { name?: string } | null)?.name;
+        if (!cancelled && errName !== 'RenderingCancelledException') {
           setState((prev) => ({
             ...prev,
-            extracted: true,
-            isLikelyScanned: extracted.isLikelyScanned,
-            paragraphs: extracted.paragraphs,
+            error: err instanceof Error ? err.message : String(err),
           }));
-
-          if (!extracted.isLikelyScanned && extracted.paragraphs.length > 0) {
-            void translateParagraphBatch(extracted.paragraphs);
-          }
         }
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+      try {
+        renderTask?.cancel?.();
+      } catch {
+        // Ignore cancel errors on already-settled render tasks
+      }
+    };
+  }, [inView, pdfDoc, pageNumber, zoom]);
+
+  // Extract page text once visible (independent of zoom)
+  useEffect(() => {
+    if (!inView) return;
+    let cancelled = false;
+
+    void (async () => {
+      try {
+        const page = await pdfDoc.getPage(pageNumber);
+        if (cancelled) return;
+        const content = await page.getTextContent();
+        if (cancelled) return;
+        const extracted = extractParagraphsFromTextItems(
+          content.items as unknown as RawPdfTextItem[],
+        );
+        if (cancelled) return;
+        setState((prev) => ({
+          ...prev,
+          extracted: true,
+          isLikelyScanned: extracted.isLikelyScanned,
+          paragraphs: extracted.paragraphs,
+        }));
       } catch (err) {
         if (!cancelled) {
           setState((prev) => ({
@@ -224,12 +315,33 @@ function PdfPageRow({
     return () => {
       cancelled = true;
     };
-  }, [inView, pdfDoc, pageNumber, zoom]);
+  }, [inView, pdfDoc, pageNumber]);
+
+  // Translate extracted paragraphs and re-translate automatically when sourceLang/targetLang changes
+  useEffect(() => {
+    if (
+      !state.extracted ||
+      state.isLikelyScanned ||
+      state.paragraphs.length === 0
+    ) {
+      return;
+    }
+    void translateParagraphBatch(state.paragraphs);
+    return () => {
+      transGenRef.current += 1;
+    };
+  }, [
+    state.extracted,
+    state.isLikelyScanned,
+    state.paragraphs,
+    translateParagraphBatch,
+  ]);
 
   const handleVisionScanTranslate = async () => {
     const canvas = canvasRef.current;
     if (!canvas) return;
 
+    const myGen = ++visionGenRef.current;
     setState((prev) => ({ ...prev, visionLoading: true, error: undefined }));
     try {
       const imageDataUrl = canvasToScaledWebpDataUrl(canvas, 1536, 0.86);
@@ -240,6 +352,8 @@ function PdfPageRow({
         toLang: targetLang,
         pageUrl: docUrl,
       });
+
+      if (!mountedRef.current || myGen !== visionGenRef.current) return;
 
       if (!res.ok) {
         setState((prev) => ({
@@ -257,6 +371,7 @@ function PdfPageRow({
         visionFallbackText: res.fallbackFullText,
       }));
     } catch (err) {
+      if (!mountedRef.current || myGen !== visionGenRef.current) return;
       setState((prev) => ({
         ...prev,
         visionLoading: false,
@@ -382,6 +497,7 @@ function PdfPageRow({
 export function PdfApp() {
   const [config, setConfig] = useState<MarginConfig>(() => createDefaultMarginConfig());
   const [pdfDoc, setPdfDoc] = useState<PDFDocumentProxy | null>(null);
+  const [docLoadId, setDocLoadId] = useState<number>(0);
   const [docTitle, setDocTitle] = useState<string>('');
   const [docUrl, setDocUrl] = useState<string>('local://pdf');
   const [urlInput, setUrlInput] = useState<string>('');
@@ -392,26 +508,74 @@ export function PdfApp() {
   const [pdfTheme, setPdfTheme] = useState<PdfThemeMode>('none');
 
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const activeDocRef = useRef<PDFDocumentProxy | null>(null);
+  const activeLoadingTaskRef = useRef<{ destroy?: () => Promise<void> | void } | null>(
+    null,
+  );
+  const openSeqRef = useRef(0);
 
   useUiColorMode(config.uiColorMode);
 
   const openPdfFromDataOrUrl = useCallback(
     async (source: { url?: string; data?: ArrayBuffer; name: string }) => {
+      let validatedUrl: string | undefined;
+      if (!source.data) {
+        const checked = validateRemotePdfUrl(source.url ?? '');
+        if (!checked) {
+          setDocError('Only http:// and https:// PDF URLs are supported.');
+          return;
+        }
+        validatedUrl = checked;
+      }
+
+      const seq = ++openSeqRef.current;
+      try {
+        void activeLoadingTaskRef.current?.destroy?.();
+      } catch {
+        // Ignore task teardown errors
+      }
+      activeLoadingTaskRef.current = null;
+
       setLoadingDoc(true);
       setDocError(null);
       try {
         const pdfjs = await loadPdfJsLazy();
+        if (seq !== openSeqRef.current) return;
+
         const task = source.data
           ? pdfjs.getDocument({ data: new Uint8Array(source.data) })
-          : pdfjs.getDocument({ url: source.url! });
+          : pdfjs.getDocument({ url: validatedUrl! });
+        activeLoadingTaskRef.current = task as {
+          destroy?: () => Promise<void> | void;
+        };
+
         const loaded = await task.promise;
+        if (activeLoadingTaskRef.current === task) {
+          activeLoadingTaskRef.current = null;
+        }
+        if (seq !== openSeqRef.current) {
+          void loaded.destroy?.();
+          return;
+        }
+
+        const prevDoc = activeDocRef.current;
+        activeDocRef.current = loaded;
+        if (prevDoc && prevDoc !== loaded) {
+          void prevDoc.destroy?.();
+        }
+
+        setDocLoadId((prev) => prev + 1);
         setPdfDoc(loaded);
         setDocTitle(source.name);
-        setDocUrl(source.url ?? `file://${encodeURIComponent(source.name)}`);
+        setDocUrl(validatedUrl ?? `file://${encodeURIComponent(source.name)}`);
       } catch (err) {
-        setDocError(err instanceof Error ? err.message : String(err));
+        if (seq === openSeqRef.current) {
+          setDocError(err instanceof Error ? err.message : String(err));
+        }
       } finally {
-        setLoadingDoc(false);
+        if (seq === openSeqRef.current) {
+          setLoadingDoc(false);
+        }
       }
     },
     [],
@@ -429,20 +593,38 @@ export function PdfApp() {
       if (active) setConfig(incoming);
     });
 
-    // Support ?file=<url>
-    if (typeof window !== 'undefined') {
+    // Support ?file=<url> only in top-level window and strictly for http:/https: URLs
+    if (typeof window !== 'undefined' && !isRunningInFrame()) {
       const params = new URLSearchParams(window.location.search);
       const fileUrl = params.get('file');
       if (fileUrl) {
-        setUrlInput(fileUrl);
-        const guessedName = fileUrl.split('/').pop()?.split('?')[0] || 'Document.pdf';
-        void openPdfFromDataOrUrl({ url: fileUrl, name: guessedName });
+        const validUrl = validateRemotePdfUrl(fileUrl);
+        if (validUrl) {
+          setUrlInput(validUrl);
+          const guessedName =
+            validUrl.split('/').pop()?.split('?')[0] || 'Document.pdf';
+          void openPdfFromDataOrUrl({ url: validUrl, name: guessedName });
+        } else {
+          setDocError('Only http:// and https:// PDF URLs are supported.');
+        }
       }
     }
 
     return () => {
       active = false;
+      openSeqRef.current += 1;
       unsub();
+      try {
+        void activeLoadingTaskRef.current?.destroy?.();
+      } catch {
+        // Ignore task teardown errors
+      }
+      activeLoadingTaskRef.current = null;
+      const currentDoc = activeDocRef.current;
+      activeDocRef.current = null;
+      if (currentDoc) {
+        void currentDoc.destroy?.();
+      }
     };
   }, [openPdfFromDataOrUrl]);
 
@@ -540,10 +722,10 @@ export function PdfApp() {
             value={config.targetLang}
             onChange={(e) => {
               const nextLang = (e.currentTarget as HTMLSelectElement).value;
-              const updated = structuredClone(config);
-              updated.targetLang = nextLang;
-              setConfig(updated);
-              void saveMarginConfig(updated);
+              setConfig((prev) => ({ ...prev, targetLang: nextLang }));
+              void updateMarginConfig((draft) => {
+                draft.targetLang = nextLang;
+              });
             }}
           >
             {targetLangOptions.map((entry) => (
@@ -562,10 +744,10 @@ export function PdfApp() {
             ]}
             value={config.uiColorMode}
             onChange={(mode: UiColorMode) => {
-              const updated = structuredClone(config);
-              updated.uiColorMode = mode;
-              setConfig(updated);
-              void saveMarginConfig(updated);
+              setConfig((prev) => ({ ...prev, uiColorMode: mode }));
+              void updateMarginConfig((draft) => {
+                draft.uiColorMode = mode;
+              });
             }}
           />
 
@@ -653,7 +835,7 @@ export function PdfApp() {
         <main class="mp-pdf-stream">
           {pageNumbers.map((pageNumber) => (
             <PdfPageRow
-              key={`${docTitle}-${pageNumber}`}
+              key={`${docLoadId}-${pageNumber}`}
               pageNumber={pageNumber}
               totalPages={pdfDoc.numPages}
               pdfDoc={pdfDoc}

@@ -387,4 +387,69 @@ describe('input-translate: Triple-Space, Alt+I, CJK direction, ShadowRoot, Escap
 
     translator.destroy();
   });
+
+  it('aborts in-flight input translation and never overwrites user typing or IME composition started while waiting', async () => {
+    const config = createDefaultMarginConfig();
+    const signals: AbortSignal[] = [];
+    let resolvePending!: (res: TranslateBatchResponse) => void;
+
+    const translator = new InputQuickTranslator({
+      config,
+      transport: (_req, _cb, signal) => {
+        signals.push(signal);
+        return new Promise<TranslateBatchResponse>((resolve) => {
+          resolvePending = resolve;
+        });
+      },
+    });
+    translator.mount();
+
+    // 1. User types additional text while LLM request is in-flight -> aborts & preserves typed edits
+    const textarea = document.createElement('textarea');
+    textarea.value = '初始待翻译草稿';
+    document.body.appendChild(textarea);
+    textarea.focus();
+
+    const flight1 = translator.translateActiveElement();
+    expect(signals).toHaveLength(1);
+    expect(signals[0]?.aborted).toBe(false);
+
+    textarea.value = '初始待翻译草稿，用户继续补充的新内容';
+    textarea.dispatchEvent(new Event('input', { bubbles: true }));
+    expect(signals[0]?.aborted).toBe(true);
+
+    resolvePending({
+      ok: true,
+      requestId: 'late-1',
+      providerId: 'google-free',
+      model: 'gtx',
+      items: [{ id: 1, trans: 'Initial draft to translate' }],
+      diagnostic: mockDiag(),
+    });
+    expect(await flight1).toBe(false);
+    expect(textarea.value).toBe('初始待翻译草稿，用户继续补充的新内容');
+
+    // 2. User starts IME composition while LLM request is in-flight -> aborts & preserves text
+    textarea.value = '第二段草稿';
+    const flight2 = translator.translateActiveElement();
+    expect(signals).toHaveLength(2);
+    expect(signals[1]?.aborted).toBe(false);
+
+    textarea.dispatchEvent(new CompositionEvent('compositionstart', { bubbles: true }));
+    expect(signals[1]?.aborted).toBe(true);
+
+    resolvePending({
+      ok: true,
+      requestId: 'late-2',
+      providerId: 'google-free',
+      model: 'gtx',
+      items: [{ id: 1, trans: 'Second draft' }],
+      diagnostic: mockDiag(),
+    });
+    expect(await flight2).toBe(false);
+    expect(textarea.value).toBe('第二段草稿');
+
+    textarea.dispatchEvent(new CompositionEvent('compositionend', { bubbles: true }));
+    translator.destroy();
+  });
 });

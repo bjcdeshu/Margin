@@ -37,7 +37,7 @@ export interface ProvidersTabProps {
   onRefreshCapabilityCache?: (next: ModelCapabilityMap) => void;
   onMutate: (mutator: (next: MarginConfig) => void) => void;
   /** Ensures unsaved provider edits are persisted before background test runs. */
-  onEnsureSavedBeforeTest: () => Promise<void>;
+  onEnsureSavedBeforeTest: () => Promise<boolean>;
   registerPendingFlush?: (fn: (() => void) | null) => void;
 }
 
@@ -307,7 +307,20 @@ export function ProvidersTab({
     const targetId = provider.id;
     setTestingId(targetId);
     try {
-      await onEnsureSavedBeforeTest();
+      const savedOk = await onEnsureSavedBeforeTest();
+      if (!savedOk) {
+        setTestResults((prev) => ({
+          ...prev,
+          [targetId]: {
+            ok: false,
+            error:
+              lang === 'en'
+                ? 'Could not save channel settings before connectivity test.'
+                : '无法在连通测试前保存渠道配置，请先排查保存错误。',
+          },
+        }));
+        return;
+      }
       const res = await requestProviderTest(targetId);
       if (onRefreshCapabilityCache) {
         const latestCaps = await getCapabilityCache();
