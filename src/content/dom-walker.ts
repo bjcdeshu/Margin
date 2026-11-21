@@ -417,6 +417,51 @@ export function isContentEditableNode(el: Element): boolean {
   return el instanceof HTMLElement && el.isContentEditable === true;
 }
 
+const nativelyHiddenBeforeMarginHide = new WeakSet<Element>();
+const checkedWhileMarginUnhidden = new WeakSet<Element>();
+
+export function snapshotNativelyHiddenChildrenBeforeSrcHide(
+  blockEl: Element,
+): void {
+  if (
+    !blockEl.isConnected ||
+    blockEl.getAttribute('data-margin-src-hidden') === 'true'
+  ) {
+    return;
+  }
+  const view = blockEl.ownerDocument?.defaultView;
+  if (!view || typeof view.getComputedStyle !== 'function') {
+    return;
+  }
+  for (let i = 0; i < blockEl.children.length; i++) {
+    const child = blockEl.children[i];
+    if (
+      child.hasAttribute('data-margin-injected') ||
+      child.hasAttribute('data-margin-host')
+    ) {
+      continue;
+    }
+    try {
+      checkedWhileMarginUnhidden.add(child);
+      if (view.getComputedStyle(child).display === 'none') {
+        nativelyHiddenBeforeMarginHide.add(child);
+      } else {
+        nativelyHiddenBeforeMarginHide.delete(child);
+      }
+    } catch {
+      // Ignore computed-style errors on detached/foreign documents
+    }
+  }
+}
+
+export function clearNativelyHiddenChildrenSnapshot(blockEl: Element): void {
+  for (let i = 0; i < blockEl.children.length; i++) {
+    const child = blockEl.children[i];
+    nativelyHiddenBeforeMarginHide.delete(child);
+    checkedWhileMarginUnhidden.delete(child);
+  }
+}
+
 function isCssHiddenOrScreenReaderOnly(el: Element): boolean {
   const classList = el.classList;
   if (classList) {
@@ -439,9 +484,24 @@ function isCssHiddenOrScreenReaderOnly(el: Element): boolean {
     const view = el.ownerDocument?.defaultView;
     if (view && typeof view.getComputedStyle === 'function') {
       try {
+        const parent = el.parentElement;
+        const underMarginSrcHidden =
+          parent?.getAttribute('data-margin-src-hidden') === 'true' &&
+          !el.hasAttribute('data-margin-injected') &&
+          !el.hasAttribute('data-margin-host');
+        if (underMarginSrcHidden && parent && !checkedWhileMarginUnhidden.has(el)) {
+          parent.removeAttribute('data-margin-src-hidden');
+          try {
+            snapshotNativelyHiddenChildrenBeforeSrcHide(parent);
+          } finally {
+            parent.setAttribute('data-margin-src-hidden', 'true');
+          }
+        }
         const cs = view.getComputedStyle(el);
+        const hiddenByMarginSrcAttr =
+          underMarginSrcHidden && !nativelyHiddenBeforeMarginHide.has(el);
         if (
-          cs.display === 'none' ||
+          (!hiddenByMarginSrcAttr && cs.display === 'none') ||
           cs.visibility === 'hidden' ||
           cs.visibility === 'collapse'
         ) {
@@ -750,6 +810,199 @@ export function isExcludedElement(
   return false;
 }
 
+const INLINE_WRAPPER_DISPLAY_VALUES: ReadonlySet<string> = new Set([
+  'inline',
+  'inline-block',
+  'inline-flex',
+]);
+
+const EXPLICIT_BLOCK_DISPLAY_VALUES: ReadonlySet<string> = new Set([
+  'block',
+  'flex',
+  'grid',
+  'table',
+  'flow-root',
+  'list-item',
+  '-webkit-box',
+]);
+
+const knownInlineWrapperDivs = new WeakSet<Element>();
+const activeInlineWrapperChecks = new WeakSet<Element>();
+
+function readExplicitOrComputedDisplay(el: Element): string {
+  if (el instanceof HTMLElement && el.style) {
+    const inlineDisp = el.style.display?.trim().toLowerCase();
+    if (inlineDisp) {
+      return inlineDisp;
+    }
+  }
+  if (el.isConnected) {
+    if (el.parentElement?.getAttribute('data-margin-src-hidden') === 'true') {
+      return '';
+    }
+    const view = el.ownerDocument?.defaultView;
+    if (view && typeof view.getComputedStyle === 'function') {
+      try {
+        return view.getComputedStyle(el).display?.trim().toLowerCase() ?? '';
+      } catch {
+        return '';
+      }
+    }
+  }
+  return '';
+}
+
+function parentHasNonDivInlineChild(parent: Element): boolean {
+  for (let i = 0; i < parent.children.length; i++) {
+    const ch = parent.children[i];
+    if (
+      ch.hasAttribute('data-margin-injected') ||
+      ch.hasAttribute('data-margin-host') ||
+      ch.getAttribute('data-margin-orig-wrap') === 'true'
+    ) {
+      continue;
+    }
+    const chTag = ch.tagName.toUpperCase();
+    if (chTag !== 'DIV' && !BLOCK_BOUNDARY_TAGS.has(chTag)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Recognizes transparent inline `<div>` wrappers inside prose paragraphs — notably X's
+ * `<div class="css-175oi2r r-xoduu5"><a role="link" href="/...">@handle</a></div>` inside
+ * `[data-testid="tweetText"]`, or explicit `display: inline / inline-block / inline-flex`
+ * inline chip `<div>`s mixed inside an un-excluded candidate parent block.
+ */
+export function isTransparentInlineWrapperDiv(el: Element): boolean {
+  if (el.tagName.toUpperCase() !== 'DIV') {
+    return false;
+  }
+  if (activeInlineWrapperChecks.has(el)) {
+    return false;
+  }
+  if (
+    el.hasAttribute('data-margin-injected') ||
+    el.hasAttribute('data-margin-host') ||
+    el.getAttribute('data-margin-orig-wrap') === 'true'
+  ) {
+    return false;
+  }
+  const testId = el.getAttribute('data-testid');
+  if (
+    testId &&
+    (testId === 'tweetText' ||
+      testId === 'card.wrapper' ||
+      EXCLUDED_DATA_TESTIDS.has(testId))
+  ) {
+    return false;
+  }
+  const role = el.getAttribute('role')?.trim().toLowerCase();
+  if (role && (role === 'group' || EXCLUDED_ARIA_ROLES.has(role))) {
+    return false;
+  }
+
+  const rawParent = el.parentElement;
+  const parent =
+    rawParent?.getAttribute('data-margin-orig-wrap') === 'true'
+      ? rawParent.parentElement
+      : rawParent;
+  if (!parent) {
+    return false;
+  }
+  const body = el.ownerDocument?.body;
+  const docEl = el.ownerDocument?.documentElement;
+  if (parent === body || parent === docEl) {
+    return false;
+  }
+
+  const inlineDisplay =
+    el instanceof HTMLElement
+      ? (el.style?.display?.trim().toLowerCase() ?? '')
+      : '';
+  if (inlineDisplay && EXPLICIT_BLOCK_DISPLAY_VALUES.has(inlineDisplay)) {
+    return false;
+  }
+
+  activeInlineWrapperChecks.add(el);
+  try {
+    const inTweetText = Boolean(parent.closest('[data-testid="tweetText"]'));
+    if (!inTweetText) {
+      let disp = inlineDisplay;
+      if (!disp) {
+        if (knownInlineWrapperDivs.has(el)) {
+          disp = 'inline';
+        } else {
+          disp = readExplicitOrComputedDisplay(el);
+          if (INLINE_WRAPPER_DISPLAY_VALUES.has(disp)) {
+            knownInlineWrapperDivs.add(el);
+          }
+        }
+      }
+      if (!INLINE_WRAPPER_DISPLAY_VALUES.has(disp)) {
+        return false;
+      }
+      const parentTag = parent.tagName.toUpperCase();
+      if (
+        (!READABLE_LEAF_TAGS.has(parentTag) && parentTag !== 'DIV') ||
+        isExcludedElement(parent)
+      ) {
+        return false;
+      }
+      if (
+        !hasDirectBareNonWhitespaceText(parent) &&
+        !parentHasNonDivInlineChild(parent)
+      ) {
+        return false;
+      }
+    }
+
+    const hasBlockDescendant = (container: Element): boolean => {
+      for (let i = 0; i < container.children.length; i++) {
+        const child = container.children[i];
+        if (
+          child.hasAttribute('data-margin-injected') ||
+          child.hasAttribute('data-margin-host') ||
+          isAtomicInlineElement(child, { insideParagraph: true })
+        ) {
+          continue;
+        }
+        const childTag = child.tagName.toUpperCase();
+        if (childTag === 'DIV') {
+          if (!isTransparentInlineWrapperDiv(child)) {
+            return true;
+          }
+          continue;
+        }
+        if (BLOCK_BOUNDARY_TAGS.has(childTag)) {
+          return true;
+        }
+        if (hasBlockDescendant(child)) {
+          return true;
+        }
+      }
+      return false;
+    };
+
+    return !hasBlockDescendant(el);
+  } finally {
+    activeInlineWrapperChecks.delete(el);
+  }
+}
+
+export function isBlockBoundaryElement(el: Element): boolean {
+  const tag = el.tagName.toUpperCase();
+  if (!BLOCK_BOUNDARY_TAGS.has(tag)) {
+    return false;
+  }
+  if (tag === 'DIV' && isTransparentInlineWrapperDiv(el)) {
+    return false;
+  }
+  return true;
+}
+
 /**
  * Checks whether `el` contains nested block-level boundary elements (ignoring atomic inline
  * math/code/SVG nodes, inline controls like `<button>`/`<input>`, and Margin's own injected nodes).
@@ -775,8 +1028,7 @@ export function hasNestedBlockChildren(el: Element): boolean {
       if (isAtomicInlineElement(child, { insideParagraph: true })) {
         continue;
       }
-      const childTag = child.tagName.toUpperCase();
-      if (BLOCK_BOUNDARY_TAGS.has(childTag)) {
+      if (isBlockBoundaryElement(child)) {
         return true;
       }
       if (inspectChildren(child)) {
@@ -810,8 +1062,7 @@ export function findFirstDirectBlockBoundaryChild(
     if (isAtomicInlineElement(child, { insideParagraph: true })) {
       continue;
     }
-    const childTag = child.tagName.toUpperCase();
-    if (BLOCK_BOUNDARY_TAGS.has(childTag) || hasNestedBlockChildren(child)) {
+    if (isBlockBoundaryElement(child) || hasNestedBlockChildren(child)) {
       return child;
     }
   }
@@ -853,8 +1104,7 @@ export function collectTranslatableProse(el: Element): string {
       if (isAtomicInlineElement(elem, { insideParagraph: true })) {
         return;
       }
-      const tag = elem.tagName.toUpperCase();
-      if (BLOCK_BOUNDARY_TAGS.has(tag)) {
+      if (isBlockBoundaryElement(elem)) {
         return;
       }
       if (isExcludedElement(elem, { insideParagraph: true })) {
@@ -970,8 +1220,7 @@ function inspectDirectInlineChildren(el: Element): DirectInlineChildSummary {
     ) {
       return;
     }
-    const childTag = child.tagName.toUpperCase();
-    if (!BLOCK_BOUNDARY_TAGS.has(childTag) && !hasNestedBlockChildren(child)) {
+    if (!isBlockBoundaryElement(child) && !hasNestedBlockChildren(child)) {
       inlineProseChildren.push(child);
     }
   };
@@ -1020,6 +1269,7 @@ export function isMixedInlineAndBlockContainer(
   options?: ExtractBlocksOptions,
 ): el is HTMLElement {
   if (!(el instanceof HTMLElement)) return false;
+  if (isTransparentInlineWrapperDiv(el)) return false;
   if (isExcludedElement(el)) return false;
   if (isAtomicInlineElement(el, { insideParagraph: false })) return false;
 
@@ -1089,6 +1339,7 @@ function isStandaloneInlineBlockChild(
   if (!STANDALONE_INLINE_CANDIDATE_TAGS.has(tag)) return false;
   const parent = el.parentElement;
   if (!parent) return false;
+  if (isTransparentInlineWrapperDiv(parent)) return false;
   if (hasDirectBareNonWhitespaceText(parent)) return false;
 
   const parentHasBlocks = hasNestedBlockChildren(parent);
@@ -1119,6 +1370,7 @@ export function isReadableLeafBlock(
   options?: ExtractBlocksOptions,
 ): el is HTMLElement {
   if (!(el instanceof HTMLElement)) return false;
+  if (isTransparentInlineWrapperDiv(el)) return false;
   if (isExcludedElement(el)) return false;
   if (isAtomicInlineElement(el, { insideParagraph: false })) return false;
 
@@ -1182,8 +1434,7 @@ export function extractParagraphBlocks(
       // children already captured by `el`'s own prose run are never extracted twice.
       for (let i = 0; i < el.children.length; i++) {
         const child = el.children[i];
-        const childTag = child.tagName.toUpperCase();
-        if (BLOCK_BOUNDARY_TAGS.has(childTag) || hasNestedBlockChildren(child)) {
+        if (isBlockBoundaryElement(child) || hasNestedBlockChildren(child)) {
           visit(child);
         }
       }

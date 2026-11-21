@@ -1,7 +1,7 @@
 import {
-  BLOCK_BOUNDARY_TAGS,
   getBlockSourceContainer,
   isAtomicInlineElement,
+  isBlockBoundaryElement,
   isExcludedElement,
 } from './dom-walker';
 import { inspectOriginalLinkAppearance } from './effective-text-style';
@@ -117,6 +117,12 @@ export interface TokenizedParagraph {
   hasRichTags: boolean;
   plainTextLength: number;
   tokens: Map<number, RichTokenDescriptor>;
+  preservesNewlines?: boolean;
+}
+
+export interface TokenizedSegment extends TokenizedParagraph {
+  sepBefore: string;
+  plain: string;
 }
 
 export interface ReconstructedRichDom {
@@ -437,14 +443,13 @@ export function tokenizeParagraph(
         }
         return;
       }
-      const upperTag = el.tagName.toUpperCase();
       if (
-        BLOCK_BOUNDARY_TAGS.has(upperTag) ||
+        isBlockBoundaryElement(el) ||
         isExcludedElement(el, { insideParagraph: true })
       ) {
         return;
       }
-      if (upperTag === 'BR') {
+      if (el.tagName.toUpperCase() === 'BR') {
         plainChars += brSentinel;
         return;
       }
@@ -470,6 +475,7 @@ export function tokenizeParagraph(
       hasRichTags: false,
       plainTextLength: normalized.length,
       tokens,
+      preservesNewlines: preserveNewlines,
     };
   }
 
@@ -506,8 +512,7 @@ export function tokenizeParagraph(
         continue;
       }
 
-      const upperTag = el.tagName.toUpperCase();
-      if (BLOCK_BOUNDARY_TAGS.has(upperTag)) {
+      if (isBlockBoundaryElement(el)) {
         continue;
       }
 
@@ -515,6 +520,7 @@ export function tokenizeParagraph(
         continue;
       }
 
+      const upperTag = el.tagName.toUpperCase();
       if (INLINE_FORMATTING_TAGS.has(upperTag)) {
         const reservedId = nextId++;
         const inner = serializeNodes(el.childNodes);
@@ -549,7 +555,721 @@ export function tokenizeParagraph(
     hasRichTags: tokens.size > 0,
     plainTextLength: normalizedPlain.length,
     tokens,
+    preservesNewlines: preserveNewlines,
   };
+}
+
+type PairedTokenDescriptor = Extract<RichTokenDescriptor, { kind: 'paired' }>;
+type AtomicTokenDescriptor = Extract<RichTokenDescriptor, { kind: 'atomic' }>;
+
+type LexItem =
+  | { kind: 'word'; value: string }
+  | { kind: 'ws'; value: string }
+  | { kind: 'open'; id: number; descriptor: PairedTokenDescriptor }
+  | { kind: 'close'; id: number; descriptor: PairedTokenDescriptor }
+  | { kind: 'atomic'; id: number; descriptor: AtomicTokenDescriptor };
+
+interface CandidateBreak {
+  start: number;
+  end: number;
+  sep: string;
+}
+
+interface RawSegmentChunk {
+  items: LexItem[];
+  sepBefore: string;
+}
+
+type SegTreeNode =
+  | { kind: 'word'; value: string }
+  | { kind: 'ws'; value: string }
+  | { kind: 'atomic'; descriptor: AtomicTokenDescriptor }
+  | { kind: 'paired'; descriptor: PairedTokenDescriptor; children: SegTreeNode[] };
+
+const CJK_SENTENCE_END_END_RE = /[。！？]+['"”’）\]]*$/u;
+const CJK_INTERNAL_SENTENCE_SPLIT_RE = /([。！？]+['"”’）\]]*)(?=.)/gu;
+const LATIN_SENTENCE_END_RE = /[.!?…]+['"”’)\]]*$/u;
+const COMMON_ABBREV_RE = /^(?:mr|mrs|ms|dr|prof|sr|jr|vs|etc|fig|no|vol)\.$/i;
+
+export function extractPlainFromTokenized(t: TokenizedParagraph): string {
+  return computePlainFromTokenized(t.text, t.tokens);
+}
+
+function computePlainFromTokenized(
+  text: string,
+  tokens: ReadonlyMap<number, RichTokenDescriptor>,
+): string {
+  if (!text) return '';
+  const markerRe = /<(\/?)m(\d+)(\s*\/)?>/g;
+  let plain = '';
+  let lastIdx = 0;
+  let match: RegExpExecArray | null;
+  while ((match = markerRe.exec(text)) !== null) {
+    if (match.index > lastIdx) {
+      plain += unescapeLiteralMarkerInRawText(text.slice(lastIdx, match.index));
+    }
+    const [, closingSlash, idStr, selfClose] = match;
+    if (!closingSlash && selfClose) {
+      const desc = tokens.get(Number(idStr));
+      if (desc?.kind === 'atomic') {
+        plain += desc.originalElement.textContent ?? '';
+      }
+    }
+    lastIdx = match.index + match[0].length;
+  }
+  if (lastIdx < text.length) {
+    plain += unescapeLiteralMarkerInRawText(text.slice(lastIdx));
+  }
+  return plain.replace(/\s+/g, ' ').trim();
+}
+
+function pushRawTextIntoLexItems(raw: string, out: LexItem[]): void {
+  if (!raw) return;
+  const parts = raw.split(/([ \t\f\v\n]+)/g);
+  for (let i = 0; i < parts.length; i++) {
+    const part = parts[i];
+    if (!part) continue;
+    const isWs = /^[ \t\f\v\n]+$/.test(part);
+    const prev = out[out.length - 1];
+    if (isWs) {
+      if (prev?.kind === 'ws') {
+        prev.value += part;
+      } else {
+        out.push({ kind: 'ws', value: part });
+      }
+    } else if (prev?.kind === 'word') {
+      prev.value += part;
+    } else {
+      out.push({ kind: 'word', value: part });
+    }
+  }
+}
+
+function lexTokenizedParagraph(t: TokenizedParagraph): LexItem[] {
+  const out: LexItem[] = [];
+  const markerRe = /<(\/?)m(\d+)(\/)?>/g;
+  let lastIdx = 0;
+  let match: RegExpExecArray | null;
+
+  while ((match = markerRe.exec(t.text)) !== null) {
+    if (match.index > lastIdx) {
+      pushRawTextIntoLexItems(t.text.slice(lastIdx, match.index), out);
+    }
+    const [fullMatch, closingSlash, idStr, selfClose] = match;
+    const id = Number(idStr);
+    const desc = t.tokens.get(id);
+
+    if (!desc) {
+      pushRawTextIntoLexItems(fullMatch, out);
+    } else if (!closingSlash && selfClose && desc.kind === 'atomic') {
+      out.push({ kind: 'atomic', id, descriptor: desc });
+    } else if (!closingSlash && !selfClose && desc.kind === 'paired') {
+      out.push({ kind: 'open', id, descriptor: desc });
+    } else if (closingSlash && !selfClose && desc.kind === 'paired') {
+      out.push({ kind: 'close', id, descriptor: desc });
+    } else {
+      pushRawTextIntoLexItems(fullMatch, out);
+    }
+
+    lastIdx = match.index + fullMatch.length;
+  }
+
+  if (lastIdx < t.text.length) {
+    pushRawTextIntoLexItems(t.text.slice(lastIdx), out);
+  }
+
+  return out;
+}
+
+function isTransparentRunItem(item: LexItem): boolean {
+  return item.kind === 'ws' || item.kind === 'open' || item.kind === 'close';
+}
+
+function countNewlinesInRange(
+  items: readonly LexItem[],
+  start: number,
+  end: number,
+): number {
+  let count = 0;
+  for (let i = start; i < end; i++) {
+    const it = items[i];
+    if (it.kind === 'ws') {
+      for (let c = 0; c < it.value.length; c++) {
+        if (it.value.charCodeAt(c) === 10 /* \n */) {
+          count += 1;
+        }
+      }
+    }
+  }
+  return count;
+}
+
+function hasWhitespaceInRange(
+  items: readonly LexItem[],
+  start: number,
+  end: number,
+): boolean {
+  for (let i = start; i < end; i++) {
+    const it = items[i];
+    if (it.kind === 'ws' && it.value.length > 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function hasContentItemInRange(
+  items: readonly LexItem[],
+  start: number,
+  end: number,
+): boolean {
+  for (let i = start; i < end; i++) {
+    if (items[i].kind === 'word' || items[i].kind === 'atomic') {
+      return true;
+    }
+  }
+  return false;
+}
+
+function findMaximalNewlineBreaks(
+  items: readonly LexItem[],
+  minNewlines: number,
+  sep: string,
+): CandidateBreak[] {
+  const breaks: CandidateBreak[] = [];
+  let i = 0;
+  while (i < items.length) {
+    if (!isTransparentRunItem(items[i])) {
+      i += 1;
+      continue;
+    }
+    const start = i;
+    while (i < items.length && isTransparentRunItem(items[i])) {
+      i += 1;
+    }
+    const end = i;
+    if (
+      countNewlinesInRange(items, start, end) >= minNewlines &&
+      hasContentItemInRange(items, 0, start) &&
+      hasContentItemInRange(items, end, items.length)
+    ) {
+      breaks.push({ start, end, sep });
+    }
+  }
+  return breaks;
+}
+
+function splitCjkWordsForSentencePass(items: readonly LexItem[]): LexItem[] {
+  const expanded: LexItem[] = [];
+  for (const it of items) {
+    if (it.kind !== 'word') {
+      expanded.push(it);
+      continue;
+    }
+    let last = 0;
+    let m: RegExpExecArray | null;
+    CJK_INTERNAL_SENTENCE_SPLIT_RE.lastIndex = 0;
+    while ((m = CJK_INTERNAL_SENTENCE_SPLIT_RE.exec(it.value)) !== null) {
+      const cutPos = m.index + m[1].length;
+      expanded.push({ kind: 'word', value: it.value.slice(last, cutPos) });
+      last = cutPos;
+    }
+    if (last < it.value.length) {
+      expanded.push({ kind: 'word', value: it.value.slice(last) });
+    }
+  }
+  return expanded;
+}
+
+function findSentenceCandidateBreaks(items: readonly LexItem[]): CandidateBreak[] {
+  const breaks: CandidateBreak[] = [];
+  for (let i = 0; i < items.length; i++) {
+    const it = items[i];
+    if (it.kind !== 'word') continue;
+
+    const isCjkEnd = CJK_SENTENCE_END_END_RE.test(it.value);
+    const isLatinEnd =
+      !isCjkEnd &&
+      LATIN_SENTENCE_END_RE.test(it.value) &&
+      !COMMON_ABBREV_RE.test(it.value);
+
+    if (!isCjkEnd && !isLatinEnd) continue;
+
+    let runEnd = i + 1;
+    while (runEnd < items.length && isTransparentRunItem(items[runEnd])) {
+      runEnd += 1;
+    }
+    if (!hasContentItemInRange(items, runEnd, items.length)) {
+      continue;
+    }
+    const hasWs = hasWhitespaceInRange(items, i + 1, runEnd);
+    if (isLatinEnd && !hasWs) {
+      continue;
+    }
+    breaks.push({
+      start: i + 1,
+      end: runEnd,
+      sep: hasWs ? ' ' : '',
+    });
+    if (runEnd > i + 1) {
+      i = runEnd - 1;
+    }
+  }
+  return breaks;
+}
+
+function findWhitespaceCandidateBreaks(items: readonly LexItem[]): CandidateBreak[] {
+  const breaks: CandidateBreak[] = [];
+  let i = 0;
+  while (i < items.length) {
+    if (!isTransparentRunItem(items[i])) {
+      i += 1;
+      continue;
+    }
+    const start = i;
+    while (i < items.length && isTransparentRunItem(items[i])) {
+      i += 1;
+    }
+    const end = i;
+    if (
+      hasWhitespaceInRange(items, start, end) &&
+      hasContentItemInRange(items, 0, start) &&
+      hasContentItemInRange(items, end, items.length)
+    ) {
+      breaks.push({ start, end, sep: ' ' });
+    }
+  }
+  return breaks;
+}
+
+function estimateSliceSerializedLength(
+  items: readonly LexItem[],
+  start: number,
+  end: number,
+): number {
+  let len = 0;
+  for (let i = start; i < end; i++) {
+    const it = items[i];
+    if (it.kind === 'word' || it.kind === 'ws') {
+      len += it.value.length;
+    } else if (it.kind === 'atomic') {
+      len += 5;
+    } else if (it.kind === 'open' || it.kind === 'close') {
+      len += 5;
+    }
+  }
+  return len;
+}
+
+function selectGreedyCuts(
+  items: readonly LexItem[],
+  candidates: readonly CandidateBreak[],
+  maxChars: number,
+): CandidateBreak[] {
+  if (candidates.length === 0) return [];
+  const chosen: CandidateBreak[] = [];
+  let sliceStart = 0;
+  let accLen = 0;
+  let openDepth = 0;
+
+  const updateDepth = (from: number, to: number) => {
+    for (let k = from; k < to; k++) {
+      if (items[k].kind === 'open') openDepth += 1;
+      else if (items[k].kind === 'close') openDepth = Math.max(0, openDepth - 1);
+    }
+  };
+
+  for (let idx = 0; idx < candidates.length; idx++) {
+    const cand = candidates[idx];
+    const sliceLen = estimateSliceSerializedLength(items, sliceStart, cand.start);
+    updateDepth(sliceStart, cand.start);
+    const nextEnd =
+      idx + 1 < candidates.length ? candidates[idx + 1].start : items.length;
+    const nextSliceLen = estimateSliceSerializedLength(items, cand.end, nextEnd);
+    const betweenBreakLen = estimateSliceSerializedLength(
+      items,
+      cand.start,
+      cand.end,
+    );
+    const currentTotal = accLen + sliceLen;
+    const tagSlack = openDepth * 10;
+
+    if (
+      currentTotal > 0 &&
+      currentTotal + betweenBreakLen + nextSliceLen + tagSlack > maxChars
+    ) {
+      chosen.push(cand);
+      accLen = 0;
+    } else {
+      accLen = currentTotal + betweenBreakLen;
+    }
+
+    updateDepth(cand.start, cand.end);
+    sliceStart = cand.end;
+  }
+
+  return chosen;
+}
+
+function applyBreaksToChunk(
+  chunk: RawSegmentChunk,
+  cuts: readonly CandidateBreak[],
+): RawSegmentChunk[] {
+  if (cuts.length === 0) return [chunk];
+  const { items } = chunk;
+  const result: RawSegmentChunk[] = [];
+  const openStack: PairedTokenDescriptor[] = [];
+  let currentItems: LexItem[] = [];
+  let currentSep = chunk.sepBefore;
+  let cutIdx = 0;
+  let i = 0;
+
+  const popMatching = (id: number) => {
+    for (let s = openStack.length - 1; s >= 0; s--) {
+      if (openStack[s].id === id) {
+        openStack.splice(s, 1);
+        return;
+      }
+    }
+  };
+
+  while (i < items.length) {
+    if (cutIdx < cuts.length && i === cuts[cutIdx].start) {
+      const cut = cuts[cutIdx++];
+      for (let s = openStack.length - 1; s >= 0; s--) {
+        const d = openStack[s];
+        currentItems.push({ kind: 'close', id: d.id, descriptor: d });
+      }
+      result.push({ items: currentItems, sepBefore: currentSep });
+
+      for (let k = cut.start; k < cut.end; k++) {
+        const ev = items[k];
+        if (ev.kind === 'open') {
+          openStack.push(ev.descriptor);
+        } else if (ev.kind === 'close') {
+          popMatching(ev.id);
+        }
+      }
+
+      currentItems = openStack.map((d) => ({
+        kind: 'open',
+        id: d.id,
+        descriptor: d,
+      }));
+      currentSep = cut.sep;
+      i = cut.end;
+      continue;
+    }
+
+    const ev = items[i++];
+    if (ev.kind === 'open') {
+      openStack.push(ev.descriptor);
+    } else if (ev.kind === 'close') {
+      popMatching(ev.id);
+    }
+    currentItems.push(ev);
+  }
+
+  result.push({ items: currentItems, sepBefore: currentSep });
+  return result;
+}
+
+function treeHasContent(nodes: readonly SegTreeNode[]): boolean {
+  for (const n of nodes) {
+    if (n.kind === 'word' || n.kind === 'atomic') {
+      return true;
+    }
+    if (n.kind === 'paired' && treeHasContent(n.children)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function pruneWhitespaceOnlyWrappers(nodes: SegTreeNode[]): SegTreeNode[] {
+  const out: SegTreeNode[] = [];
+  for (const n of nodes) {
+    if (n.kind === 'paired') {
+      const cleanedChildren = pruneWhitespaceOnlyWrappers(n.children);
+      if (!treeHasContent(cleanedChildren)) {
+        out.push(...cleanedChildren);
+      } else {
+        out.push({
+          kind: 'paired',
+          descriptor: n.descriptor,
+          children: cleanedChildren,
+        });
+      }
+    } else {
+      out.push(n);
+    }
+  }
+  return out;
+}
+
+function trimEdgeSpineWhitespace(nodes: SegTreeNode[], trimAllWs: boolean): void {
+  const trimStart = (list: SegTreeNode[]) => {
+    while (list.length > 0) {
+      const first = list[0];
+      if (first.kind === 'ws' && (trimAllWs || first.value.includes('\n'))) {
+        list.shift();
+      } else {
+        break;
+      }
+    }
+    const head = list[0];
+    if (head && head.kind === 'paired') {
+      trimStart(head.children);
+    }
+  };
+
+  const trimEnd = (list: SegTreeNode[]) => {
+    while (list.length > 0) {
+      const last = list[list.length - 1];
+      if (last.kind === 'ws' && (trimAllWs || last.value.includes('\n'))) {
+        list.pop();
+      } else {
+        break;
+      }
+    }
+    const tail = list[list.length - 1];
+    if (tail && tail.kind === 'paired') {
+      trimEnd(tail.children);
+    }
+  };
+
+  trimStart(nodes);
+  trimEnd(nodes);
+}
+
+function finalizeSegmentChunk(
+  chunk: RawSegmentChunk,
+  preservesNewlines: boolean,
+  trimInnerBoundaryWs = false,
+): TokenizedSegment | null {
+  const rootChildren: SegTreeNode[] = [];
+  const stack: Array<{ descriptor: PairedTokenDescriptor | null; children: SegTreeNode[] }> = [
+    { descriptor: null, children: rootChildren },
+  ];
+
+  for (const it of chunk.items) {
+    const top = stack[stack.length - 1];
+    if (it.kind === 'word') {
+      top.children.push({ kind: 'word', value: it.value });
+    } else if (it.kind === 'ws') {
+      top.children.push({ kind: 'ws', value: it.value });
+    } else if (it.kind === 'atomic') {
+      top.children.push({ kind: 'atomic', descriptor: it.descriptor });
+    } else if (it.kind === 'open') {
+      const children: SegTreeNode[] = [];
+      stack.push({ descriptor: it.descriptor, children });
+    } else if (it.kind === 'close') {
+      if (stack.length > 1) {
+        const closed = stack.pop()!;
+        if (closed.descriptor) {
+          stack[stack.length - 1].children.push({
+            kind: 'paired',
+            descriptor: closed.descriptor,
+            children: closed.children,
+          });
+        } else {
+          stack[stack.length - 1].children.push(...closed.children);
+        }
+      }
+    }
+  }
+
+  while (stack.length > 1) {
+    const dangling = stack.pop()!;
+    if (dangling.descriptor) {
+      stack[stack.length - 1].children.push({
+        kind: 'paired',
+        descriptor: dangling.descriptor,
+        children: dangling.children,
+      });
+    } else {
+      stack[stack.length - 1].children.push(...dangling.children);
+    }
+  }
+
+  let pruned = pruneWhitespaceOnlyWrappers(rootChildren);
+  if (!treeHasContent(pruned)) {
+    return null;
+  }
+
+  // Trim outer root-level whitespace + newline/split-exposed edge whitespace on wrapper spines
+  while (pruned.length > 0 && pruned[0].kind === 'ws') {
+    pruned.shift();
+  }
+  while (pruned.length > 0 && pruned[pruned.length - 1].kind === 'ws') {
+    pruned.pop();
+  }
+  trimEdgeSpineWhitespace(pruned, trimInnerBoundaryWs);
+  pruned = pruneWhitespaceOnlyWrappers(pruned);
+  if (!treeHasContent(pruned)) {
+    return null;
+  }
+
+  const localTokens = new Map<number, RichTokenDescriptor>();
+  let nextLocalId = 0;
+  let plainAcc = '';
+
+  const serializeTree = (nodes: readonly SegTreeNode[]): string => {
+    let acc = '';
+    for (const n of nodes) {
+      if (n.kind === 'word' || n.kind === 'ws') {
+        acc += n.value;
+        plainAcc += unescapeLiteralMarkerInRawText(n.value);
+      } else if (n.kind === 'atomic') {
+        const localId = nextLocalId++;
+        localTokens.set(localId, {
+          id: localId,
+          kind: 'atomic',
+          originalElement: n.descriptor.originalElement,
+        });
+        acc += `<m${localId}/>`;
+        plainAcc += n.descriptor.originalElement.textContent ?? '';
+      } else if (n.kind === 'paired') {
+        const localId = nextLocalId++;
+        localTokens.set(localId, {
+          id: localId,
+          kind: 'paired',
+          originalElement: n.descriptor.originalElement,
+        });
+        const inner = serializeTree(n.children);
+        acc += `<m${localId}>${inner}</m${localId}>`;
+      }
+    }
+    return acc;
+  };
+
+  const text = serializeTree(pruned).trim();
+  const plain = plainAcc.replace(/\s+/g, ' ').trim();
+  if (!text) {
+    return null;
+  }
+
+  return {
+    text,
+    hasRichTags: localTokens.size > 0,
+    plainTextLength: plain.length,
+    tokens: localTokens,
+    preservesNewlines,
+    sepBefore: chunk.sepBefore,
+    plain,
+  };
+}
+
+/**
+ * Pure post-tokenization paragraph splitter for newline-preserving (`white-space: pre-*`) blocks.
+ * - Non-`pre-*` blocks return a single unchanged segment so ordinary `<p>` cache keys survive.
+ * - Splits on maximal runs of whitespace + paired `<mN>`/`</mN>` tags containing `>= 2` `\n`s
+ *   (handling straddling `<m0>P1\n</m0><m1>\nP2</m1>`), closing and re-opening active wrappers.
+ * - Drops whitespace-only paired wrappers and densely renumbers `<m0..mK>` per segment.
+ * - Applies oversize guards on single `\n` (`> softMaxChars`) and sentence ends (`> hardMaxChars`).
+ */
+export function splitTokenizedIntoSegments(
+  t: TokenizedParagraph,
+  opts: { softMaxChars: number; hardMaxChars: number },
+): TokenizedSegment[] {
+  const fallbackPlain = computePlainFromTokenized(t.text, t.tokens);
+  if (!t.preservesNewlines || !t.text) {
+    return [
+      {
+        ...t,
+        tokens: new Map(t.tokens),
+        sepBefore: '',
+        plain: fallbackPlain,
+      },
+    ];
+  }
+
+  const softMax = Math.max(64, Math.floor(opts.softMaxChars || 1200));
+  const hardMax = Math.max(softMax, Math.floor(opts.hardMaxChars || 2400));
+
+  const lexed = lexTokenizedParagraph(t);
+  const paraBreaks = findMaximalNewlineBreaks(lexed, 2, '\n\n');
+  let chunks: RawSegmentChunk[] = applyBreaksToChunk(
+    { items: lexed, sepBefore: '' },
+    paraBreaks,
+  );
+
+  // Oversize Pass 2: split chunks exceeding `softMaxChars` on single `\n`
+  const splitOnSingleNewline = (chunk: RawSegmentChunk): RawSegmentChunk[] => {
+    const finalized = finalizeSegmentChunk(chunk, true);
+    if (!finalized || finalized.text.length <= softMax) {
+      return [chunk];
+    }
+    const lineCands = findMaximalNewlineBreaks(chunk.items, 1, '\n');
+    if (lineCands.length === 0) {
+      return [chunk];
+    }
+    let chosen = selectGreedyCuts(chunk.items, lineCands, softMax);
+    if (chosen.length === 0) {
+      chosen = [lineCands[Math.floor(lineCands.length / 2)]];
+    }
+    const subChunks = applyBreaksToChunk(chunk, chosen);
+    if (subChunks.length <= 1) {
+      return [chunk];
+    }
+    return subChunks.flatMap((sc) => splitOnSingleNewline(sc));
+  };
+
+  chunks = chunks.flatMap((c) => splitOnSingleNewline(c));
+
+  // Oversize Pass 3: split chunks still exceeding `hardMaxChars` on sentence ends (with whitespace fallback)
+  const splitOversizeHard = (chunk: RawSegmentChunk): RawSegmentChunk[] => {
+    const finalized = finalizeSegmentChunk(chunk, true);
+    if (!finalized || finalized.text.length <= hardMax) {
+      return [chunk];
+    }
+    const cjkPreparedItems = splitCjkWordsForSentencePass(chunk.items);
+    const preparedChunk: RawSegmentChunk = {
+      items: cjkPreparedItems,
+      sepBefore: chunk.sepBefore,
+    };
+    let cands = findSentenceCandidateBreaks(cjkPreparedItems);
+    if (cands.length === 0) {
+      cands = findWhitespaceCandidateBreaks(cjkPreparedItems);
+    }
+    if (cands.length === 0) {
+      return [chunk];
+    }
+    let chosen = selectGreedyCuts(cjkPreparedItems, cands, hardMax);
+    if (chosen.length === 0) {
+      chosen = [cands[Math.floor(cands.length / 2)]];
+    }
+    const subChunks = applyBreaksToChunk(preparedChunk, chosen);
+    if (subChunks.length <= 1) {
+      return [chunk];
+    }
+    return subChunks.flatMap((sc) => splitOversizeHard(sc));
+  };
+
+  chunks = chunks.flatMap((c) => splitOversizeHard(c));
+
+  const segments: TokenizedSegment[] = [];
+  const hasMultipleChunks = chunks.length > 1;
+  for (const chunk of chunks) {
+    const seg = finalizeSegmentChunk(chunk, true, hasMultipleChunks);
+    if (seg) {
+      segments.push(seg);
+    }
+  }
+
+  if (segments.length === 0) {
+    return [
+      {
+        ...t,
+        tokens: new Map(t.tokens),
+        sepBefore: '',
+        plain: fallbackPlain,
+      },
+    ];
+  }
+
+  segments[0].sepBefore = '';
+  return segments;
 }
 
 function createPlainFragment(doc: Document, cleanText: string): DocumentFragment {

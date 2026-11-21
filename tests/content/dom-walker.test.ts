@@ -1,11 +1,17 @@
 import { beforeEach, describe, expect, it } from 'vitest';
 import {
+  clearNativelyHiddenChildrenSnapshot,
   collectTranslatableProse,
   extractPageContext,
   extractParagraphBlocks,
   findClosestParagraphBlock,
+  findFirstDirectBlockBoundaryChild,
+  getBlockSourceContainer,
   inferDomainStyleGuide,
+  isMixedInlineAndBlockContainer,
+  isReadableLeafBlock,
   samplePageProseForLanguageDetection,
+  snapshotNativelyHiddenChildrenBeforeSrcHide,
 } from '../../src/content/dom-walker';
 
 describe('dom-walker: smart paragraph extraction & math/code protection', () => {
@@ -622,5 +628,135 @@ describe('dom-walker: smart paragraph extraction & math/code protection', () => 
         'Long architectural thread root sentence',
       ),
     ).toBe(true);
+  });
+
+  it('treats X tweetText inline @mention <div> wrappers as transparent inline containers without affecting standard webpage <div> splitting, and keeps data-margin-src-hidden transparent', () => {
+    const style = document.createElement('style');
+    style.textContent = `
+      .r-xoduu5 { display: inline-flex; }
+      [data-margin-src-hidden="true"] > :not([data-margin-injected]):not([data-margin-host]) {
+        display: none !important;
+      }
+    `;
+    document.head.appendChild(style);
+
+    document.body.innerHTML = `
+      <article>
+        <div id="x-mention-tweet" data-testid="tweetText" style="white-space: pre-wrap;">
+          <span class="css-1jxf684">We partnered with </span>
+          <div class="css-175oi2r r-xoduu5"><span class="css-1jxf684"><a id="mention-link" role="link" href="/AnthropicAI">@AnthropicAI</a></span></div>
+          <span class="css-1jxf684"> to ship multi-paragraph progressive streaming.</span>
+        </div>
+      </article>
+      <section>
+        <div id="ordinary-outer">
+          <div id="ordinary-inner">Standard webpage nested div remains its own leaf block.</div>
+        </div>
+      </section>
+    `;
+
+    const tweetEl = document.getElementById('x-mention-tweet')!;
+    const mentionLink = document.getElementById('mention-link')!;
+
+    expect(isReadableLeafBlock(tweetEl)).toBe(true);
+    expect(isMixedInlineAndBlockContainer(tweetEl)).toBe(false);
+    expect(findFirstDirectBlockBoundaryChild(tweetEl)).toBeNull();
+    expect(collectTranslatableProse(tweetEl).replace(/\s+/g, ' ').trim()).toBe(
+      'We partnered with @AnthropicAI to ship multi-paragraph progressive streaming.',
+    );
+    expect(findClosestParagraphBlock(mentionLink)?.id).toBe('x-mention-tweet');
+
+    const extracted = extractParagraphBlocks(document.body, {
+      targetLang: 'zh-CN',
+    });
+    expect(extracted.map((el) => el.id)).toEqual([
+      'x-mention-tweet',
+      'ordinary-inner',
+    ]);
+
+    // Activate CSS-based target-only source hiding (`data-margin-src-hidden="true"`)
+    tweetEl.setAttribute('data-margin-src-hidden', 'true');
+    expect(getBlockSourceContainer(tweetEl)).toBe(tweetEl);
+    expect(collectTranslatableProse(tweetEl).replace(/\s+/g, ' ').trim()).toBe(
+      'We partnered with @AnthropicAI to ship multi-paragraph progressive streaming.',
+    );
+    expect(samplePageProseForLanguageDetection(document.body)).toContain(
+      'We partnered with',
+    );
+    expect(
+      extractParagraphBlocks(document.body, { targetLang: 'zh-CN' }).map(
+        (el) => el.id,
+      ),
+    ).toEqual(['x-mention-tweet', 'ordinary-inner']);
+  });
+
+  it('v2.3.6 Round-2 (P1-4 & P2-5): never drops inline-styled divs inside non-candidate parents or merges display:contents rows, and snapshots stylesheet-hidden children before data-margin-src-hidden', () => {
+    const style = document.createElement('style');
+    style.textContent = `
+      .host-stylesheet-hidden { display: none; }
+      [data-margin-src-hidden="true"] > :not([data-margin-injected]):not([data-margin-host]) {
+        display: none !important;
+      }
+    `;
+    document.head.appendChild(style);
+
+    document.body.innerHTML = `
+      <custom-card>
+        <div id="inline-block-in-custom" style="display: inline-block;">
+          Standalone inline-block prose inside custom element
+        </div>
+      </custom-card>
+      <figure>
+        <div id="inline-flex-in-figure" style="display: inline-flex;">
+          Figure callout prose inside non-candidate parent
+        </div>
+      </figure>
+      <p id="candidate-p-with-inline-div">
+        Read the <div style="display: inline-block;"><a href="/guide">inline badge</a></div> carefully before deploying.
+      </p>
+      <div class="css-grid-table" style="display: grid;">
+        <div id="contents-row" style="display: contents;">
+          <div id="grid-cell-a">First grid cell prose</div>
+          <div id="grid-cell-b">Second grid cell prose</div>
+        </div>
+      </div>
+      <article>
+        <div id="tweet-with-native-hidden" data-testid="tweetText" style="white-space: pre-wrap;">
+          <span class="visible-copy">Visible public engineering update.</span>
+          <span class="host-stylesheet-hidden">Hidden internal debug copy that must stay excluded</span>
+        </div>
+      </article>
+    `;
+
+    const blocksBeforeHide = extractParagraphBlocks(document.body, {
+      targetLang: 'zh-CN',
+    });
+    expect(blocksBeforeHide.map((el) => el.id)).toEqual([
+      'inline-block-in-custom',
+      'inline-flex-in-figure',
+      'candidate-p-with-inline-div',
+      'grid-cell-a',
+      'grid-cell-b',
+      'tweet-with-native-hidden',
+    ]);
+
+    const tweetWithHidden = document.getElementById('tweet-with-native-hidden')!;
+    expect(collectTranslatableProse(tweetWithHidden).trim()).toBe(
+      'Visible public engineering update.',
+    );
+
+    // Snapshot natively stylesheet-hidden direct children BEFORE setting `data-margin-src-hidden="true"`
+    snapshotNativelyHiddenChildrenBeforeSrcHide(tweetWithHidden);
+    tweetWithHidden.setAttribute('data-margin-src-hidden', 'true');
+
+    expect(collectTranslatableProse(tweetWithHidden).trim()).toBe(
+      'Visible public engineering update.',
+    );
+    expect(collectTranslatableProse(tweetWithHidden)).not.toContain(
+      'Hidden internal debug copy',
+    );
+
+    tweetWithHidden.removeAttribute('data-margin-src-hidden');
+    clearNativelyHiddenChildrenSnapshot(tweetWithHidden);
   });
 });

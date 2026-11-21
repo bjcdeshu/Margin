@@ -26,7 +26,7 @@ import type {
 } from '@shared/types';
 import { resolveThemeForUrl } from '@shared/url-match';
 import {
-  BLOCK_BOUNDARY_TAGS,
+  clearNativelyHiddenChildrenSnapshot,
   extractFocalThreadContext,
   extractPageContext,
   extractParagraphBlocks,
@@ -35,17 +35,29 @@ import {
   hasNestedBlockChildren,
   inferDomainStyleGuide,
   isAtomicInlineElement,
+  isBlockBoundaryElement,
+  snapshotNativelyHiddenChildrenBeforeSrcHide,
 } from './dom-walker';
 import {
   applyEffectiveHostTextStyle,
   resolveEffectiveHostTextStyle,
 } from './effective-text-style';
 import {
+  RecentPrefixStore,
+  classifySourceChange,
+  isBoundarySegmentExpansion,
+  normalizePlainForPrefix,
+} from './expansion';
+import {
+  extractPlainFromTokenized,
   reconstructRichDom,
   refreshClonedLinksAppearance,
+  splitTokenizedIntoSegments,
   stripResidualMarkers,
   tokenizeParagraph,
+  type RichTokenDescriptor,
   type TokenizedParagraph,
+  type TokenizedSegment,
 } from './rich-text';
 
 export * from './effective-text-style';
@@ -80,6 +92,14 @@ const INLINE_SHORT_CELL_TAGS: ReadonlySet<string> = new Set([
 export const WEBPAGE_INJECTED_CSS = /* css */ `
 .margin-orig-source[data-margin-orig-wrap="true"] {
   display: none !important;
+}
+
+[data-margin-src-hidden="true"] > :not([data-margin-injected]):not([data-margin-host]) {
+  display: none !important;
+}
+
+.margin-trans-seg {
+  display: inline;
 }
 
 .margin-trans-root[data-margin-injected="true"],
@@ -282,12 +302,36 @@ html[data-margin-mask-revealed="true"] .margin-trans-root[data-margin-theme="mas
   display: none !important;
 }
 
+.margin-trans-tail-shimmer[data-margin-injected="true"] {
+  display: inline-block;
+  width: 2.4em;
+  height: 0.78em;
+  min-height: 9px;
+  max-height: 14px;
+  margin-inline-start: 0.38em;
+  vertical-align: -0.08em;
+  border-radius: 4px;
+  background-color: color-mix(in srgb, currentColor 8%, transparent);
+  background-image: linear-gradient(
+    90deg,
+    transparent 0%,
+    rgba(185, 131, 61, 0.18) 50%,
+    transparent 100%
+  );
+  background-size: 220% 100%;
+  background-position: 120% 0;
+  animation: margin-shimmer-sweep 1.5s cubic-bezier(0.4, 0, 0.2, 1) infinite;
+  user-select: none;
+  pointer-events: none;
+}
+
 @media (prefers-reduced-motion: reduce) {
   .margin-trans-root[data-margin-injected="true"],
   .margin-inline-retry[data-margin-injected="true"] {
     transition: none !important;
   }
-  .margin-shimmer-line {
+  .margin-shimmer-line,
+  .margin-trans-tail-shimmer[data-margin-injected="true"] {
     animation: none !important;
     background-image: none !important;
   }
@@ -662,6 +706,58 @@ export interface WebpageRendererOptions {
   transport?: BatchTransportFn;
   flushDelayMs?: number;
   onManualStop?: () => void;
+  isUserActivationActive?: () => boolean;
+}
+
+type SegState =
+  | 'pending'
+  | 'pinned'
+  | 'streaming'
+  | 'done'
+  | 'failed'
+  | 'identity';
+
+interface PriorSegmentSnapshot {
+  sourceText: string;
+  plain: string;
+  translatedText: string;
+}
+
+interface PriorBlockSnapshot {
+  blockPlain: string;
+  segments: PriorSegmentSnapshot[];
+}
+
+interface PlanSegment extends TokenizedSegment {
+  cacheKey: string;
+  state: SegState;
+  trans?: string;
+  fallbackPlain?: boolean;
+  hadPinnedTrans?: boolean;
+  pinnedPlainLen?: number;
+  pinnedRichTokenized?: TokenizedParagraph;
+  pinnedSourceText?: string;
+  pinnedSourcePlain?: string;
+  staleSettledTrans?: string;
+  holdUntilFinal?: boolean;
+  lastPaintLen: number;
+  domEl?: HTMLSpanElement;
+  streamTextNode?: Text;
+}
+
+interface BlockPlan {
+  block: HTMLElement;
+  scene: TranslationScene;
+  blockSourceText: string;
+  blockPlain: string;
+  segments: PlanSegment[];
+  controllers: Set<AbortController>;
+  batchPromises: Set<Promise<void>>;
+  inFlightBatches: number;
+  superseded: boolean;
+  forceBilingual: boolean;
+  isExpansionFromPrior: boolean;
+  hasPendingGrowth?: boolean;
 }
 
 interface PreparedBlockTask {
@@ -670,13 +766,19 @@ interface PreparedBlockTask {
   cacheKey: string;
   charCount: number;
   scene: TranslationScene;
+  seg?: { plan: BlockPlan; index: number };
+  superseded?: boolean;
+  controller?: AbortController;
+  settled?: boolean;
 }
 
 interface MountedBlockMeta {
   plainTextLength: number;
+  plain: string;
   fallbackPlain: boolean;
   sourceText: string;
   translatedText: string;
+  segments?: PriorSegmentSnapshot[];
 }
 
 const UNCLAMP_TRACKED_PROPS = [
@@ -978,6 +1080,23 @@ export class WebpageRenderer {
   private statusCloseBtn: HTMLButtonElement | null = null;
   private statusHideTimer: ReturnType<typeof setTimeout> | null = null;
 
+  private readonly customIsUserActivationActive?: () => boolean;
+  private userInteractionCleanup: (() => void) | null = null;
+  private lastUserInteractionAt = 0;
+
+  private readonly blockPlans = new Map<HTMLElement, BlockPlan>();
+  private readonly recentPrefixes = new RecentPrefixStore();
+  private readonly hiddenSourceBlocks = new Set<HTMLElement>();
+  private readonly batchTasksByController = new Map<
+    AbortController,
+    readonly PreparedBlockTask[]
+  >();
+  private readonly inFlightTasksByBlock = new Map<
+    HTMLElement,
+    Set<PreparedBlockTask>
+  >();
+  private readonly maskClickBoundRoots = new WeakSet<Element>();
+
   private flushTimer: ReturnType<typeof setTimeout> | null = null;
   private spaMutationTimer: ReturnType<typeof setTimeout> | null = null;
   private readonly pendingSpaRoots = new Set<ParentNode>();
@@ -996,8 +1115,10 @@ export class WebpageRenderer {
     this.transport = options.transport ?? defaultBatchTransport;
     this.flushDelayMs = options.flushDelayMs ?? 16;
     this.onManualStop = options.onManualStop;
+    this.customIsUserActivationActive = options.isUserActivationActive;
 
     this.bindFullscreenListener();
+    this.bindUserInteractionListener();
   }
 
   get isActive(): boolean {
@@ -1038,6 +1159,17 @@ export class WebpageRenderer {
         this.translatedBlockSet.delete(blk);
       }
     }
+    for (const [blk, plan] of Array.from(this.blockPlans.entries())) {
+      if (!blk.isConnected) {
+        this.supersedePlan(plan);
+        this.blockPlans.delete(blk);
+      }
+    }
+    for (const blk of Array.from(this.hiddenSourceBlocks)) {
+      if (!blk.isConnected) {
+        this.hiddenSourceBlocks.delete(blk);
+      }
+    }
     for (const blk of Array.from(this.inFlightBlockSet)) {
       if (!blk.isConnected) {
         this.inFlightBlockSet.delete(blk);
@@ -1058,6 +1190,7 @@ export class WebpageRenderer {
 
   clearCache(): void {
     this.cache.clear();
+    this.recentPrefixes.clear();
   }
 
   private runInternalDomMutation<T>(fn: () => T): T {
@@ -1087,6 +1220,64 @@ export class WebpageRenderer {
       this.doc.removeEventListener('fullscreenchange', onFsChange);
       this.doc.removeEventListener('webkitfullscreenchange', onFsChange);
     };
+  }
+
+  private bindUserInteractionListener(): void {
+    if (this.userInteractionCleanup) return;
+    const onInteract = () => {
+      this.lastUserInteractionAt = Date.now();
+    };
+    this.doc.addEventListener('pointerdown', onInteract, {
+      capture: true,
+      passive: true,
+    });
+    this.doc.addEventListener('keydown', onInteract, {
+      capture: true,
+      passive: true,
+    });
+    this.doc.addEventListener('click', onInteract, {
+      capture: true,
+      passive: true,
+    });
+    this.userInteractionCleanup = () => {
+      this.doc.removeEventListener('pointerdown', onInteract, true);
+      this.doc.removeEventListener('keydown', onInteract, true);
+      this.doc.removeEventListener('click', onInteract, true);
+    };
+  }
+
+  private isUserInitiatedNow(): boolean {
+    if (this.customIsUserActivationActive) {
+      return Boolean(this.customIsUserActivationActive());
+    }
+    const nav = (
+      this.doc.defaultView?.navigator ??
+      (typeof navigator !== 'undefined' ? navigator : undefined)
+    ) as (Navigator & { userActivation?: { isActive?: boolean } }) | undefined;
+    if (nav?.userActivation?.isActive) {
+      return true;
+    }
+    return (
+      this.lastUserInteractionAt > 0 &&
+      Date.now() - this.lastUserInteractionAt <= 1500
+    );
+  }
+
+  private bindMaskClickToggle(container: HTMLElement): void {
+    if (this.maskClickBoundRoots.has(container)) return;
+    this.maskClickBoundRoots.add(container);
+    container.addEventListener('click', (ev) => {
+      if (container.getAttribute('data-margin-theme') !== 'mask') return;
+      const target = ev.target as Element | null;
+      if (target?.closest?.('a, button')) return;
+      const currentlyUnmasked =
+        container.getAttribute('data-margin-item-unmasked') === 'true';
+      if (currentlyUnmasked) {
+        container.removeAttribute('data-margin-item-unmasked');
+      } else {
+        container.setAttribute('data-margin-item-unmasked', 'true');
+      }
+    });
   }
 
   ensureStylesInjected(): void {
@@ -1299,12 +1490,58 @@ export class WebpageRenderer {
     return false;
   }
 
+  private findDirectInjectedRoot(blockEl: Element): HTMLSpanElement | null {
+    for (let i = 0; i < blockEl.children.length; i++) {
+      const child = blockEl.children[i];
+      if (
+        child instanceof HTMLSpanElement &&
+        child.classList.contains('margin-trans-root') &&
+        child.getAttribute('data-margin-injected') === 'true'
+      ) {
+        return child;
+      }
+    }
+    return null;
+  }
+
   private insertInjectedIntoBlock(blockEl: HTMLElement, node: Element): void {
     const firstNestedBlock = findFirstDirectBlockBoundaryChild(blockEl);
     if (firstNestedBlock && firstNestedBlock.parentElement === blockEl) {
       blockEl.insertBefore(node, firstNestedBlock);
     } else {
       blockEl.appendChild(node);
+    }
+  }
+
+  private ensureInjectedRootAtEnd(blockEl: HTMLElement, root: Element): void {
+    const firstNestedBlock = findFirstDirectBlockBoundaryChild(blockEl);
+    if (firstNestedBlock && firstNestedBlock.parentElement === blockEl) {
+      if (root.nextElementSibling !== firstNestedBlock) {
+        blockEl.insertBefore(root, firstNestedBlock);
+      }
+      return;
+    }
+    if (root.parentElement !== blockEl) {
+      blockEl.appendChild(root);
+      return;
+    }
+    let sib = root.nextSibling;
+    while (sib) {
+      if (sib.nodeType === Node.TEXT_NODE && sib.nodeValue?.trim()) {
+        blockEl.appendChild(root);
+        return;
+      }
+      if (sib.nodeType === Node.ELEMENT_NODE) {
+        const sibEl = sib as Element;
+        if (
+          !sibEl.hasAttribute('data-margin-injected') &&
+          !sibEl.hasAttribute('data-margin-host')
+        ) {
+          blockEl.appendChild(root);
+          return;
+        }
+      }
+      sib = sib.nextSibling;
     }
   }
 
@@ -1734,20 +1971,33 @@ export class WebpageRenderer {
           const failed = Array.from(this.failedBlockTasks.values());
           this.failedBlockTasks.clear();
           this.lastError = undefined;
-          if (failed.length > 0) {
+          const legacyFailed: PreparedBlockTask[] = [];
+          const plansToRetry = new Set<BlockPlan>();
+          for (const task of failed) {
+            const activePlan = this.blockPlans.get(task.block);
+            if (activePlan && !activePlan.superseded) {
+              plansToRetry.add(activePlan);
+            } else if (!task.seg) {
+              legacyFailed.push(task);
+            }
+          }
+          for (const plan of plansToRetry) {
+            this.retryFailedPlan(plan);
+          }
+          if (legacyFailed.length > 0) {
             this.runInternalDomMutation(() => {
-              for (const task of failed) {
+              for (const task of legacyFailed) {
                 this.clearBlockInjectedElements(task.block);
-                this.unwrapOriginalContent(task.block);
+                this.setSourceHidden(task.block, false);
                 this.mountBlockLoadingIndicator(
                   task.block,
                   task.tokenized.plainTextLength,
                 );
               }
             });
-            this.sessionTotalBlocks += failed.length;
+            this.sessionTotalBlocks += legacyFailed.length;
             this.refreshStatusPill();
-            void this.executeBatch(failed, { priority: 0 });
+            void this.executeBatch(legacyFailed, { priority: 0 });
           }
         }
       });
@@ -1926,10 +2176,9 @@ export class WebpageRenderer {
           flushRun();
           continue;
         }
-        const tag = el.tagName.toUpperCase();
         if (
           !isAtomicInlineElement(el, { insideParagraph: true }) &&
-          (BLOCK_BOUNDARY_TAGS.has(tag) || hasNestedBlockChildren(el))
+          (isBlockBoundaryElement(el) || hasNestedBlockChildren(el))
         ) {
           flushRun();
           continue;
@@ -1974,6 +2223,53 @@ export class WebpageRenderer {
     }
   }
 
+  private canHideSourceByCss(blockEl: HTMLElement): boolean {
+    for (let i = 0; i < blockEl.childNodes.length; i++) {
+      const child = blockEl.childNodes[i];
+      if (child.nodeType === Node.TEXT_NODE) {
+        if ((child.nodeValue ?? '').trim().length > 0) {
+          return false;
+        }
+        continue;
+      }
+      if (child.nodeType === Node.ELEMENT_NODE) {
+        const el = child as Element;
+        if (el.getAttribute('data-margin-orig-wrap') === 'true') {
+          return false;
+        }
+      }
+    }
+    return findFirstDirectBlockBoundaryChild(blockEl) === null;
+  }
+
+  private setSourceHidden(blockEl: HTMLElement, hidden: boolean): void {
+    if (!hidden) {
+      if (blockEl.hasAttribute('data-margin-src-hidden')) {
+        blockEl.removeAttribute('data-margin-src-hidden');
+      }
+      clearNativelyHiddenChildrenSnapshot(blockEl);
+      this.hiddenSourceBlocks.delete(blockEl);
+      this.unwrapOriginalContent(blockEl);
+      return;
+    }
+
+    if (this.canHideSourceByCss(blockEl)) {
+      snapshotNativelyHiddenChildrenBeforeSrcHide(blockEl);
+      if (blockEl.getAttribute('data-margin-src-hidden') !== 'true') {
+        blockEl.setAttribute('data-margin-src-hidden', 'true');
+      }
+      this.hiddenSourceBlocks.add(blockEl);
+      return;
+    }
+
+    if (blockEl.hasAttribute('data-margin-src-hidden')) {
+      blockEl.removeAttribute('data-margin-src-hidden');
+      this.hiddenSourceBlocks.delete(blockEl);
+    }
+    clearNativelyHiddenChildrenSnapshot(blockEl);
+    this.wrapOriginalContentForTargetOnly(blockEl);
+  }
+
   private clearBlockInjectedElements(blockEl: HTMLElement): void {
     const toRemove: Element[] = [];
     for (let i = 0; i < blockEl.children.length; i++) {
@@ -1989,13 +2285,42 @@ export class WebpageRenderer {
   }
 
   removeBlockTranslation(blockEl: HTMLElement): void {
+    const existingPlan = this.blockPlans.get(blockEl);
+    if (existingPlan) {
+      this.supersedePlan(existingPlan);
+      this.blockPlans.delete(blockEl);
+    } else {
+      this.supersedeBlockInFlight(blockEl);
+    }
     this.runInternalDomMutation(() => {
       this.clearBlockInjectedElements(blockEl);
-      this.unwrapOriginalContent(blockEl);
+      this.setSourceHidden(blockEl, false);
       this.restoreUnclampedForBlock(blockEl);
       blockEl.removeAttribute('data-margin-translated');
       this.mountedMeta.delete(blockEl);
       this.translatedBlockSet.delete(blockEl);
+      this.failedBlockTasks.delete(blockEl);
+    });
+  }
+
+  private recordRecentPrefixIfEligible(
+    blockPlain: string,
+    lastSegPlain: string,
+    lastSegSourceText: string,
+    lastSegTranslated: string,
+    preservesNewlines: boolean,
+    forceBilingual: boolean,
+  ): void {
+    if (forceBilingual || !preservesNewlines) return;
+    if (blockPlain.length < 160) return;
+    const configSig = this.computeTranslationConfigSignature(this.config);
+    this.recentPrefixes.record({
+      configSig,
+      blockPlain,
+      lastSegPlain,
+      lastSegSourceText,
+      lastSegTranslated,
+      at: Date.now(),
     });
   }
 
@@ -2005,6 +2330,11 @@ export class WebpageRenderer {
     translatedText: string,
     options: { forceBilingual?: boolean } = {},
   ): { fallbackPlain: boolean } {
+    const oldPlan = this.blockPlans.get(blockEl);
+    if (oldPlan) {
+      this.supersedePlan(oldPlan);
+      this.blockPlans.delete(blockEl);
+    }
     this.ensureStylesInjected();
     const displayMode: DisplayMode = options.forceBilingual
       ? 'bilingual'
@@ -2016,7 +2346,7 @@ export class WebpageRenderer {
     ) {
       this.runInternalDomMutation(() => {
         this.clearBlockInjectedElements(blockEl);
-        this.unwrapOriginalContent(blockEl);
+        this.setSourceHidden(blockEl, false);
         this.restoreUnclampedForBlock(blockEl);
         blockEl.removeAttribute('data-margin-translated');
         this.mountedMeta.delete(blockEl);
@@ -2039,16 +2369,14 @@ export class WebpageRenderer {
       tokenized.plainTextLength,
       displayMode,
     );
+    const normalizedPlain = normalizePlainForPrefix(
+      extractPlainFromTokenized(tokenized),
+    );
 
     this.ensureThemeObserver();
     this.runInternalDomMutation(() => {
       this.clearBlockInjectedElements(blockEl);
-
-      if (displayMode === 'target-only') {
-        this.wrapOriginalContentForTargetOnly(blockEl);
-      } else {
-        this.unwrapOriginalContent(blockEl);
-      }
+      this.setSourceHidden(blockEl, displayMode === 'target-only');
 
       const span = this.doc.createElement('span');
       span.className = 'margin-trans-root margin-trans-block';
@@ -2061,26 +2389,16 @@ export class WebpageRenderer {
         span.setAttribute('data-margin-fallback-plain', 'true');
       }
       span.appendChild(reconstructed.fragment);
-
-      span.addEventListener('click', (ev) => {
-        if (span.getAttribute('data-margin-theme') !== 'mask') return;
-        const target = ev.target as Element | null;
-        if (target?.closest?.('a')) return;
-        const currentlyUnmasked =
-          span.getAttribute('data-margin-item-unmasked') === 'true';
-        if (currentlyUnmasked) {
-          span.removeAttribute('data-margin-item-unmasked');
-        } else {
-          span.setAttribute('data-margin-item-unmasked', 'true');
-        }
-      });
+      this.bindMaskClickToggle(span);
 
       this.ownedInjectedNodes.add(span);
       this.insertInjectedIntoBlock(blockEl, span);
+      this.ensureInjectedRootAtEnd(blockEl, span);
       this.unclampForInjectedNode(blockEl, span);
       blockEl.setAttribute('data-margin-translated', 'true');
       this.mountedMeta.set(blockEl, {
         plainTextLength: tokenized.plainTextLength,
+        plain: normalizedPlain,
         fallbackPlain: reconstructed.fallbackPlain,
         sourceText: tokenized.text,
         translatedText,
@@ -2089,7 +2407,1129 @@ export class WebpageRenderer {
       this.failedBlockTasks.delete(blockEl);
     });
 
+    this.recordRecentPrefixIfEligible(
+      normalizedPlain,
+      normalizedPlain,
+      tokenized.text,
+      translatedText,
+      Boolean(tokenized.preservesNewlines),
+      Boolean(options.forceBilingual),
+    );
+
     return { fallbackPlain: reconstructed.fallbackPlain };
+  }
+
+  private tryBindPriorRichTokens(
+    oldSourceText: string,
+    oldTranslatedText: string,
+    newSeg: TokenizedSegment,
+  ): TokenizedParagraph | undefined {
+    if (!oldSourceText || !/<\/?m\d+/i.test(oldTranslatedText)) {
+      return undefined;
+    }
+    const oldOpenRe = /<m(\d+)(\/)?>/g;
+    const oldMarkers: Array<{ id: number; kind: 'paired' | 'atomic' }> = [];
+    let m: RegExpExecArray | null;
+    while ((m = oldOpenRe.exec(oldSourceText)) !== null) {
+      oldMarkers.push({
+        id: Number(m[1]),
+        kind: m[2] ? 'atomic' : 'paired',
+      });
+    }
+    if (oldMarkers.length === 0) {
+      return undefined;
+    }
+
+    const oldCore = oldSourceText.replace(
+      /(?:<\/m\d+>|\s|\u2026|\.{3})+$/gu,
+      '',
+    );
+    let lastTagEnd = 0;
+    const anyTagRe = /<\/?m\d+\/?>/g;
+    while ((m = anyTagRe.exec(oldCore)) !== null) {
+      lastTagEnd = m.index + m[0].length;
+    }
+    const safePrefixLen = Math.max(lastTagEnd, oldCore.length - 16);
+    const safePrefix = oldCore.slice(0, safePrefixLen);
+    if (!safePrefix || !newSeg.text.startsWith(safePrefix)) {
+      return undefined;
+    }
+
+    for (const marker of oldMarkers) {
+      const newDesc = newSeg.tokens.get(marker.id);
+      if (!newDesc || newDesc.kind !== marker.kind) {
+        return undefined;
+      }
+    }
+
+    const transIds = new Set<number>();
+    const transMarkerRe = /<m(\d+)(?:\s*\/)?>/g;
+    while ((m = transMarkerRe.exec(oldTranslatedText)) !== null) {
+      transIds.add(Number(m[1]));
+    }
+    if (transIds.size === 0) {
+      return undefined;
+    }
+
+    const boundTokens = new Map<number, RichTokenDescriptor>();
+    for (const id of transIds) {
+      const desc = newSeg.tokens.get(id);
+      if (!desc) return undefined;
+      boundTokens.set(id, desc);
+    }
+
+    return {
+      text: oldSourceText,
+      hasRichTags: boundTokens.size > 0,
+      plainTextLength: newSeg.plainTextLength,
+      tokens: boundTokens,
+      preservesNewlines: newSeg.preservesNewlines,
+    };
+  }
+
+  private hasPinnedFallback(seg: PlanSegment): boolean {
+    return seg.state === 'failed' && Boolean(seg.hadPinnedTrans && seg.trans);
+  }
+
+  private isPlanSegmentCurrentlyRevealable(
+    plan: BlockPlan,
+    index: number,
+  ): boolean {
+    for (let k = 0; k < index; k++) {
+      const prev = plan.segments[k];
+      if (!prev) return false;
+      const st = prev.state;
+      if (st === 'done' || st === 'identity') continue;
+      if (st === 'pinned' && prev.holdUntilFinal) continue;
+      if (this.hasPinnedFallback(prev) && prev.holdUntilFinal) continue;
+      return false;
+    }
+    return true;
+  }
+
+  private extractPriorSnapshot(
+    block: HTMLElement,
+    activePlan: BlockPlan | undefined,
+    meta: MountedBlockMeta | undefined,
+  ): PriorBlockSnapshot | null {
+    if (activePlan) {
+      const segSnaps: PriorSegmentSnapshot[] = [];
+      for (const s of activePlan.segments) {
+        if (s.staleSettledTrans) {
+          segSnaps.push({
+            sourceText: s.text,
+            plain: s.plain,
+            translatedText: s.staleSettledTrans,
+          });
+          continue;
+        }
+        if (
+          (s.state === 'done' ||
+            s.state === 'identity' ||
+            s.state === 'pinned' ||
+            this.hasPinnedFallback(s)) &&
+          s.trans
+        ) {
+          const fromPin = s.state === 'pinned' || this.hasPinnedFallback(s);
+          segSnaps.push({
+            sourceText: fromPin ? (s.pinnedSourceText ?? s.text) : s.text,
+            plain: fromPin ? (s.pinnedSourcePlain ?? s.plain) : s.plain,
+            translatedText: s.trans,
+          });
+        } else if (s.state === 'streaming' && s.trans) {
+          segSnaps.push({
+            sourceText: s.text,
+            plain: s.plain,
+            translatedText: s.trans,
+          });
+          break;
+        } else {
+          break;
+        }
+      }
+      if (segSnaps.length > 0) {
+        return {
+          blockPlain: activePlan.blockPlain,
+          segments: segSnaps,
+        };
+      }
+    }
+
+    if (meta) {
+      if (meta.segments && meta.segments.length > 0) {
+        return {
+          blockPlain: meta.plain,
+          segments: meta.segments,
+        };
+      }
+      if (meta.translatedText) {
+        return {
+          blockPlain: meta.plain,
+          segments: [
+            {
+              sourceText: meta.sourceText,
+              plain: meta.plain,
+              translatedText: meta.translatedText,
+            },
+          ],
+        };
+      }
+    }
+
+    // Check if an initial single-block stream is currently displaying partial text on `block`
+    for (let i = 0; i < block.children.length; i++) {
+      const ch = block.children[i];
+      if (
+        ch.classList.contains('margin-trans-root') &&
+        ch.getAttribute('data-margin-streaming') === '1'
+      ) {
+        const partialTxt = ch.textContent?.trim() ?? '';
+        const tasks = this.inFlightTasksByBlock.get(block);
+        const firstTask = tasks ? Array.from(tasks)[0] : undefined;
+        if (partialTxt && firstTask) {
+          const oldPlain = normalizePlainForPrefix(
+            extractPlainFromTokenized(firstTask.tokenized),
+          );
+          return {
+            blockPlain: oldPlain,
+            segments: [
+              {
+                sourceText: firstTask.tokenized.text,
+                plain: oldPlain,
+                translatedText: partialTxt,
+              },
+            ],
+          };
+        }
+      }
+    }
+
+    return null;
+  }
+
+  private carryOverPlanDomNodes(
+    oldPlan: BlockPlan | undefined,
+    nextPlan: BlockPlan,
+    block: HTMLElement,
+  ): void {
+    if (oldPlan) {
+      for (let i = 0; i < nextPlan.segments.length; i++) {
+        const nextSeg = nextPlan.segments[i];
+        const oldSeg = oldPlan.segments[i];
+        if (!oldSeg?.domEl || !oldSeg.domEl.isConnected) {
+          break;
+        }
+        if (
+          nextSeg.state === 'done' &&
+          oldSeg.state === 'done' &&
+          oldSeg.cacheKey === nextSeg.cacheKey
+        ) {
+          nextSeg.domEl = oldSeg.domEl;
+          continue;
+        }
+        if (
+          nextSeg.state === 'pinned' &&
+          (oldSeg.state === 'done' ||
+            oldSeg.state === 'pinned' ||
+            this.hasPinnedFallback(oldSeg))
+        ) {
+          if (!oldSeg.staleSettledTrans) {
+            nextSeg.domEl = oldSeg.domEl;
+          }
+          if (nextSeg.holdUntilFinal) {
+            continue;
+          }
+          break;
+        }
+        break;
+      }
+      return;
+    }
+
+    const firstSeg = nextPlan.segments[0];
+    if (
+      !firstSeg ||
+      (firstSeg.state !== 'done' && firstSeg.state !== 'pinned')
+    ) {
+      return;
+    }
+
+    let legacyRoot: HTMLElement | null = null;
+    for (let i = 0; i < block.children.length; i++) {
+      const ch = block.children[i];
+      if (
+        ch instanceof HTMLElement &&
+        ch.classList.contains('margin-trans-root') &&
+        ch.getAttribute('data-margin-injected') === 'true' &&
+        ch.getAttribute('data-margin-segmented') !== '1'
+      ) {
+        legacyRoot = ch;
+        break;
+      }
+    }
+    if (!legacyRoot || legacyRoot.childNodes.length === 0) {
+      return;
+    }
+
+    this.runInternalDomMutation(() => {
+      const segSpan = this.doc.createElement('span');
+      segSpan.className = 'margin-trans-seg';
+      segSpan.setAttribute('data-margin-seg-index', '0');
+      while (legacyRoot!.firstChild) {
+        const node = legacyRoot!.firstChild;
+        if (
+          node instanceof Element &&
+          (node.classList.contains('margin-inline-retry') ||
+            node.classList.contains('margin-trans-tail-shimmer'))
+        ) {
+          this.ownedInjectedNodes.delete(node);
+          node.remove();
+          continue;
+        }
+        segSpan.appendChild(node);
+      }
+      legacyRoot!.removeAttribute('data-margin-streaming');
+      legacyRoot!.setAttribute('data-margin-segmented', '1');
+      legacyRoot!.appendChild(segSpan);
+      firstSeg.domEl = segSpan;
+    });
+  }
+
+  private planBlock(
+    prepared: PreparedBlockTask,
+    prior?: PriorBlockSnapshot,
+    forceBilingual = false,
+  ): BlockPlan | null {
+    const enableRichHtml = this.config.webpage.enableRichHtml;
+    const { maxCharsPerBatch } = this.resolveBatchLimits(prepared.scene);
+    const softMaxChars = 1200;
+    const hardMaxChars = Math.max(256, Math.min(maxCharsPerBatch || 4096, 2400));
+    const rawSegments = splitTokenizedIntoSegments(prepared.tokenized, {
+      softMaxChars,
+      hardMaxChars,
+    });
+    const blockPlain = normalizePlainForPrefix(
+      extractPlainFromTokenized(prepared.tokenized),
+    );
+
+    const configSig = this.computeTranslationConfigSignature(this.config);
+    const crossRouteSnap =
+      !prior && prepared.scene === 'webpage' && !forceBilingual
+        ? this.recentPrefixes.match(blockPlain, configSig)
+        : null;
+
+    if (rawSegments.length <= 1 && !prior && !crossRouteSnap) {
+      return null;
+    }
+
+    const planSegments: PlanSegment[] = [];
+    let boundaryPinned = false;
+    let canAlignWithPrior = true;
+
+    for (let i = 0; i < rawSegments.length; i++) {
+      const seg = rawSegments[i];
+      const cacheKey = this.makeCacheKey(
+        prepared.scene,
+        seg.text,
+        enableRichHtml,
+      );
+
+      if (!/\p{L}/u.test(seg.plain)) {
+        planSegments.push({
+          ...seg,
+          cacheKey,
+          state: 'identity',
+          trans: seg.text,
+          lastPaintLen: 0,
+        });
+        continue;
+      }
+
+      const cached = this.cache.get(cacheKey);
+      if (cached) {
+        const redundant = isRedundantIdenticalTranslation(seg.text, cached.trans);
+        planSegments.push({
+          ...seg,
+          cacheKey,
+          state: redundant ? 'identity' : 'done',
+          trans: cached.trans,
+          fallbackPlain: cached.fallbackPlain,
+          lastPaintLen: stripResidualMarkers(cached.trans).length,
+        });
+        continue;
+      }
+
+      if (canAlignWithPrior && !boundaryPinned) {
+        if (prior && i < prior.segments.length) {
+          const priorSeg = prior.segments[i];
+          const prevSegNorm = normalizePlainForPrefix(priorSeg.plain);
+          const nextSegNorm = normalizePlainForPrefix(seg.plain);
+
+          if (prevSegNorm && prevSegNorm === nextSegNorm) {
+            const cleanPin = stripResidualMarkers(priorSeg.translatedText);
+            planSegments.push({
+              ...seg,
+              cacheKey,
+              state: 'pinned',
+              trans: priorSeg.translatedText,
+              hadPinnedTrans: true,
+              pinnedPlainLen: cleanPin.length,
+              pinnedRichTokenized: this.tryBindPriorRichTokens(
+                priorSeg.sourceText,
+                priorSeg.translatedText,
+                seg,
+              ),
+              pinnedSourceText: priorSeg.sourceText,
+              pinnedSourcePlain: priorSeg.plain,
+              holdUntilFinal: true,
+              lastPaintLen: cleanPin.length,
+            });
+            continue;
+          }
+
+          if (isBoundarySegmentExpansion(priorSeg.plain, seg.plain)) {
+            const cleanPin = stripResidualMarkers(priorSeg.translatedText);
+            planSegments.push({
+              ...seg,
+              cacheKey,
+              state: 'pinned',
+              trans: priorSeg.translatedText,
+              hadPinnedTrans: true,
+              pinnedPlainLen: cleanPin.length,
+              pinnedRichTokenized: this.tryBindPriorRichTokens(
+                priorSeg.sourceText,
+                priorSeg.translatedText,
+                seg,
+              ),
+              pinnedSourceText: priorSeg.sourceText,
+              pinnedSourcePlain: priorSeg.plain,
+              holdUntilFinal: seg.plainTextLength <= 480,
+              lastPaintLen: cleanPin.length,
+            });
+            boundaryPinned = true;
+            canAlignWithPrior = false;
+            continue;
+          }
+        } else if (crossRouteSnap) {
+          const prevSegNorm = normalizePlainForPrefix(
+            crossRouteSnap.lastSegPlain,
+          );
+          const nextSegNorm = normalizePlainForPrefix(seg.plain);
+          if (
+            (prevSegNorm && prevSegNorm === nextSegNorm) ||
+            isBoundarySegmentExpansion(crossRouteSnap.lastSegPlain, seg.plain)
+          ) {
+            const samePlain = prevSegNorm === nextSegNorm;
+            const cleanPin = stripResidualMarkers(
+              crossRouteSnap.lastSegTranslated,
+            );
+            planSegments.push({
+              ...seg,
+              cacheKey,
+              state: 'pinned',
+              trans: crossRouteSnap.lastSegTranslated,
+              hadPinnedTrans: true,
+              pinnedPlainLen: cleanPin.length,
+              pinnedRichTokenized: this.tryBindPriorRichTokens(
+                crossRouteSnap.lastSegSourceText,
+                crossRouteSnap.lastSegTranslated,
+                seg,
+              ),
+              pinnedSourceText: crossRouteSnap.lastSegSourceText,
+              pinnedSourcePlain: crossRouteSnap.lastSegPlain,
+              holdUntilFinal: samePlain || seg.plainTextLength <= 480,
+              lastPaintLen: cleanPin.length,
+            });
+            boundaryPinned = true;
+            canAlignWithPrior = false;
+            continue;
+          }
+        }
+      }
+
+      canAlignWithPrior = false;
+      planSegments.push({
+        ...seg,
+        cacheKey,
+        state: 'pending',
+        lastPaintLen: 0,
+      });
+    }
+
+    return {
+      block: prepared.block,
+      scene: prepared.scene,
+      blockSourceText: prepared.tokenized.text,
+      blockPlain,
+      segments: planSegments,
+      controllers: new Set(),
+      batchPromises: new Set(),
+      inFlightBatches: 0,
+      superseded: false,
+      forceBilingual,
+      isExpansionFromPrior: Boolean(prior || crossRouteSnap),
+    };
+  }
+
+  private renderPlan(plan: BlockPlan): void {
+    if (plan.superseded || !plan.block.isConnected) return;
+
+    this.ensureStylesInjected();
+    this.ensureThemeObserver();
+
+    const displayMode: DisplayMode = plan.forceBilingual
+      ? 'bilingual'
+      : this.config.webpage.displayMode;
+    const allSettled = plan.segments.every(
+      (s) => s.state === 'done' || s.state === 'identity',
+    );
+    const allRedundant =
+      allSettled &&
+      plan.segments.every(
+        (s) =>
+          s.state === 'identity' ||
+          isRedundantIdenticalTranslation(s.text, s.trans ?? ''),
+      );
+
+    if (displayMode === 'bilingual' && allRedundant) {
+      this.runInternalDomMutation(() => {
+        this.clearBlockInjectedElements(plan.block);
+        this.setSourceHidden(plan.block, false);
+        this.restoreUnclampedForBlock(plan.block);
+        plan.block.removeAttribute('data-margin-translated');
+        this.mountedMeta.delete(plan.block);
+        this.translatedBlockSet.delete(plan.block);
+        this.failedBlockTasks.delete(plan.block);
+        this.blockPlans.delete(plan.block);
+      });
+      return;
+    }
+
+    // Determine ordered reveal prefix
+    const revealedIndices: number[] = [];
+    for (let i = 0; i < plan.segments.length; i++) {
+      const seg = plan.segments[i];
+      const st = seg.state;
+      if (st === 'done' || st === 'identity') {
+        revealedIndices.push(i);
+        continue;
+      }
+      if (st === 'pinned' && seg.holdUntilFinal) {
+        revealedIndices.push(i);
+        continue;
+      }
+      if (st === 'pinned' || st === 'streaming') {
+        revealedIndices.push(i);
+        break;
+      }
+      if (this.hasPinnedFallback(seg)) {
+        revealedIndices.push(i);
+        if (seg.holdUntilFinal) {
+          continue;
+        }
+        break;
+      }
+      break;
+    }
+
+    const visibleIndices = revealedIndices.filter((idx) => {
+      const s = plan.segments[idx];
+      if (displayMode === 'bilingual') {
+        if (
+          s.state === 'identity' ||
+          (s.state === 'done' &&
+            isRedundantIdenticalTranslation(s.text, s.trans ?? ''))
+        ) {
+          return false;
+        }
+      }
+      return true;
+    });
+
+    const hasAnyFailed = plan.segments.some((s) => s.state === 'failed');
+    const hasUnsettled = plan.segments.some(
+      (s) =>
+        s.state === 'pending' || s.state === 'pinned' || s.state === 'streaming',
+    );
+
+    // If nothing can be displayed yet and no failure has happened yet, reconcile stale root & keep/mount loading shimmer
+    if (visibleIndices.length === 0 && !hasAnyFailed) {
+      this.runInternalDomMutation(() => {
+        for (const s of plan.segments) {
+          s.domEl = undefined;
+          s.streamTextNode = undefined;
+        }
+        const toRemove: Element[] = [];
+        for (let i = 0; i < plan.block.children.length; i++) {
+          const ch = plan.block.children[i];
+          if (ch.getAttribute('data-margin-injected') !== 'true') continue;
+          if (hasUnsettled && ch.getAttribute('data-margin-loading') === '1') {
+            continue;
+          }
+          toRemove.push(ch);
+        }
+        for (const el of toRemove) {
+          this.ownedInjectedNodes.delete(el);
+          el.remove();
+        }
+        this.setSourceHidden(plan.block, false);
+        if (!hasUnsettled) {
+          this.restoreUnclampedForBlock(plan.block);
+        }
+        plan.block.removeAttribute('data-margin-translated');
+        this.translatedBlockSet.delete(plan.block);
+        this.mountedMeta.delete(plan.block);
+      });
+      if (hasUnsettled) {
+        this.mountBlockLoadingIndicator(plan.block, plan.blockPlain.length);
+      }
+      return;
+    }
+
+    const effectiveStyle = resolveEffectiveHostTextStyle(plan.block);
+    const theme = this.resolveEffectiveTheme();
+    const layout = this.computeLayoutMode(
+      plan.block,
+      plan.blockPlain.length,
+      displayMode,
+    );
+
+    this.runInternalDomMutation(() => {
+      const shouldHideSource =
+        displayMode === 'target-only' &&
+        !hasAnyFailed &&
+        visibleIndices.length > 0;
+      this.setSourceHidden(plan.block, shouldHideSource);
+
+      // Reuse existing `.margin-trans-root` or convert `.margin-trans-loading`
+      let root: HTMLSpanElement | null = null;
+      const strayInjected: Element[] = [];
+      for (let i = 0; i < plan.block.children.length; i++) {
+        const ch = plan.block.children[i];
+        if (ch.getAttribute('data-margin-injected') !== 'true') continue;
+        if (!root && ch instanceof HTMLSpanElement && ch.classList.contains('margin-trans-block')) {
+          root = ch;
+        } else {
+          strayInjected.push(ch);
+        }
+      }
+      for (const stray of strayInjected) {
+        this.ownedInjectedNodes.delete(stray);
+        stray.remove();
+      }
+
+      const isNewRoot = root === null;
+      if (!root) {
+        root = this.doc.createElement('span');
+      }
+
+      const hasDoneOrPinned = visibleIndices.some((idx) => {
+        const seg = plan.segments[idx];
+        return (
+          seg.state === 'done' ||
+          seg.state === 'pinned' ||
+          seg.state === 'identity' ||
+          this.hasPinnedFallback(seg)
+        );
+      });
+
+      root.className = 'margin-trans-root margin-trans-block';
+      root.removeAttribute('data-margin-loading');
+      root.removeAttribute('role');
+      root.removeAttribute('aria-label');
+      root.setAttribute('data-margin-injected', 'true');
+      root.setAttribute('data-margin-segmented', '1');
+      root.setAttribute('data-margin-theme', theme);
+      root.setAttribute('data-margin-layout', layout);
+      if (hasUnsettled) {
+        root.setAttribute('aria-busy', 'true');
+      } else {
+        root.removeAttribute('aria-busy');
+      }
+      if (!hasDoneOrPinned && visibleIndices.length > 0) {
+        root.setAttribute('data-margin-streaming', '1');
+      } else {
+        root.removeAttribute('data-margin-streaming');
+      }
+      this.applyTargetLocaleTypography(root, plan.block);
+      applyEffectiveHostTextStyle(root, effectiveStyle);
+      this.bindMaskClickToggle(root);
+
+      const desiredNodes: Node[] = [];
+      for (let pos = 0; pos < visibleIndices.length; pos++) {
+        const idx = visibleIndices[pos];
+        const seg = plan.segments[idx];
+
+        let segEl = seg.domEl;
+        if (!segEl) {
+          segEl = this.doc.createElement('span');
+          segEl.className = 'margin-trans-seg';
+          segEl.setAttribute('data-margin-seg-index', String(idx));
+
+          if (seg.state === 'done') {
+            const rec = reconstructRichDom(seg.trans ?? '', seg, this.doc, {
+              stripSourceLocaleAttrs: true,
+              preserveLinkAppearance: true,
+            });
+            seg.fallbackPlain = rec.fallbackPlain;
+            segEl.appendChild(rec.fragment);
+          } else if (seg.state === 'identity') {
+            const rec = reconstructRichDom(seg.text, seg, this.doc, {
+              stripSourceLocaleAttrs: true,
+              preserveLinkAppearance: true,
+            });
+            segEl.appendChild(rec.fragment);
+          } else if (seg.state === 'pinned' || this.hasPinnedFallback(seg)) {
+            if (seg.pinnedRichTokenized) {
+              const rec = reconstructRichDom(
+                seg.trans ?? '',
+                seg.pinnedRichTokenized,
+                this.doc,
+                { stripSourceLocaleAttrs: true, preserveLinkAppearance: true },
+              );
+              segEl.appendChild(rec.fragment);
+            } else {
+              segEl.textContent = stripResidualMarkers(seg.trans ?? '');
+            }
+          } else if (seg.state === 'streaming') {
+            const tn = this.doc.createTextNode(seg.trans ?? '');
+            seg.streamTextNode = tn;
+            segEl.appendChild(tn);
+          }
+          seg.domEl = segEl;
+        } else {
+          segEl.setAttribute('data-margin-seg-index', String(idx));
+          // If transitioning displayMode or refreshing an identity segment with empty domEl
+          if (seg.state === 'identity' && segEl.childNodes.length === 0) {
+            const rec = reconstructRichDom(seg.text, seg, this.doc, {
+              stripSourceLocaleAttrs: true,
+              preserveLinkAppearance: true,
+            });
+            segEl.appendChild(rec.fragment);
+          }
+        }
+
+        if (pos > 0) {
+          const prevIdx = visibleIndices[pos - 1];
+          let sepText = seg.sepBefore;
+          if (prevIdx + 1 < idx) {
+            const rank = (sep: string): number =>
+              sep === '\n\n' ? 3 : sep === '\n' ? 2 : sep === ' ' ? 1 : 0;
+            for (let k = prevIdx + 1; k <= idx; k++) {
+              const cand = plan.segments[k]?.sepBefore ?? '';
+              if (rank(cand) > rank(sepText)) {
+                sepText = cand;
+              }
+            }
+          }
+          if (sepText.length > 0) {
+            const prevSib = segEl.previousSibling;
+            if (
+              prevSib &&
+              prevSib.parentNode === root &&
+              prevSib.nodeType === Node.TEXT_NODE &&
+              prevSib.nodeValue === sepText
+            ) {
+              desiredNodes.push(prevSib);
+            } else {
+              desiredNodes.push(this.doc.createTextNode(sepText));
+            }
+          }
+        }
+        desiredNodes.push(segEl);
+      }
+
+      if (hasUnsettled) {
+        let tailShimmer: HTMLSpanElement | null = null;
+        for (let i = 0; i < root.children.length; i++) {
+          const ch = root.children[i];
+          if (
+            ch instanceof HTMLSpanElement &&
+            ch.classList.contains('margin-trans-tail-shimmer')
+          ) {
+            tailShimmer = ch;
+            break;
+          }
+        }
+        if (!tailShimmer) {
+          tailShimmer = this.doc.createElement('span');
+          tailShimmer.className = 'margin-trans-tail-shimmer';
+          tailShimmer.setAttribute('data-margin-injected', 'true');
+          tailShimmer.setAttribute('aria-hidden', 'true');
+          this.ownedInjectedNodes.add(tailShimmer);
+        }
+        desiredNodes.push(tailShimmer);
+      }
+
+      if (hasAnyFailed) {
+        let retryBtn: HTMLButtonElement | null = null;
+        for (let i = 0; i < root.children.length; i++) {
+          const ch = root.children[i];
+          if (
+            ch instanceof HTMLButtonElement &&
+            ch.classList.contains('margin-inline-retry')
+          ) {
+            retryBtn = ch;
+            break;
+          }
+        }
+        if (!retryBtn) {
+          retryBtn = this.doc.createElement('button');
+          retryBtn.type = 'button';
+          retryBtn.className = 'margin-inline-retry';
+          retryBtn.setAttribute('data-margin-injected', 'true');
+          retryBtn.setAttribute('aria-label', 'Retry translation');
+          retryBtn.title = this.lastError
+            ? `Translation failed (${this.lastError}) — click to retry`
+            : 'Retry failed paragraphs';
+          retryBtn.textContent = '↻';
+          retryBtn.addEventListener('click', (ev) => {
+            ev.preventDefault();
+            ev.stopPropagation();
+            this.retryFailedPlan(plan);
+          });
+          this.ownedInjectedNodes.add(retryBtn);
+        }
+        applyEffectiveHostTextStyle(retryBtn, effectiveStyle);
+        desiredNodes.push(retryBtn);
+      }
+
+      const desiredSet = new Set<Node>(desiredNodes);
+      let cursor: ChildNode | null = root.firstChild;
+      for (const desired of desiredNodes) {
+        if (cursor === desired) {
+          cursor = cursor.nextSibling;
+          continue;
+        }
+        while (cursor && !desiredSet.has(cursor)) {
+          const obsolete = cursor;
+          cursor = cursor.nextSibling;
+          if (obsolete instanceof Element) {
+            this.ownedInjectedNodes.delete(obsolete);
+          }
+          obsolete.remove();
+        }
+        if (cursor === desired) {
+          cursor = cursor.nextSibling;
+        } else {
+          root.insertBefore(desired, cursor);
+        }
+      }
+      while (cursor) {
+        const obsolete = cursor;
+        cursor = cursor.nextSibling;
+        if (obsolete instanceof Element) {
+          this.ownedInjectedNodes.delete(obsolete);
+        }
+        obsolete.remove();
+      }
+
+      const anyFallbackPlain = plan.segments.some((s) => Boolean(s.fallbackPlain));
+      if (anyFallbackPlain) {
+        root.setAttribute('data-margin-fallback-plain', 'true');
+      } else {
+        root.removeAttribute('data-margin-fallback-plain');
+      }
+
+      this.ownedInjectedNodes.add(root);
+      if (isNewRoot) {
+        this.insertInjectedIntoBlock(plan.block, root);
+      }
+      this.ensureInjectedRootAtEnd(plan.block, root);
+      this.unclampForInjectedNode(plan.block, root);
+      refreshClonedLinksAppearance(root);
+
+      if (hasDoneOrPinned) {
+        plan.block.setAttribute('data-margin-translated', 'true');
+        this.translatedBlockSet.add(plan.block);
+
+        const settledSnapshots: PriorSegmentSnapshot[] = [];
+        for (const s of plan.segments) {
+          if (
+            (s.state === 'done' ||
+              s.state === 'identity' ||
+              s.state === 'pinned' ||
+              this.hasPinnedFallback(s)) &&
+            s.trans
+          ) {
+            const fromPin = s.state === 'pinned' || this.hasPinnedFallback(s);
+            settledSnapshots.push({
+              sourceText: fromPin ? (s.pinnedSourceText ?? s.text) : s.text,
+              plain: fromPin ? (s.pinnedSourcePlain ?? s.plain) : s.plain,
+              translatedText: s.trans,
+            });
+          } else {
+            break;
+          }
+        }
+
+        const joinedTranslated = settledSnapshots
+          .map((s, idx) =>
+            idx === 0
+              ? s.translatedText
+              : `${plan.segments[idx]?.sepBefore ?? ''}${s.translatedText}`,
+          )
+          .join('');
+
+        this.mountedMeta.set(plan.block, {
+          plainTextLength: plan.blockPlain.length,
+          plain: plan.blockPlain,
+          fallbackPlain: anyFallbackPlain,
+          sourceText: plan.blockSourceText,
+          translatedText: joinedTranslated,
+          segments: settledSnapshots,
+        });
+      }
+
+      if (!hasAnyFailed) {
+        this.failedBlockTasks.delete(plan.block);
+      }
+    });
+
+    if (allSettled && plan.segments.length > 0) {
+      const lastSeg = plan.segments[plan.segments.length - 1];
+      this.recordRecentPrefixIfEligible(
+        plan.blockPlain,
+        lastSeg.plain,
+        lastSeg.text,
+        lastSeg.trans ?? lastSeg.text,
+        Boolean(lastSeg.preservesNewlines),
+        plan.forceBilingual,
+      );
+    }
+  }
+
+  private dispatchPlan(
+    plan: BlockPlan,
+    basePriority: RequestPriority,
+  ): Promise<void> {
+    if (plan.superseded || !plan.block.isConnected) {
+      return Promise.resolve();
+    }
+
+    const liveSegIndices = new Set<number>();
+    const activeBlockTasks = this.inFlightTasksByBlock.get(plan.block);
+    if (activeBlockTasks) {
+      for (const activeTask of activeBlockTasks) {
+        if (
+          activeTask.seg?.plan === plan &&
+          !activeTask.superseded &&
+          !activeTask.settled &&
+          !activeTask.controller?.signal.aborted
+        ) {
+          liveSegIndices.add(activeTask.seg.index);
+        }
+      }
+    }
+
+    const tasks: PreparedBlockTask[] = [];
+    for (let idx = 0; idx < plan.segments.length; idx++) {
+      if (liveSegIndices.has(idx)) {
+        continue;
+      }
+      const seg = plan.segments[idx];
+      if (seg.state === 'pending' || seg.state === 'pinned') {
+        tasks.push({
+          block: plan.block,
+          tokenized: seg,
+          cacheKey: seg.cacheKey,
+          charCount: seg.text.length,
+          scene: plan.scene,
+          seg: { plan, index: idx },
+        });
+      }
+    }
+
+    if (tasks.length === 0) {
+      if (plan.inFlightBatches === 0) {
+        this.inFlightBlocks.delete(plan.block);
+        this.inFlightBlockSet.delete(plan.block);
+        this.inFlightBlockPromises.delete(plan.block);
+      }
+      if (plan.scene === 'webpage') {
+        this.refreshStatusPill();
+      }
+      return plan.batchPromises.size > 0
+        ? Promise.all(Array.from(plan.batchPromises)).then(() => {})
+        : Promise.resolve();
+    }
+
+    const { maxBatchCount, maxCharsPerBatch } = this.resolveBatchLimits(
+      plan.scene,
+    );
+    const batches = packIntoProgressiveBatches(
+      tasks,
+      maxBatchCount,
+      maxCharsPerBatch,
+      true,
+    );
+
+    const wave0Vip =
+      plan.scene === 'webpage' &&
+      plan.isExpansionFromPrior &&
+      this.classifyBlockViewportState(plan.block).isStrictlyVisible &&
+      this.isUserInitiatedNow();
+
+    this.observedBlocks.add(plan.block);
+    this.inFlightBlocks.add(plan.block);
+    this.inFlightBlockSet.add(plan.block);
+    if (plan.scene === 'webpage') {
+      this.sessionTotalBlocks += tasks.length;
+    }
+
+    const promises = batches.map((batch, batchIdx) => {
+      const prio: RequestPriority =
+        plan.scene === 'hover'
+          ? -1
+          : batchIdx === 0 && wave0Vip
+            ? -1
+            : wave0Vip
+              ? 0
+              : basePriority;
+      const p = this.executeBatch(batch, {
+        forceBilingual: plan.forceBilingual,
+        priority: prio,
+      });
+      plan.batchPromises.add(p);
+      void p.finally(() => {
+        plan.batchPromises.delete(p);
+      });
+      return p;
+    });
+
+    const combined = Promise.all(Array.from(plan.batchPromises)).then(() => {});
+    this.inFlightBlockPromises.set(plan.block, combined);
+    if (plan.scene === 'webpage') {
+      this.refreshStatusPill();
+    }
+    return combined;
+  }
+
+  private supersedeBlockInFlight(block: HTMLElement): void {
+    const activeTasks = this.inFlightTasksByBlock.get(block);
+    if (!activeTasks || activeTasks.size === 0) {
+      this.inFlightBlocks.delete(block);
+      this.inFlightBlockSet.delete(block);
+      this.inFlightBlockPromises.delete(block);
+      return;
+    }
+
+    let unsettledWebpageCount = 0;
+    const touchedControllers = new Set<AbortController>();
+    for (const task of activeTasks) {
+      if (!task.superseded && !task.settled && task.scene === 'webpage') {
+        unsettledWebpageCount += 1;
+      }
+      task.superseded = true;
+      if (task.controller) {
+        touchedControllers.add(task.controller);
+      }
+    }
+
+    if (unsettledWebpageCount > 0) {
+      this.sessionTotalBlocks = Math.max(
+        this.sessionDoneBlocks,
+        this.sessionTotalBlocks - unsettledWebpageCount,
+      );
+    }
+
+    this.inFlightBlocks.delete(block);
+    this.inFlightBlockSet.delete(block);
+    this.inFlightBlockPromises.delete(block);
+
+    for (const ctrl of touchedControllers) {
+      const ctrlTasks = this.batchTasksByController.get(ctrl);
+      if (
+        ctrlTasks &&
+        ctrlTasks.length > 0 &&
+        ctrlTasks.every((t) => Boolean(t.superseded || t.seg?.plan.superseded))
+      ) {
+        ctrl.abort();
+      }
+    }
+  }
+
+  private supersedePlan(plan: BlockPlan): void {
+    if (plan.superseded) return;
+    plan.superseded = true;
+    if (this.blockPlans.get(plan.block) === plan) {
+      this.blockPlans.delete(plan.block);
+    }
+
+    const activeTasks = this.inFlightTasksByBlock.get(plan.block);
+    let unsettledCount = 0;
+    const touchedControllers = new Set<AbortController>(plan.controllers);
+
+    if (activeTasks) {
+      for (const task of activeTasks) {
+        if (task.seg?.plan === plan) {
+          if (!task.superseded && !task.settled && task.scene === 'webpage') {
+            unsettledCount += 1;
+          }
+          task.superseded = true;
+          if (task.controller) {
+            touchedControllers.add(task.controller);
+          }
+        }
+      }
+    }
+
+    if (plan.scene === 'webpage' && unsettledCount > 0) {
+      this.sessionTotalBlocks = Math.max(
+        this.sessionDoneBlocks,
+        this.sessionTotalBlocks - unsettledCount,
+      );
+    }
+
+    this.inFlightBlocks.delete(plan.block);
+    this.inFlightBlockSet.delete(plan.block);
+    this.inFlightBlockPromises.delete(plan.block);
+
+    for (const ctrl of touchedControllers) {
+      const ctrlTasks = this.batchTasksByController.get(ctrl);
+      if (
+        ctrlTasks &&
+        ctrlTasks.length > 0 &&
+        ctrlTasks.every((t) => Boolean(t.superseded || t.seg?.plan.superseded))
+      ) {
+        ctrl.abort();
+      }
+    }
+  }
+
+  private retryFailedPlan(plan: BlockPlan): void {
+    if (plan.superseded || !plan.block.isConnected) return;
+    let resetCount = 0;
+    for (const seg of plan.segments) {
+      if (seg.state === 'failed') {
+        if (seg.hadPinnedTrans && seg.trans) {
+          seg.state = 'pinned';
+          seg.streamTextNode = undefined;
+          seg.lastPaintLen =
+            seg.pinnedPlainLen ?? stripResidualMarkers(seg.trans).length;
+        } else {
+          seg.state = 'pending';
+          seg.domEl = undefined;
+          seg.streamTextNode = undefined;
+          seg.lastPaintLen = 0;
+        }
+        resetCount += 1;
+      }
+    }
+    this.failedBlockTasks.delete(plan.block);
+    this.lastError = undefined;
+    if (resetCount === 0) {
+      this.refreshStatusPill();
+      return;
+    }
+    if (plan.scene === 'webpage') {
+      this.sessionTotalBlocks = Math.max(
+        this.sessionDoneBlocks,
+        this.sessionTotalBlocks - resetCount,
+      );
+    }
+    this.renderPlan(plan);
+    void this.dispatchPlan(plan, 0);
   }
 
   private mountBatchRetryButtons(
@@ -2103,31 +3543,79 @@ export class WebpageRenderer {
       this.lastError = errorMessage;
     }
 
+    const segTasks: PreparedBlockTask[] = [];
+    const legacyTasks: PreparedBlockTask[] = [];
+    for (const task of batchTasks) {
+      if (task.superseded || task.seg?.plan.superseded) {
+        continue;
+      }
+      if (task.seg) {
+        segTasks.push(task);
+      } else {
+        legacyTasks.push(task);
+      }
+    }
+
+    if (segTasks.length > 0) {
+      const affectedPlans = new Map<BlockPlan, PreparedBlockTask>();
+      for (const task of segTasks) {
+        const { plan, index } = task.seg!;
+        if (
+          plan.superseded ||
+          this.blockPlans.get(plan.block) !== plan ||
+          !plan.block.isConnected
+        ) {
+          continue;
+        }
+        const seg = plan.segments[index];
+        if (seg && seg.state !== 'done' && seg.state !== 'identity') {
+          seg.state = 'failed';
+          seg.streamTextNode = undefined;
+          if (!seg.hadPinnedTrans) {
+            seg.domEl = undefined;
+          }
+        }
+        if (!affectedPlans.has(plan)) {
+          affectedPlans.set(plan, task);
+        }
+      }
+
+      for (const [plan, repTask] of affectedPlans.entries()) {
+        this.observedBlocks.delete(plan.block);
+        this.failedBlockTasks.set(plan.block, repTask);
+        this.renderPlan(plan);
+      }
+    }
+
+    if (legacyTasks.length === 0) {
+      return;
+    }
+
     this.runInternalDomMutation(() => {
       const retryBatch = () => {
         this.runInternalDomMutation(() => {
-          for (const t of batchTasks) {
+          for (const t of legacyTasks) {
             this.failedBlockTasks.delete(t.block);
             this.clearBlockInjectedElements(t.block);
-            this.unwrapOriginalContent(t.block);
+            this.setSourceHidden(t.block, false);
             this.mountBlockLoadingIndicator(
               t.block,
               t.tokenized.plainTextLength,
             );
           }
         });
-        this.sessionTotalBlocks += batchTasks.length;
+        this.sessionTotalBlocks += legacyTasks.length;
         this.refreshStatusPill();
-        void this.executeBatch(batchTasks, { ...options, priority: 0 });
+        void this.executeBatch(legacyTasks, { ...options, priority: 0 });
       };
 
-      for (const task of batchTasks) {
+      for (const task of legacyTasks) {
         this.observedBlocks.delete(task.block);
         if (!task.block.isConnected || this.hasMountedTranslation(task.block)) {
           continue;
         }
         this.clearBlockInjectedElements(task.block);
-        this.unwrapOriginalContent(task.block);
+        this.setSourceHidden(task.block, false);
         const effectiveStyle = resolveEffectiveHostTextStyle(task.block);
         this.failedBlockTasks.set(task.block, task);
 
@@ -2210,6 +3698,7 @@ export class WebpageRenderer {
     const { preferStream, providerId } = this.resolveBatchLimits(scene);
     const abortController = new AbortController();
     this.activeControllers.add(abortController);
+    this.batchTasksByController.set(abortController, batchTasks);
 
     let p1Tracker: InFlightP1BatchTracker | null = null;
     if (scene === 'webpage' && resolvedPriority === 1) {
@@ -2222,13 +3711,38 @@ export class WebpageRenderer {
       this.inFlightP1Batches.add(p1Tracker);
     }
 
+    const batchPlans = new Set<BlockPlan>();
     for (const task of batchTasks) {
+      task.controller = abortController;
+      let blockTaskSet = this.inFlightTasksByBlock.get(task.block);
+      if (!blockTaskSet) {
+        blockTaskSet = new Set();
+        this.inFlightTasksByBlock.set(task.block, blockTaskSet);
+      }
+      blockTaskSet.add(task);
+
       this.inFlightBlocks.add(task.block);
       this.inFlightBlockSet.add(task.block);
-      this.mountBlockLoadingIndicator(
-        task.block,
-        task.tokenized.plainTextLength,
-      );
+
+      if (task.seg) {
+        batchPlans.add(task.seg.plan);
+        task.seg.plan.controllers.add(abortController);
+        const hasRootAlready = Boolean(this.findDirectInjectedRoot(task.block));
+        if (!hasRootAlready) {
+          this.mountBlockLoadingIndicator(
+            task.block,
+            task.tokenized.plainTextLength,
+          );
+        }
+      } else {
+        this.mountBlockLoadingIndicator(
+          task.block,
+          task.tokenized.plainTextLength,
+        );
+      }
+    }
+    for (const p of batchPlans) {
+      p.inFlightBatches += 1;
     }
     if (scene === 'webpage') {
       this.refreshStatusPill();
@@ -2237,7 +3751,6 @@ export class WebpageRenderer {
     const slotMap = new Map<number, PreparedBlockTask>();
     const renderedTransBySlot = new Map<number, string>();
     const slotStreams = new Map<number, SlotStreamState>();
-    const maskBoundContainers = new WeakSet<Element>();
 
     const cancelPendingSlotRafs = () => {
       for (const st of slotStreams.values()) {
@@ -2311,13 +3824,79 @@ export class WebpageRenderer {
       task: PreparedBlockTask,
       slotState: SlotStreamState,
       previewText: string,
-    ): void => {
+    ): boolean => {
       if (
         abortController.signal.aborted ||
         renderedTransBySlot.has(slotId) ||
+        task.superseded ||
         !task.block.isConnected
       ) {
-        return;
+        return false;
+      }
+
+      if (task.seg) {
+        const { plan, index } = task.seg;
+        if (plan.superseded || this.blockPlans.get(plan.block) !== plan) {
+          return false;
+        }
+        const seg = plan.segments[index];
+        if (!seg || seg.state === 'done' || seg.state === 'identity') {
+          return false;
+        }
+
+        if (seg.state === 'pinned') {
+          if (seg.holdUntilFinal || seg.plainTextLength <= 480) {
+            return false;
+          }
+          const minOvertakeLen = (seg.pinnedPlainLen ?? 0) + 6;
+          if (previewText.length < minOvertakeLen) {
+            return false;
+          }
+          seg.state = 'streaming';
+          seg.hadPinnedTrans = false;
+          seg.pinnedRichTokenized = undefined;
+          seg.trans = previewText;
+          seg.lastPaintLen = previewText.length;
+          if (seg.domEl && seg.domEl.isConnected) {
+            this.runInternalDomMutation(() => {
+              const tn = this.doc.createTextNode(previewText);
+              seg.domEl!.replaceChildren(tn);
+              seg.streamTextNode = tn;
+            });
+          } else if (this.isPlanSegmentCurrentlyRevealable(plan, index)) {
+            this.renderPlan(plan);
+          }
+          return true;
+        }
+
+        if (seg.state === 'pending') {
+          seg.state = 'streaming';
+          seg.trans = previewText;
+          seg.lastPaintLen = previewText.length;
+          if (this.isPlanSegmentCurrentlyRevealable(plan, index)) {
+            this.renderPlan(plan);
+          }
+          return true;
+        }
+
+        if (seg.state === 'streaming') {
+          if (previewText.length < seg.lastPaintLen) {
+            return false;
+          }
+          seg.trans = previewText;
+          seg.lastPaintLen = previewText.length;
+          if (seg.streamTextNode && seg.domEl?.isConnected) {
+            if (seg.streamTextNode.nodeValue !== previewText) {
+              this.runInternalDomMutation(() => {
+                seg.streamTextNode!.textContent = previewText;
+              });
+            }
+          } else if (this.isPlanSegmentCurrentlyRevealable(plan, index)) {
+            this.renderPlan(plan);
+          }
+          return true;
+        }
+        return false;
       }
 
       if (
@@ -2330,7 +3909,7 @@ export class WebpageRenderer {
             slotState.streamTextNode!.textContent = previewText;
           });
         }
-        return;
+        return true;
       }
 
       this.ensureStylesInjected();
@@ -2347,11 +3926,7 @@ export class WebpageRenderer {
       );
 
       this.runInternalDomMutation(() => {
-        if (displayMode === 'target-only') {
-          this.wrapOriginalContentForTargetOnly(task.block);
-        } else {
-          this.unwrapOriginalContent(task.block);
-        }
+        this.setSourceHidden(task.block, displayMode === 'target-only');
 
         let container: HTMLSpanElement | null = null;
         for (let i = 0; i < task.block.children.length; i++) {
@@ -2386,31 +3961,18 @@ export class WebpageRenderer {
 
         const textNode = this.doc.createTextNode(previewText);
         container.replaceChildren(textNode);
-
-        if (!maskBoundContainers.has(container)) {
-          maskBoundContainers.add(container);
-          container.addEventListener('click', (ev) => {
-            if (container!.getAttribute('data-margin-theme') !== 'mask') return;
-            const target = ev.target as Element | null;
-            if (target?.closest?.('a')) return;
-            const currentlyUnmasked =
-              container!.getAttribute('data-margin-item-unmasked') === 'true';
-            if (currentlyUnmasked) {
-              container!.removeAttribute('data-margin-item-unmasked');
-            } else {
-              container!.setAttribute('data-margin-item-unmasked', 'true');
-            }
-          });
-        }
+        this.bindMaskClickToggle(container);
 
         this.ownedInjectedNodes.add(container);
         if (isNewContainer) {
           this.insertInjectedIntoBlock(task.block, container);
         }
+        this.ensureInjectedRootAtEnd(task.block, container);
         this.unclampForInjectedNode(task.block, container);
         slotState.streamContainer = container;
         slotState.streamTextNode = textNode;
       });
+      return true;
     };
 
     const handlePartialOutputItem = (item: BatchItemOutput): void => {
@@ -2443,8 +4005,9 @@ export class WebpageRenderer {
         slotState.cancelScheduled?.();
         slotState.cancelScheduled = null;
         slotState.pendingPartialText = null;
-        paintPartialSlot(item.id, task, slotState, previewText);
-        slotState.lastPaintAt = now;
+        if (paintPartialSlot(item.id, task, slotState, previewText)) {
+          slotState.lastPaintAt = now;
+        }
         return;
       }
 
@@ -2460,8 +4023,9 @@ export class WebpageRenderer {
             !abortController.signal.aborted &&
             !renderedTransBySlot.has(item.id)
           ) {
-            paintPartialSlot(item.id, task, slotState, latest);
-            slotState.lastPaintAt = nowFrameMs();
+            if (paintPartialSlot(item.id, task, slotState, latest)) {
+              slotState.lastPaintAt = nowFrameMs();
+            }
           }
         });
       }
@@ -2498,8 +4062,112 @@ export class WebpageRenderer {
 
       const isFirstRenderForSlot = prevTrans === undefined;
       renderedTransBySlot.set(item.id, item.trans);
+      if (isFirstRenderForSlot) {
+        task.settled = true;
+      }
       if (!transportSettled) {
         provisionalStreamedSlots.add(item.id);
+      }
+
+      if (task.superseded || task.seg?.plan.superseded) {
+        this.cache.set(task.cacheKey, {
+          trans: item.trans,
+          fallbackPlain: Boolean(item.fallbackPlain),
+        });
+        return;
+      }
+
+      if (task.seg) {
+        const { plan, index } = task.seg;
+        const seg = plan.segments[index];
+        if (
+          !seg ||
+          !plan.block.isConnected ||
+          this.blockPlans.get(plan.block) !== plan
+        ) {
+          this.cache.set(task.cacheKey, {
+            trans: item.trans,
+            fallbackPlain: Boolean(item.fallbackPlain),
+          });
+          if (isFirstRenderForSlot && scene === 'webpage' && !plan.block.isConnected) {
+            this.sessionDoneBlocks += 1;
+            this.inFlightBlockSet.delete(plan.block);
+            this.refreshStatusPill();
+          }
+          return;
+        }
+
+        if (scene === 'webpage') {
+          const latestPrepared = this.prepareBlockTask(plan.block, scene);
+          if (
+            !latestPrepared ||
+            latestPrepared.tokenized.text.trim() !== plan.blockSourceText.trim()
+          ) {
+            this.cache.set(task.cacheKey, {
+              trans: item.trans,
+              fallbackPlain: Boolean(item.fallbackPlain),
+            });
+            seg.staleSettledTrans = item.trans;
+            if (latestPrepared) {
+              staleMidFlightBlocks.add(plan.block);
+            }
+            if (isFirstRenderForSlot) {
+              this.sessionDoneBlocks += 1;
+              this.refreshStatusPill();
+            }
+            return;
+          }
+        }
+
+        const isRedundant = isRedundantIdenticalTranslation(
+          seg.text,
+          item.trans,
+        );
+        seg.trans = item.trans;
+        seg.hadPinnedTrans = false;
+        seg.staleSettledTrans = undefined;
+        seg.streamTextNode = undefined;
+        seg.state = isRedundant ? 'identity' : 'done';
+
+        const displayMode: DisplayMode = plan.forceBilingual
+          ? 'bilingual'
+          : this.config.webpage.displayMode;
+        const rec = reconstructRichDom(
+          isRedundant ? seg.text : item.trans,
+          seg,
+          this.doc,
+          { stripSourceLocaleAttrs: true, preserveLinkAppearance: true },
+        );
+        seg.fallbackPlain = isRedundant ? false : rec.fallbackPlain;
+
+        if (isRedundant && displayMode === 'bilingual') {
+          seg.domEl = undefined;
+        } else if (seg.domEl && seg.domEl.isConnected) {
+          this.runInternalDomMutation(() => {
+            seg.domEl!.replaceChildren(rec.fragment);
+          });
+        }
+
+        this.cache.set(task.cacheKey, {
+          trans: item.trans,
+          fallbackPlain: Boolean(item.fallbackPlain || seg.fallbackPlain),
+        });
+        this.renderPlan(plan);
+
+        if (isFirstRenderForSlot && scene === 'webpage') {
+          this.sessionDoneBlocks += 1;
+          const stillUnsettled = plan.segments.some(
+            (s) =>
+              s.state === 'pending' ||
+              s.state === 'pinned' ||
+              s.state === 'streaming',
+          );
+          if (!stillUnsettled) {
+            this.inFlightBlockSet.delete(plan.block);
+          }
+          this.refreshStatusPill();
+        }
+        return;
       }
 
       if (!task.block.isConnected) {
@@ -2528,7 +4196,7 @@ export class WebpageRenderer {
           this.runInternalDomMutation(() => {
             if (!this.hasMountedTranslation(task.block)) {
               this.clearBlockInjectedElements(task.block);
-              this.unwrapOriginalContent(task.block);
+              this.setSourceHidden(task.block, false);
               this.restoreUnclampedForBlock(task.block);
             }
           });
@@ -2569,15 +4237,32 @@ export class WebpageRenderer {
       }
       this.runInternalDomMutation(() => {
         for (const task of batchTasks) {
+          if (task.superseded || task.seg?.plan.superseded) {
+            continue;
+          }
           if (
             !renderedTransBySlot.has(
               requestItems.find((it) => slotMap.get(it.id) === task)?.id ?? -1,
             )
           ) {
             this.observedBlocks.delete(task.block);
-            if (!this.hasMountedTranslation(task.block)) {
+            if (task.seg) {
+              const { plan } = task.seg;
+              if (this.blockPlans.get(plan.block) === plan) {
+                const anyMountedSeg = plan.segments.some(
+                  (s) => s.state === 'done' || s.state === 'pinned',
+                );
+                if (!anyMountedSeg) {
+                  this.clearBlockInjectedElements(plan.block);
+                  this.setSourceHidden(plan.block, false);
+                  this.restoreUnclampedForBlock(plan.block);
+                } else {
+                  this.renderPlan(plan);
+                }
+              }
+            } else if (!this.hasMountedTranslation(task.block)) {
               this.clearBlockInjectedElements(task.block);
-              this.unwrapOriginalContent(task.block);
+              this.setSourceHidden(task.block, false);
               this.restoreUnclampedForBlock(task.block);
             }
           }
@@ -2619,13 +4304,29 @@ export class WebpageRenderer {
               renderedTransBySlot.delete(slotId);
               const task = slotMap.get(slotId);
               if (!task) continue;
+              task.settled = false;
               this.cache.delete(task.cacheKey);
-              if (scene === 'webpage' && this.sessionDoneBlocks > 0) {
+              if (
+                scene === 'webpage' &&
+                !task.superseded &&
+                !task.seg?.plan.superseded &&
+                this.sessionDoneBlocks > 0
+              ) {
                 this.sessionDoneBlocks -= 1;
               }
-              if (task.block.isConnected) {
+              if (task.seg) {
+                const { plan, index } = task.seg;
+                const seg = plan.segments[index];
+                if (seg) {
+                  seg.state = 'pending';
+                  seg.trans = undefined;
+                  seg.domEl = undefined;
+                  seg.streamTextNode = undefined;
+                  seg.lastPaintLen = 0;
+                }
+              } else if (task.block.isConnected) {
                 this.clearBlockInjectedElements(task.block);
-                this.unwrapOriginalContent(task.block);
+                this.setSourceHidden(task.block, false);
                 this.restoreUnclampedForBlock(task.block);
               }
             }
@@ -2674,14 +4375,47 @@ export class WebpageRenderer {
     } finally {
       cancelPendingSlotRafs();
       this.activeControllers.delete(abortController);
+      this.batchTasksByController.delete(abortController);
+      for (const p of batchPlans) {
+        if (!p1Tracker?.abortedByFastScroll) {
+          p.inFlightBatches = Math.max(0, p.inFlightBatches - 1);
+        }
+        p.controllers.delete(abortController);
+        if (
+          !p.superseded &&
+          p.hasPendingGrowth &&
+          p.inFlightBatches === 0 &&
+          p.block.isConnected
+        ) {
+          p.hasPendingGrowth = false;
+          staleMidFlightBlocks.add(p.block);
+        }
+      }
+      for (const task of batchTasks) {
+        const blockSet = this.inFlightTasksByBlock.get(task.block);
+        if (blockSet) {
+          blockSet.delete(task);
+          if (blockSet.size === 0) {
+            this.inFlightTasksByBlock.delete(task.block);
+          }
+        }
+      }
       if (batchSessionGen === this.sessionGen) {
         if (p1Tracker) {
           this.inFlightP1Batches.delete(p1Tracker);
         }
         for (const task of batchTasks) {
-          this.inFlightBlocks.delete(task.block);
-          this.inFlightBlockSet.delete(task.block);
-          this.inFlightBlockPromises.delete(task.block);
+          const activePlan = this.blockPlans.get(task.block);
+          const remainingTasks =
+            this.inFlightTasksByBlock.get(task.block)?.size ?? 0;
+          const planInFlight = activePlan
+            ? activePlan.inFlightBatches > 0
+            : false;
+          if (!planInFlight && remainingTasks === 0) {
+            this.inFlightBlocks.delete(task.block);
+            this.inFlightBlockSet.delete(task.block);
+            this.inFlightBlockPromises.delete(task.block);
+          }
         }
         if (scene === 'webpage') {
           this.refreshStatusPill();
@@ -2763,14 +4497,14 @@ export class WebpageRenderer {
         this.pendingViewportQueue.delete(block);
         this.syncStaleBlockBeforeRegister(block, false);
       }
-      if (this.hasMountedTranslation(block)) {
-        continue;
-      }
       if (this.inFlightBlocks.has(block)) {
         const inFlightPromise = this.inFlightBlockPromises.get(block);
         if (inFlightPromise) {
           existingPromises.add(inFlightPromise);
         }
+        continue;
+      }
+      if (this.hasMountedTranslation(block)) {
         continue;
       }
 
@@ -2785,6 +4519,27 @@ export class WebpageRenderer {
           cached.trans,
           options,
         );
+        continue;
+      }
+
+      const plan = this.planBlock(
+        prepared,
+        undefined,
+        Boolean(options.forceBilingual),
+      );
+      if (plan) {
+        this.blockPlans.set(block, plan);
+        this.renderPlan(plan);
+        const vpState = this.classifyBlockViewportState(block);
+        const prio: RequestPriority =
+          scene === 'hover'
+            ? -1
+            : vpState.isStrictlyVisible
+              ? 0
+              : options.fullPage
+                ? 2
+                : 1;
+        existingPromises.add(this.dispatchPlan(plan, prio));
         continue;
       }
 
@@ -2935,6 +4690,14 @@ export class WebpageRenderer {
         continue;
       }
 
+      const plan = this.planBlock(prepared);
+      if (plan) {
+        this.blockPlans.set(block, plan);
+        this.renderPlan(plan);
+        void this.dispatchPlan(plan, vpState.isStrictlyVisible ? 0 : 1);
+        continue;
+      }
+
       if (vpState.isStrictlyVisible) {
         p0Tasks.push(prepared);
       } else {
@@ -2947,7 +4710,7 @@ export class WebpageRenderer {
         for (const block of evictedBlocks) {
           if (!this.hasMountedTranslation(block)) {
             this.clearBlockInjectedElements(block);
-            this.unwrapOriginalContent(block);
+            this.setSourceHidden(block, false);
             this.restoreUnclampedForBlock(block);
           }
           this.observedBlocks.delete(block);
@@ -3024,8 +4787,19 @@ export class WebpageRenderer {
           if (!entry.isIntersecting) continue;
           const target = entry.target as HTMLElement;
           this.intersectionObserver?.unobserve(target);
+          const targetPlan = this.blockPlans.get(target);
+          const needsPlanResume =
+            targetPlan !== undefined &&
+            !targetPlan.superseded &&
+            targetPlan.inFlightBatches === 0 &&
+            targetPlan.segments.some(
+              (s) =>
+                s.state === 'pending' ||
+                s.state === 'pinned' ||
+                s.state === 'streaming',
+            );
           if (
-            !this.hasMountedTranslation(target) &&
+            (needsPlanResume || !this.hasMountedTranslation(target)) &&
             !this.inFlightBlocks.has(target) &&
             !this.failedBlockTasks.has(target)
           ) {
@@ -3035,7 +4809,9 @@ export class WebpageRenderer {
               scene: 'webpage',
               priority: tier,
             });
-            this.mountBlockLoadingIndicator(target);
+            if (!needsPlanResume) {
+              this.mountBlockLoadingIndicator(target);
+            }
             added = true;
           }
         }
@@ -3098,19 +4874,51 @@ export class WebpageRenderer {
         this.sessionTotalBlocks - tracker.tasks.length,
       );
 
+      const evictedPlans = new Set<BlockPlan>();
+      for (const task of tracker.tasks) {
+        if (task.seg) {
+          evictedPlans.add(task.seg.plan);
+        }
+      }
+      for (const p of evictedPlans) {
+        p.inFlightBatches = Math.max(0, p.inFlightBatches - 1);
+        p.controllers.delete(tracker.controller);
+      }
+
       this.runInternalDomMutation(() => {
         for (const task of tracker.tasks) {
+          const blockSet = this.inFlightTasksByBlock.get(task.block);
+          blockSet?.delete(task);
+          if (blockSet && blockSet.size === 0) {
+            this.inFlightTasksByBlock.delete(task.block);
+          }
+
+          const activePlan = this.blockPlans.get(task.block);
+          if (activePlan && activePlan.inFlightBatches > 0) {
+            continue;
+          }
+
           this.inFlightBlocks.delete(task.block);
           this.inFlightBlockSet.delete(task.block);
           this.inFlightBlockPromises.delete(task.block);
           this.observedBlocks.delete(task.block);
           if (!this.hasMountedTranslation(task.block)) {
             this.clearBlockInjectedElements(task.block);
-            this.unwrapOriginalContent(task.block);
+            this.setSourceHidden(task.block, false);
             this.restoreUnclampedForBlock(task.block);
           }
-          if (task.block.isConnected && !this.hasMountedTranslation(task.block)) {
-            this.observeOffscreenBlock(task.block);
+          if (task.block.isConnected) {
+            const hasUnsettledPlan =
+              activePlan !== undefined &&
+              activePlan.segments.some(
+                (s) =>
+                  s.state === 'pending' ||
+                  s.state === 'pinned' ||
+                  s.state === 'streaming',
+              );
+            if (!this.hasMountedTranslation(task.block) || hasUnsettledPlan) {
+              this.observeOffscreenBlock(task.block);
+            }
           }
         }
       });
@@ -3171,28 +4979,183 @@ export class WebpageRenderer {
     block: HTMLElement,
     fromSpaRescan: boolean,
   ): void {
-    if (this.hasMountedTranslation(block)) {
-      const currentSource =
-        this.prepareBlockTask(block, 'webpage')?.tokenized.text.trim() ?? '';
-      const prevSource = this.mountedMeta.get(block)?.sourceText.trim() ?? '';
-      if (!currentSource || currentSource !== prevSource) {
+    const activePlan = this.blockPlans.get(block);
+    const meta = this.mountedMeta.get(block);
+    const hasMounted = this.hasMountedTranslation(block);
+    const hasTranslatedAttr = block.getAttribute('data-margin-translated') === 'true';
+
+    if (activePlan || hasMounted || meta || hasTranslatedAttr) {
+      const currentPrepared = this.prepareBlockTask(block, 'webpage');
+      const currentSource = currentPrepared?.tokenized.text.trim() ?? '';
+      const prevSource = (
+        activePlan?.blockSourceText ??
+        meta?.sourceText ??
+        ''
+      ).trim();
+
+      if (!currentPrepared || !currentSource) {
         this.removeBlockTranslation(block);
         this.observedBlocks.delete(block);
         this.fallbackOffscreenBlocks.delete(block);
         this.intersectionObserver?.unobserve(block);
         this.failedBlockTasks.delete(block);
+        return;
       }
-      return;
-    }
 
-    if (
-      this.mountedMeta.has(block) ||
-      block.getAttribute('data-margin-translated') === 'true'
-    ) {
+      if (currentSource === prevSource) {
+        if (!hasMounted && !activePlan) {
+          // Root was externally removed while meta remained with identical source -> clean and allow re-mount
+          this.removeBlockTranslation(block);
+          this.observedBlocks.delete(block);
+          this.fallbackOffscreenBlocks.delete(block);
+          this.intersectionObserver?.unobserve(block);
+          return;
+        }
+        // Re-assert bilingual root last if host appended non-prose sibling, or self-heal if host wiped root on a live plan
+        const existingRoot = this.findDirectInjectedRoot(block);
+        if (existingRoot) {
+          this.runInternalDomMutation(() => {
+            this.ensureInjectedRootAtEnd(block, existingRoot);
+          });
+        } else if (activePlan && !activePlan.superseded) {
+          for (const s of activePlan.segments) {
+            s.domEl = undefined;
+            s.streamTextNode = undefined;
+          }
+          this.runInternalDomMutation(() => {
+            this.setSourceHidden(block, false);
+          });
+          this.renderPlan(activePlan);
+        }
+        // Resume unsettled plan with no live requests (e.g. after fast-scroll eviction)
+        if (
+          activePlan &&
+          !activePlan.superseded &&
+          activePlan.inFlightBatches === 0 &&
+          !this.failedBlockTasks.has(block) &&
+          activePlan.segments.some(
+            (s) =>
+              s.state === 'pending' ||
+              s.state === 'pinned' ||
+              s.state === 'streaming',
+          )
+        ) {
+          this.renderPlan(activePlan);
+          const vp = this.classifyBlockViewportState(block);
+          void this.dispatchPlan(activePlan, vp.isStrictlyVisible ? 0 : 1);
+        }
+        return;
+      }
+
+      const prevPlain =
+        activePlan?.blockPlain ??
+        meta?.plain ??
+        normalizePlainForPrefix(prevSource);
+      const nextPlain = normalizePlainForPrefix(
+        extractPlainFromTokenized(currentPrepared.tokenized),
+      );
+      const changeKind = classifySourceChange(prevPlain, nextPlain);
+
+      if (changeKind === 'same' || changeKind === 'expansion') {
+        if (
+          changeKind === 'expansion' &&
+          activePlan &&
+          !activePlan.superseded &&
+          activePlan.isExpansionFromPrior &&
+          activePlan.inFlightBatches > 0
+        ) {
+          activePlan.hasPendingGrowth = true;
+          const existingRoot = this.findDirectInjectedRoot(block);
+          if (existingRoot) {
+            this.runInternalDomMutation(() => {
+              this.ensureInjectedRootAtEnd(block, existingRoot);
+            });
+          }
+          return;
+        }
+
+        const prior = this.extractPriorSnapshot(block, activePlan, meta);
+        if (activePlan) {
+          this.supersedePlan(activePlan);
+        } else {
+          this.supersedeBlockInFlight(block);
+        }
+        this.failedBlockTasks.delete(block);
+        this.pendingViewportQueue.delete(block);
+        this.fallbackOffscreenBlocks.delete(block);
+        this.intersectionObserver?.unobserve(block);
+
+        const cachedWhole = this.cache.get(currentPrepared.cacheKey);
+        if (cachedWhole) {
+          this.mountBlockTranslation(
+            block,
+            currentPrepared.tokenized,
+            cachedWhole.trans,
+          );
+          return;
+        }
+
+        const nextPlan = this.planBlock(currentPrepared, prior ?? undefined);
+        if (nextPlan) {
+          nextPlan.isExpansionFromPrior = changeKind === 'expansion';
+          this.carryOverPlanDomNodes(activePlan, nextPlan, block);
+          this.blockPlans.set(block, nextPlan);
+          this.renderPlan(nextPlan);
+          const vp = this.classifyBlockViewportState(block);
+          void this.dispatchPlan(nextPlan, vp.isStrictlyVisible ? 0 : 1);
+          return;
+        }
+      }
+
+      // Unrelated source change (e.g. virtual-scroll cell recycle or shrink) -> wipe synchronously
       this.removeBlockTranslation(block);
       this.observedBlocks.delete(block);
       this.fallbackOffscreenBlocks.delete(block);
       this.intersectionObserver?.unobserve(block);
+      this.failedBlockTasks.delete(block);
+      return;
+    }
+
+    // Handle mid-flight legacy single-block tasks whose source mutated before final mount
+    const inFlightSet = this.inFlightTasksByBlock.get(block);
+    if (inFlightSet && inFlightSet.size > 0) {
+      const firstInFlight = Array.from(inFlightSet)[0];
+      const currentPrepared = this.prepareBlockTask(block, 'webpage');
+      const currentSource = currentPrepared?.tokenized.text.trim() ?? '';
+      if (
+        firstInFlight &&
+        (!currentPrepared ||
+          currentSource !== firstInFlight.tokenized.text.trim())
+      ) {
+        if (!currentPrepared || !currentSource) {
+          this.removeBlockTranslation(block);
+          this.observedBlocks.delete(block);
+          return;
+        }
+        const prevPlain = normalizePlainForPrefix(
+          extractPlainFromTokenized(firstInFlight.tokenized),
+        );
+        const nextPlain = normalizePlainForPrefix(
+          extractPlainFromTokenized(currentPrepared.tokenized),
+        );
+        const changeKind = classifySourceChange(prevPlain, nextPlain);
+        if (changeKind === 'expansion') {
+          const prior = this.extractPriorSnapshot(block, undefined, undefined);
+          const nextPlan = this.planBlock(currentPrepared, prior ?? undefined);
+          if (!nextPlan) {
+            return;
+          }
+          this.supersedeBlockInFlight(block);
+          this.pendingViewportQueue.delete(block);
+          nextPlan.isExpansionFromPrior = true;
+          this.carryOverPlanDomNodes(undefined, nextPlan, block);
+          this.blockPlans.set(block, nextPlan);
+          this.renderPlan(nextPlan);
+          const vp = this.classifyBlockViewportState(block);
+          void this.dispatchPlan(nextPlan, vp.isStrictlyVisible ? 0 : 1);
+          return;
+        }
+      }
     }
 
     const failedTask = this.failedBlockTasks.get(block);
@@ -3206,7 +5169,7 @@ export class WebpageRenderer {
         this.intersectionObserver?.unobserve(block);
         this.runInternalDomMutation(() => {
           this.clearBlockInjectedElements(block);
-          this.unwrapOriginalContent(block);
+          this.setSourceHidden(block, false);
           this.restoreUnclampedForBlock(block);
         });
       }
@@ -3237,7 +5200,11 @@ export class WebpageRenderer {
     for (const block of blocks) {
       if (!block.isConnected) continue;
       this.syncStaleBlockBeforeRegister(block, fromSpaRescan);
-      if (this.hasMountedTranslation(block) || this.failedBlockTasks.has(block)) {
+      if (
+        this.blockPlans.has(block) ||
+        this.hasMountedTranslation(block) ||
+        this.failedBlockTasks.has(block)
+      ) {
         continue;
       }
 
@@ -3254,14 +5221,26 @@ export class WebpageRenderer {
       }
 
       const vpState = this.classifyBlockViewportState(block);
+      if (!vpState.isStrictlyVisible && !vpState.isWithinLookahead) {
+        missesForObserver.push(block);
+        continue;
+      }
+
+      const plan = this.planBlock(prepared);
+      if (plan) {
+        this.observedBlocks.add(block);
+        this.blockPlans.set(block, plan);
+        this.renderPlan(plan);
+        void this.dispatchPlan(plan, vpState.isStrictlyVisible ? 0 : 1);
+        continue;
+      }
+
       if (vpState.isStrictlyVisible) {
         this.observedBlocks.add(block);
         candidateP0.push(prepared);
-      } else if (vpState.isWithinLookahead) {
+      } else {
         this.observedBlocks.add(block);
         candidateP1.push(prepared);
-      } else {
-        missesForObserver.push(block);
       }
     }
 
@@ -3405,6 +5384,17 @@ export class WebpageRenderer {
         }
       }
 
+      for (const planBlock of this.blockPlans.keys()) {
+        if (
+          planBlock.isConnected &&
+          (r === planBlock ||
+            r.contains(planBlock) ||
+            (r instanceof Node && planBlock.contains(r)))
+        ) {
+          staleCheckCandidates.add(planBlock);
+        }
+      }
+
       for (const blk of staleCheckCandidates) {
         if (blk.isConnected) {
           this.syncStaleBlockBeforeRegister(blk, true);
@@ -3502,8 +5492,10 @@ export class WebpageRenderer {
             }
             if (
               effectiveTargetEl &&
-              effectiveTargetEl.closest('[data-margin-translated="true"]') !==
-                null
+              (effectiveTargetEl.closest('[data-margin-translated="true"]') !==
+                null ||
+                effectiveTargetEl.closest('[data-margin-src-hidden="true"]') !==
+                  null)
             ) {
               this.pendingSpaRoots.add(effectiveTargetEl);
               hasExternalMutation = true;
@@ -3521,7 +5513,8 @@ export class WebpageRenderer {
           targetEl &&
           !this.isMarginInternalNode(targetEl) &&
           (m.target.nodeValue?.trim() ||
-            targetEl.closest('[data-margin-translated="true"]') !== null)
+            targetEl.closest('[data-margin-translated="true"]') !== null ||
+            targetEl.closest('[data-margin-src-hidden="true"]') !== null)
         ) {
           this.pendingSpaRoots.add(targetEl);
           hasExternalMutation = true;
@@ -3572,6 +5565,11 @@ export class WebpageRenderer {
       }
     }
     for (const blk of this.failedBlockTasks.keys()) {
+      if (blk.isConnected) {
+        blocksToSync.add(blk);
+      }
+    }
+    for (const blk of this.blockPlans.keys()) {
       if (blk.isConnected) {
         blocksToSync.add(blk);
       }
@@ -3806,6 +5804,13 @@ export class WebpageRenderer {
     for (const blk of this.inFlightBlockSet) {
       ownedBlocksSnapshot.add(blk);
     }
+    for (const [blk, plan] of this.blockPlans.entries()) {
+      plan.superseded = true;
+      ownedBlocksSnapshot.add(blk);
+    }
+    for (const blk of this.hiddenSourceBlocks) {
+      ownedBlocksSnapshot.add(blk);
+    }
 
     this.active = false;
     this.lastBatchTailContext = '';
@@ -3840,6 +5845,10 @@ export class WebpageRenderer {
       ctrl.abort();
     }
     this.activeControllers.clear();
+    this.batchTasksByController.clear();
+    this.inFlightTasksByBlock.clear();
+    this.blockPlans.clear();
+    this.recentPrefixes.clear();
     this.inFlightP1Batches.clear();
     this.inFlightBlockSet.clear();
     this.translatedBlockSet.clear();
@@ -3867,6 +5876,11 @@ export class WebpageRenderer {
         }
         for (const blk of wrappedBlocks) {
           this.unwrapOriginalContent(blk);
+        }
+        for (const blk of Array.from(this.hiddenSourceBlocks)) {
+          this.hiddenSourceBlocks.delete(blk);
+          blk.removeAttribute('data-margin-src-hidden');
+          clearNativelyHiddenChildrenSnapshot(blk);
         }
 
         for (const blk of ownedBlocksSnapshot) {
@@ -3902,6 +5916,19 @@ export class WebpageRenderer {
         this.unwrapOriginalContent(blk);
       }
       this.ownedOrigWrappers.clear();
+
+      for (const blk of Array.from(this.hiddenSourceBlocks)) {
+        blk.removeAttribute('data-margin-src-hidden');
+        clearNativelyHiddenChildrenSnapshot(blk);
+      }
+      this.hiddenSourceBlocks.clear();
+      const hiddenBlocks = Array.from(
+        this.doc.querySelectorAll<HTMLElement>('[data-margin-src-hidden="true"]'),
+      );
+      for (const blk of hiddenBlocks) {
+        blk.removeAttribute('data-margin-src-hidden');
+        clearNativelyHiddenChildrenSnapshot(blk);
+      }
 
       const markedBlocks = Array.from(
         this.doc.querySelectorAll<HTMLElement>('[data-margin-translated="true"]'),
@@ -3984,14 +6011,27 @@ export class WebpageRenderer {
       this.statusHost.setAttribute('data-display-mode', nextConfig.uiColorMode);
     }
 
-    if (this.active && prevSig !== nextSig) {
-      this.restorePage();
-      this.enablePageTranslation();
-      return;
+    if (prevSig !== nextSig) {
+      this.recentPrefixes.clear();
+      if (this.active) {
+        this.restorePage();
+        this.enablePageTranslation();
+        return;
+      }
     }
 
     const effectiveTheme = this.resolveEffectiveTheme();
     const newDisplayMode = nextConfig.webpage.displayMode;
+
+    // Re-render segmented BlockPlans in place (including mid-revalidation pins & identity segments) with zero network
+    for (const [blk, plan] of Array.from(this.blockPlans.entries())) {
+      if (!blk.isConnected) {
+        this.supersedePlan(plan);
+        this.blockPlans.delete(blk);
+        continue;
+      }
+      this.renderPlan(plan);
+    }
 
     this.runInternalDomMutation(() => {
       const spans = Array.from(
@@ -4000,9 +6040,13 @@ export class WebpageRenderer {
         ),
       );
       for (const span of spans) {
-        span.setAttribute('data-margin-theme', effectiveTheme);
         const parentBlock = span.parentElement;
         if (!parentBlock) continue;
+        if (this.blockPlans.has(parentBlock)) {
+          continue;
+        }
+
+        span.setAttribute('data-margin-theme', effectiveTheme);
 
         if (prevTargetLang !== nextConfig.targetLang) {
           this.applyTargetLocaleTypography(span, parentBlock);
@@ -4011,10 +6055,10 @@ export class WebpageRenderer {
         if (prevDisplayMode !== newDisplayMode) {
           if (newDisplayMode === 'target-only') {
             const effectiveStyle = resolveEffectiveHostTextStyle(parentBlock);
-            this.wrapOriginalContentForTargetOnly(parentBlock);
+            this.setSourceHidden(parentBlock, true);
             applyEffectiveHostTextStyle(span, effectiveStyle);
           } else {
-            this.unwrapOriginalContent(parentBlock);
+            this.setSourceHidden(parentBlock, false);
             applyEffectiveHostTextStyle(
               span,
               resolveEffectiveHostTextStyle(parentBlock),
@@ -4031,7 +6075,7 @@ export class WebpageRenderer {
           isRedundantIdenticalTranslation(meta.sourceText, meta.translatedText)
         ) {
           this.clearBlockInjectedElements(parentBlock);
-          this.unwrapOriginalContent(parentBlock);
+          this.setSourceHidden(parentBlock, false);
           this.restoreUnclampedForBlock(parentBlock);
           parentBlock.removeAttribute('data-margin-translated');
           this.mountedMeta.delete(parentBlock);
@@ -4044,6 +6088,7 @@ export class WebpageRenderer {
           'data-margin-layout',
           this.computeLayoutMode(parentBlock, plainLen, newDisplayMode),
         );
+        this.ensureInjectedRootAtEnd(parentBlock, span);
         this.unclampForInjectedNode(parentBlock, span);
       }
     });
@@ -4064,6 +6109,8 @@ export class WebpageRenderer {
     this.statusCloseBtn = null;
     this.fullscreenCleanup?.();
     this.fullscreenCleanup = null;
+    this.userInteractionCleanup?.();
+    this.userInteractionCleanup = null;
     if (
       !contextInvalidated ||
       !this.doc.querySelector(

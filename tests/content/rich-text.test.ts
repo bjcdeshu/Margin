@@ -3,6 +3,7 @@ import {
   cloneFormattingElementSafely,
   reconstructRichDom,
   refreshClonedLinksAppearance,
+  splitTokenizedIntoSegments,
   stripResidualMarkers,
   tokenizeParagraph,
 } from '../../src/content/rich-text';
@@ -401,5 +402,165 @@ describe('rich-text: <mN> tokenizer, zero-innerHTML reconstructor & per-item fal
 
     document.head.innerHTML = '';
     document.documentElement.removeAttribute('dark');
+  });
+
+  it('splits pre-* blocks across all three X span layouts, drops empty wrappers, renumbers burned IDs densely from 0, and round-trips emoji + links in P2', () => {
+    // Layout 1: <m0>P1</m0>\n\n<m1>P2</m1>
+    const t1 = document.createElement('div');
+    t1.style.whiteSpace = 'pre-wrap';
+    t1.innerHTML = '<span>First paragraph prose.</span>\n\n<span>Second paragraph prose.</span>';
+    document.body.appendChild(t1);
+    const segs1 = splitTokenizedIntoSegments(tokenizeParagraph(t1), {
+      softMaxChars: 1200,
+      hardMaxChars: 2400,
+    });
+    expect(segs1).toHaveLength(2);
+    expect(segs1[0]?.text).toBe('<m0>First paragraph prose.</m0>');
+    expect(segs1[0]?.sepBefore).toBe('');
+    expect(segs1[1]?.text).toBe('<m0>Second paragraph prose.</m0>');
+    expect(segs1[1]?.sepBefore).toBe('\n\n');
+
+    // Layout 2: Whitespace-only middle span burns ID -> <m0>P1</m0>\n\n<m2>P2</m2>
+    const t2 = document.createElement('div');
+    t2.style.whiteSpace = 'pre-wrap';
+    t2.innerHTML =
+      '<span>First paragraph after burned id.</span><span>\n\n</span><span>Second paragraph renumbered cleanly.</span>';
+    document.body.appendChild(t2);
+    const rawTok2 = tokenizeParagraph(t2);
+    expect(rawTok2.text).toBe(
+      '<m0>First paragraph after burned id.</m0>\n\n<m2>Second paragraph renumbered cleanly.</m2>',
+    );
+    const segs2 = splitTokenizedIntoSegments(rawTok2, {
+      softMaxChars: 1200,
+      hardMaxChars: 2400,
+    });
+    expect(segs2).toHaveLength(2);
+    expect(segs2[0]?.text).toBe('<m0>First paragraph after burned id.</m0>');
+    expect(segs2[1]?.text).toBe('<m0>Second paragraph renumbered cleanly.</m0>');
+    expect(Array.from(segs2[1]!.tokens.keys())).toEqual([0]);
+
+    // Layout 3: Break straddling sibling spans -> <m0>P1\n</m0><m1>\nP2</m1> + wrapper left empty after split
+    const t3 = document.createElement('div');
+    t3.setAttribute('data-testid', 'tweetText');
+    t3.style.whiteSpace = 'pre-wrap';
+    t3.innerHTML = [
+      '<span>Opening paragraph with trailing newline\n</span>',
+      '<span>\nParagraph two with </span>',
+      '<img alt="🔥" src="https://abs-0.twimg.com/emoji/v2/svg/1f525.svg">',
+      '<div class="css-175oi2r r-xoduu5"><a role="link" href="/AnthropicAI">@AnthropicAI</a></div>',
+      '<span> and <a href="https://margin.dev">benchmark report</a>.\n\n   </span>',
+    ].join('');
+    document.body.appendChild(t3);
+
+    const rawTok3 = tokenizeParagraph(t3);
+    const segs3 = splitTokenizedIntoSegments(rawTok3, {
+      softMaxChars: 1200,
+      hardMaxChars: 2400,
+    });
+    expect(segs3).toHaveLength(2);
+    expect(segs3[0]?.text).toBe(
+      '<m0>Opening paragraph with trailing newline</m0>',
+    );
+    // Paragraph 2 has local dense IDs m0..m4: span, emoji atomic img, @AnthropicAI link, span, benchmark link
+    expect(segs3[1]?.text).toBe(
+      '<m0>Paragraph two with </m0><m1/><m2>@AnthropicAI</m2><m3> and <m4>benchmark report</m4>.</m3>',
+    );
+
+    const recP2 = reconstructRichDom(
+      '<m0>第二段包含 </m0><m1/><m2>@AnthropicAI</m2><m3> 与<m4>基准测试报告</m4>。</m3>',
+      segs3[1]!,
+      document,
+      { stripSourceLocaleAttrs: true, preserveLinkAppearance: true },
+    );
+    expect(recP2.fallbackPlain).toBe(false);
+    const hostP2 = document.createElement('div');
+    hostP2.appendChild(recP2.fragment);
+    expect(hostP2.querySelector('img')?.getAttribute('alt')).toBe('🔥');
+    const linksP2 = hostP2.querySelectorAll('a');
+    expect(linksP2).toHaveLength(2);
+    expect(linksP2[0]?.getAttribute('href')).toBe('/AnthropicAI');
+    expect(linksP2[0]?.textContent).toBe('@AnthropicAI');
+    expect(linksP2[1]?.getAttribute('href')).toBe('https://margin.dev');
+    expect(linksP2[1]?.textContent).toBe('基准测试报告');
+
+    // Single wrapper spanning two paragraphs + trailing whitespace-only child dropped
+    const t4 = document.createElement('div');
+    t4.style.whiteSpace = 'pre-line';
+    t4.innerHTML = '<span>Alpha paragraph\n\n<strong>   </strong>Beta paragraph</span>';
+    document.body.appendChild(t4);
+    const segs4 = splitTokenizedIntoSegments(tokenizeParagraph(t4), {
+      softMaxChars: 1200,
+      hardMaxChars: 2400,
+    });
+    expect(segs4).toHaveLength(2);
+    expect(segs4[0]?.text).toBe('<m0>Alpha paragraph</m0>');
+    expect(segs4[1]?.text).toBe('<m0>Beta paragraph</m0>');
+  });
+
+  it('returns non-pre blocks and single-paragraph blocks unchanged, and splits oversize segments on single \\n then sentence ends', () => {
+    // 1. Non-pre `<p>` block stays a single unchanged item
+    const normalP = document.createElement('p');
+    normalP.innerHTML = 'Normal paragraph with <a href="https://example.com">link</a>.';
+    document.body.appendChild(normalP);
+    const tokP = tokenizeParagraph(normalP);
+    expect(tokP.preservesNewlines).toBe(false);
+    const segP = splitTokenizedIntoSegments(tokP, {
+      softMaxChars: 20,
+      hardMaxChars: 30,
+    });
+    expect(segP).toHaveLength(1);
+    expect(segP[0]?.text).toBe(tokP.text);
+
+    // 2. Single-paragraph `pre-line` block under softMaxChars stays unchanged
+    const singlePre = document.createElement('div');
+    singlePre.style.whiteSpace = 'pre-line';
+    singlePre.innerHTML = '<span>Line one\nLine two within budget.</span>';
+    document.body.appendChild(singlePre);
+    const tokSingle = tokenizeParagraph(singlePre);
+    expect(tokSingle.preservesNewlines).toBe(true);
+    const segSingle = splitTokenizedIntoSegments(tokSingle, {
+      softMaxChars: 1200,
+      hardMaxChars: 2400,
+    });
+    expect(segSingle).toHaveLength(1);
+    expect(segSingle[0]?.text).toBe(tokSingle.text);
+
+    // 3. Oversize > softMaxChars splits on single `\n` while balancing paired tags
+    const multilinePre = document.createElement('div');
+    multilinePre.style.whiteSpace = 'pre-wrap';
+    multilinePre.innerHTML =
+      '<span>First fifty-char line inside shared wrapper span here.\nSecond fifty-char line inside shared wrapper span here.</span>';
+    document.body.appendChild(multilinePre);
+    const segLineSplit = splitTokenizedIntoSegments(
+      tokenizeParagraph(multilinePre),
+      { softMaxChars: 75, hardMaxChars: 200 },
+    );
+    expect(segLineSplit).toHaveLength(2);
+    expect(segLineSplit[0]?.text).toBe(
+      '<m0>First fifty-char line inside shared wrapper span here.</m0>',
+    );
+    expect(segLineSplit[1]?.sepBefore).toBe('\n');
+    expect(segLineSplit[1]?.text).toBe(
+      '<m0>Second fifty-char line inside shared wrapper span here.</m0>',
+    );
+
+    // 4. Oversize > hardMaxChars with NO newlines splits on sentence ends while keeping <m0> balanced
+    const longSingleLine = document.createElement('div');
+    longSingleLine.style.whiteSpace = 'pre-wrap';
+    longSingleLine.innerHTML =
+      '<span>Sentence one has no line breaks at all and carries rich formatting. Sentence two continues on the exact same line past the hard limit.</span>';
+    document.body.appendChild(longSingleLine);
+    const segSentSplit = splitTokenizedIntoSegments(
+      tokenizeParagraph(longSingleLine),
+      { softMaxChars: 80, hardMaxChars: 95 },
+    );
+    expect(segSentSplit).toHaveLength(2);
+    expect(segSentSplit[0]?.text).toBe(
+      '<m0>Sentence one has no line breaks at all and carries rich formatting.</m0>',
+    );
+    expect(segSentSplit[1]?.sepBefore).toBe(' ');
+    expect(segSentSplit[1]?.text).toBe(
+      '<m0>Sentence two continues on the exact same line past the hard limit.</m0>',
+    );
   });
 });
