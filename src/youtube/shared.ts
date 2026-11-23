@@ -376,7 +376,9 @@ const RUBY_RP_BLOCK_RE =
   /<rp\b[^<>]*>[\s\S]*?(?:<\/\s*rp\s*>|(?=<\/\s*ruby\s*>|<rt\b|<rp\b))/gi;
 const SUBTITLE_BR_TAG_RE =
   /<br\b(?:(?:[\s;]+|(?<=["']))[a-zA-Z_:][\w:.-]*(?:\s*=\s*(?:"[^<>"]*"|'[^<>']*'|[^\s"'<>\/=;]+))?)*\s*\/?>/gi;
-const WEBVTT_TIMESTAMP_TAG_RE = /<\d{1,3}:\d{2}(?::\d{2})?[.,]\d{1,3}>/g;
+// R1 widen timestamps conservatively (fraction optional ONLY with 3 parts, so prose "<10:30>" is kept)
+const WEBVTT_TIMESTAMP_TAG_RE =
+  /<\d{1,3}:\d{2}:\d{2}(?:[.,]\d{1,6})?>|<\d{1,3}:\d{2}[.,]\d{1,6}>/g;
 const ASS_OVERRIDE_BLOCK_RE = /\{\\[a-zA-Z0-9][^}\n]*\}/g;
 const SUBTITLE_CLOSE_TAG_RE =
   /<\/\s*(?:b|i|u|s|strong|em|small|big|sub|sup|mark|font|span|ruby|c|v|lang|rt|rp)\s*>/gi;
@@ -385,8 +387,55 @@ const SUBTITLE_VOICE_OR_LANG_OPEN_TAG_RE =
 const SUBTITLE_INLINE_OPEN_TAG_RE =
   /<(?:b|i|u|s|strong|em|small|big|sub|sup|mark|font|span|ruby|c|rt|rp)\b(?:\.[^\s.<>\/=;]+)*(?:(?:[\s;]+|(?<=["']))[a-zA-Z_:][\w:.-]*(?:\s*=\s*(?:"[^<>"]*"|'[^<>']*'|[^\s"'<>\/=;]+))?)*\s*\/?>/gi;
 
+// R2 known X vendor tags (open/close, attrs bounded). Require >=2 lowercase letters after "X-" so math "<X-Y>", "<X-1>" survive.
+const X_VENDOR_TAG_RE =
+  /<\/?X-[a-z]{2,}[A-Za-z0-9]*(?:-[A-Za-z0-9]+)*(?:\s[^<>]{0,4096})?>/g;
+// Single-colon XML namespace only (spares C++ `std::vector`)
+const SUBTITLE_VENDOR_TAG_NAME_SRC = String.raw`[A-Za-z][\w.-]*(?:(?<!:):(?!:)[A-Za-z][\w.-]*)?`;
+// Unspaced `=` attribute key-value only (spares `template <typename T = int>` and `Box<T = string>`)
+const SUBTITLE_VENDOR_ATTR_KV_SRC = String.raw`[A-Za-z_][\w:.-]*=(?:"[^"<>]*"|'[^'<>]*'|[^\s"'<>=]+)`;
+// R3 hyphen-letter / single-colon-ns names WITH >=1 unspaced attr (<tt:span style="s1">, <x-foo a=1>)
+const VENDOR_ATTR_TAG_RE = new RegExp(
+  String.raw`<(?:[A-Za-z]\w*(?:-[A-Za-z]\w*)+|[A-Za-z][\w.-]*(?<!:):(?!:)[A-Za-z][\w.-]*)(?:\s+${SUBTITLE_VENDOR_ATTR_KV_SRC})+\s*\/?>`,
+  'g',
+);
+// R4 any letter-start tag with >=2 unspaced attrs (NOT >=1: `template<typename T=int>` / `template<char C='a'>` must survive)
+const MULTI_ATTR_TAG_RE = new RegExp(
+  String.raw`<${SUBTITLE_VENDOR_TAG_NAME_SRC}(?:\s+${SUBTITLE_VENDOR_ATTR_KV_SRC}){2,}\s*\/?>`,
+  'g',
+);
+// R5 self-closing XML tags
+const SELF_CLOSING_TAG_RE = new RegExp(
+  String.raw`<${SUBTITLE_VENDOR_TAG_NAME_SRC}(?:\s+${SUBTITLE_VENDOR_ATTR_KV_SRC})*\s*\/>`,
+  'g',
+);
+// R6 paired generic XML/vendor tags (collect closer names -> strip matching openers without &&/|| -> strip closers)
+const PAIRED_CLOSE_ANY_RE = new RegExp(
+  String.raw`<\/\s*(${SUBTITLE_VENDOR_TAG_NAME_SRC})\s*>`,
+  'g',
+);
+const PAIRED_OPEN_ANY_RE = new RegExp(
+  String.raw`<(${SUBTITLE_VENDOR_TAG_NAME_SRC})(\s+[^<>]{0,2048})?>`,
+  'g',
+);
+
+function stripPairedVendorSubtitleTags(input: string): string {
+  if (!input.includes('</')) return input;
+  const closers = new Set<string>();
+  for (const match of input.matchAll(PAIRED_CLOSE_ANY_RE)) {
+    if (match[1]) closers.add(match[1]);
+  }
+  if (closers.size === 0) return input;
+  const withoutOpeners = input.replace(
+    PAIRED_OPEN_ANY_RE,
+    (full, name: string, attrs?: string) =>
+      closers.has(name) && !(attrs && /&&|\|\|/.test(attrs)) ? '' : full,
+  );
+  return withoutOpeners.replace(PAIRED_CLOSE_ANY_RE, '');
+}
+
 function stripSubtitleTagLayer(input: string, brReplacement: string): string {
-  return input
+  const afterAllowlist = input
     .replace(CDATA_WRAPPER_RE, '$1')
     .replace(RUBY_RT_BLOCK_RE, '')
     .replace(RUBY_RP_BLOCK_RE, '')
@@ -395,7 +444,12 @@ function stripSubtitleTagLayer(input: string, brReplacement: string): string {
     .replace(ASS_OVERRIDE_BLOCK_RE, '')
     .replace(SUBTITLE_CLOSE_TAG_RE, '')
     .replace(SUBTITLE_VOICE_OR_LANG_OPEN_TAG_RE, '')
-    .replace(SUBTITLE_INLINE_OPEN_TAG_RE, '');
+    .replace(SUBTITLE_INLINE_OPEN_TAG_RE, '')
+    .replace(X_VENDOR_TAG_RE, '')
+    .replace(VENDOR_ATTR_TAG_RE, '')
+    .replace(MULTI_ATTR_TAG_RE, '')
+    .replace(SELF_CLOSING_TAG_RE, '');
+  return stripPairedVendorSubtitleTags(afterAllowlist);
 }
 
 export interface SanitizeSubtitleMarkupOptions {

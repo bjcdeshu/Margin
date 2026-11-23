@@ -60,6 +60,8 @@ export interface SubtitleSchedulerConfig {
   preTranslate: boolean;
   maxBatchCount: number;
   maxCharsPerBatch: number;
+  immediateLookaheadMs?: number;
+  refillTriggerMs?: number;
   pageUrl?: string;
   videoTitle?: string;
 }
@@ -207,12 +209,14 @@ export function buildSubtitleBatchRequest(
 
   for (let i = 0; i < params.entries.length; i += 1) {
     const entry = params.entries[i];
-    const id = i + 1;
+    const cleanText = sanitizeSubtitleMarkup(entry.cue.text);
+    if (!cleanText) continue;
+    const id = items.length + 1;
     idToCueIndex.set(id, entry.cueIndex);
     cueIndices.push(entry.cueIndex);
     items.push({
       id,
-      text: entry.cue.text,
+      text: cleanText,
       hasRichTags: false,
     });
   }
@@ -301,9 +305,28 @@ export function isCueInImmediateWindow(
   return cueEnd >= windowStart && cue.tStartMs <= windowEnd;
 }
 
+function resolveLookaheadWindowMs(raw?: number): number {
+  if (raw !== undefined && Number.isFinite(raw) && raw > 0) {
+    return Math.round(raw);
+  }
+  return SUBTITLE_IMMEDIATE_LOOKAHEAD_MS;
+}
+
+function resolveRefillTriggerMs(
+  rawTrigger: number | undefined,
+  lookaheadMs: number,
+): number {
+  if (rawTrigger !== undefined && Number.isFinite(rawTrigger) && rawTrigger >= 0) {
+    return Math.min(lookaheadMs, Math.round(rawTrigger));
+  }
+  return lookaheadMs;
+}
+
 /**
- * Plans immediate window batches `[currentTimeMs - 2s, currentTimeMs + 35s]` first,
+ * Plans immediate window batches `[currentTimeMs - 2s, currentTimeMs + immediateLookaheadMs]` first,
  * followed (when `preTranslate: true`) by chronological lookahead batches ahead of playhead.
+ * When `refillTriggerMs < immediateLookaheadMs`, immediate batches only fire if at least one pending
+ * cue starts within `currentTimeMs + refillTriggerMs` (or is already active/in lookbehind).
  */
 export function planSubtitleBatches(params: {
   cues: readonly SubtitleCue[];
@@ -311,9 +334,16 @@ export function planSubtitleBatches(params: {
   preTranslate: boolean;
   limits: SubtitleBatchLimits;
   excludeCueIndices?: ReadonlySet<number>;
+  immediateLookaheadMs?: number;
+  refillTriggerMs?: number;
 }): PlannedSubtitleBatches {
   const { cues, currentTimeMs, preTranslate, limits, excludeCueIndices } = params;
   const safeNow = Math.max(0, Number.isFinite(currentTimeMs) ? currentTimeMs : 0);
+  const lookaheadMs = resolveLookaheadWindowMs(params.immediateLookaheadMs);
+  const refillTriggerMs = resolveRefillTriggerMs(
+    params.refillTriggerMs,
+    lookaheadMs,
+  );
 
   const immediateEntries: IndexedSubtitleCue[] = [];
   const aheadEntries: IndexedSubtitleCue[] = [];
@@ -324,19 +354,36 @@ export function planSubtitleBatches(params: {
     const cue = cues[cueIndex];
     if (!cue?.text?.trim() || cue.trans) continue;
 
-    if (isCueInImmediateWindow(cue, safeNow)) {
+    if (
+      isCueInImmediateWindow(
+        cue,
+        safeNow,
+        SUBTITLE_IMMEDIATE_LOOKBEHIND_MS,
+        lookaheadMs,
+      )
+    ) {
       immediateEntries.push({ cueIndex, cue });
-    } else if (cue.tStartMs > safeNow + SUBTITLE_IMMEDIATE_LOOKAHEAD_MS) {
+    } else if (cue.tStartMs > safeNow + lookaheadMs) {
       aheadEntries.push({ cueIndex, cue });
     } else {
       behindEntries.push({ cueIndex, cue });
     }
   }
 
-  const immediateBatches = partitionCuesIntoBatches(immediateEntries, limits);
+  const hasRefillTrigger =
+    immediateEntries.length > 0 &&
+    (refillTriggerMs >= lookaheadMs ||
+      immediateEntries.some(
+        (entry) => entry.cue.tStartMs <= safeNow + refillTriggerMs,
+      ));
+
+  const immediateBatches = hasRefillTrigger
+    ? partitionCuesIntoBatches(immediateEntries, limits)
+    : [];
+  const deferredImmediate = hasRefillTrigger ? [] : immediateEntries;
   const lookaheadBatches = preTranslate
     ? [
-        ...partitionCuesIntoBatches(aheadEntries, limits),
+        ...partitionCuesIntoBatches([...deferredImmediate, ...aheadEntries], limits),
         ...partitionCuesIntoBatches(behindEntries, limits),
       ]
     : [];
@@ -376,6 +423,7 @@ export class SubtitleBatchScheduler {
   private statuses: CueDispatchStatus[] = [];
   private failureCounts: number[] = [];
   private playheadMs = 0;
+  private dispatchGateOpen = true;
   private abortController: AbortController = new AbortController();
   private inflightImmediate = 0;
   private inflightLookahead = 0;
@@ -392,6 +440,17 @@ export class SubtitleBatchScheduler {
       options.maxCueRetries >= 0
         ? Math.floor(options.maxCueRetries)
         : MAX_SUBTITLE_CUE_RETRIES;
+  }
+
+  public setDispatchGate(open: boolean): void {
+    const nextOpen = Boolean(open);
+    if (this.dispatchGateOpen === nextOpen) return;
+    this.dispatchGateOpen = nextOpen;
+    this.pump();
+  }
+
+  public isDispatchGateOpen(): boolean {
+    return this.dispatchGateOpen;
   }
 
   public configure(next: Partial<SubtitleSchedulerConfig>): void {
@@ -436,6 +495,71 @@ export class SubtitleBatchScheduler {
     this.pump();
   }
 
+  /**
+   * Appends chronologically advancing HLS cues without cancelling in-flight LLM batches
+   * or shifting existing cue indices (`idToCueIndex` stays valid).
+   */
+  public appendCues(newCues: readonly SubtitleCue[]): number {
+    if (!newCues || newCues.length === 0) return 0;
+    let lastStartMs =
+      this.cues.length > 0 ? this.cues[this.cues.length - 1].tStartMs : 0;
+
+    // Trim overlap on the previous tail cue if the first appended cue starts before its end
+    if (this.cues.length > 0) {
+      const prevIdx = this.cues.length - 1;
+      const prev = this.cues[prevIdx];
+      const firstNewStart = Math.max(lastStartMs, newCues[0].tStartMs);
+      if (
+        firstNewStart > prev.tStartMs &&
+        prev.tStartMs + prev.dDurationMs > firstNewStart
+      ) {
+        this.cues[prevIdx] = {
+          ...prev,
+          dDurationMs: Math.max(100, firstNewStart - prev.tStartMs),
+        };
+      }
+    }
+
+    let appendedCount = 0;
+    for (const raw of newCues) {
+      if (!raw) continue;
+      const safeStart = Math.max(lastStartMs, raw.tStartMs);
+      lastStartMs = safeStart;
+      const copy: SubtitleCue = {
+        ...raw,
+        tStartMs: safeStart,
+      };
+      this.cues.push(copy);
+      this.statuses.push(copy.trans ? 'done' : 'pending');
+      this.failureCounts.push(0);
+      appendedCount += 1;
+    }
+
+    if (appendedCount > 0) {
+      this.pump();
+    }
+    return appendedCount;
+  }
+
+  /**
+   * Updates an existing cue's duration in-place (e.g. when an HLS segment-boundary split cue coalesces)
+   * without touching its index, translation, or in-flight status.
+   */
+  public updateCueDuration(cueIndex: number, dDurationMs: number): void {
+    if (
+      cueIndex < 0 ||
+      cueIndex >= this.cues.length ||
+      !Number.isFinite(dDurationMs) ||
+      dDurationMs <= 0
+    ) {
+      return;
+    }
+    this.cues[cueIndex] = {
+      ...this.cues[cueIndex],
+      dDurationMs: Math.round(dDurationMs),
+    };
+  }
+
   public updatePlayhead(
     currentTimeMs: number,
     options?: { seek?: boolean },
@@ -449,6 +573,9 @@ export class SubtitleBatchScheduler {
     this.playheadMs = currentTimeMs;
 
     if (isExplicitSeek) {
+      const lookaheadMs = resolveLookaheadWindowMs(
+        this.config.immediateLookaheadMs,
+      );
       for (let i = 0; i < this.statuses.length; i += 1) {
         const cue = this.cues[i];
         if (
@@ -456,7 +583,12 @@ export class SubtitleBatchScheduler {
           cue &&
           !cue.trans &&
           (this.failureCounts[i] ?? 0) <= this.maxCueRetries &&
-          isCueInImmediateWindow(cue, currentTimeMs)
+          isCueInImmediateWindow(
+            cue,
+            currentTimeMs,
+            SUBTITLE_IMMEDIATE_LOOKBEHIND_MS,
+            lookaheadMs,
+          )
         ) {
           this.statuses[i] = 'pending';
         }
@@ -527,7 +659,7 @@ export class SubtitleBatchScheduler {
   }
 
   private pump(): void {
-    if (this.cues.length === 0) {
+    if (!this.dispatchGateOpen || this.cues.length === 0) {
       this.checkIdle();
       return;
     }
@@ -546,6 +678,8 @@ export class SubtitleBatchScheduler {
         preTranslate: false,
         limits,
         excludeCueIndices: excluded,
+        immediateLookaheadMs: this.config.immediateLookaheadMs,
+        refillTriggerMs: this.config.refillTriggerMs,
       });
       const nextImmediate = plan.immediateBatches[0];
       if (!nextImmediate || nextImmediate.length === 0) break;
@@ -565,6 +699,8 @@ export class SubtitleBatchScheduler {
         preTranslate: true,
         limits,
         excludeCueIndices: excluded,
+        immediateLookaheadMs: this.config.immediateLookaheadMs,
+        refillTriggerMs: this.config.refillTriggerMs,
       });
       const nextLookahead =
         plan.immediateBatches[0] ?? plan.lookaheadBatches[0];

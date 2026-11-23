@@ -149,6 +149,8 @@ const EXCLUDED_DATA_TESTIDS: ReadonlySet<string> = new Set([
   'tweetButtonInline',
   'toolBar',
   'socialContext',
+  'videoPlayer',
+  'videoComponent',
 ]);
 
 const EXCLUDED_ELEMENT_IDS: ReadonlySet<string> = new Set([

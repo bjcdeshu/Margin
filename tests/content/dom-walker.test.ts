@@ -7,6 +7,7 @@ import {
   findClosestParagraphBlock,
   findFirstDirectBlockBoundaryChild,
   getBlockSourceContainer,
+  hasExcludedAncestor,
   inferDomainStyleGuide,
   isMixedInlineAndBlockContainer,
   isReadableLeafBlock,
@@ -758,5 +759,43 @@ describe('dom-walker: smart paragraph extraction & math/code protection', () => 
 
     tweetWithHidden.removeAttribute('data-margin-src-hidden');
     clearNativelyHiddenChildrenSnapshot(tweetWithHidden);
+  });
+
+  it('v2.3.7: excludes X [data-testid="videoPlayer"] and [data-testid="videoComponent"] subtrees while still collecting surrounding tweetText', () => {
+    document.body.innerHTML = `
+      <article data-testid="tweet">
+        <div id="terence-tao-tweet" data-testid="tweetText">
+          <span>One of the first things Terence Tao asked ChatGPT in 2023 was to solve the Riemann hypothesis.</span>
+        </div>
+        <div id="x-video-player" data-testid="videoPlayer">
+          <div id="x-video-comp" data-testid="videoComponent">
+            <video src="blob:https://x.com/mock"></video>
+            <div id="inner-comp-overlay">Internal video component overlay label</div>
+          </div>
+          <div id="x-react-caption">
+            <span dir="auto">So do you remember the first time you</span>
+          </div>
+          <div id="x-controls-bar">
+            <div role="slider" aria-label="Seek slider"></div>
+            <span>0:01 / 0:20</span>
+          </div>
+        </div>
+      </article>
+    `;
+
+    const blocks = extractParagraphBlocks(document.body, {
+      targetLang: 'zh-CN',
+    });
+    expect(blocks.map((el) => el.id)).toEqual(['terence-tao-tweet']);
+
+    const captionEl = document.getElementById('x-react-caption')!;
+    const compOverlay = document.getElementById('inner-comp-overlay')!;
+    expect(hasExcludedAncestor(captionEl)).toBe(true);
+    expect(hasExcludedAncestor(compOverlay)).toBe(true);
+    expect(findClosestParagraphBlock(captionEl)).toBeNull();
+    expect(findClosestParagraphBlock(compOverlay)).toBeNull();
+    expect(findClosestParagraphBlock(document.getElementById('terence-tao-tweet'))?.id).toBe(
+      'terence-tao-tweet',
+    );
   });
 });

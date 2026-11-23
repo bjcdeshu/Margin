@@ -25,6 +25,33 @@ import {
   SubtitleBatchScheduler,
 } from './batching';
 import {
+  buildHtml5TrackIdentity,
+  computeHtml5BottomOffset,
+  computeHtml5CaptionTypography,
+  computeVisibleRatio,
+  findNativeCaptionLayer,
+  HTML5_ARBITRATION_THROTTLE_MS,
+  HTML5_CONTROLS_AUTOHIDE_IDLE_MS,
+  HTML5_ENGAGE_DWELL_MS,
+  HTML5_IMMEDIATE_LOOKAHEAD_MS,
+  HTML5_REFILL_TRIGGER_MS,
+  HTML5_STATUS_DWELL_MS,
+  HTML5_TRACK_POLL_MS,
+  isHostCaptionsOn,
+  isHtml5VideoPlayingVisible,
+  mergeHtml5Cues,
+  NATIVE_CAPTION_HIDDEN_ATTR,
+  NATIVE_CUE_SUPPRESSED_ATTR,
+  NATIVE_HTML5_HIDE_STYLE_ID,
+  pickCaptionTrack,
+  rebaseSmpteBroadcastOffset,
+  recordCueTranslationsInMemo,
+  resolveEffectiveVideoRect,
+  resolveHtml5PlayerRoot,
+  resolveViewportSize,
+  selectActiveHtml5Video,
+} from './html5-video';
+import {
   applyNativeThemeVariablesToElement,
   areYoutubeNativeThemesEqual,
   buildSourceTrackFingerprint,
@@ -40,7 +67,9 @@ import {
   readLocalYoutubeCaptionTheme,
   resolveEffectiveTranslationScale,
   resolveRenderedCueLines,
+  resolveSubtitleCjkFallbackForLang,
   resolveSubtitleTargetDir,
+   sanitizeSubtitleMarkup,
   YOUTUBE_CAPTION_STORAGE_KEY,
   type YoutubeExtendedBridgeMessage,
   type YoutubeIsolatedToMainMessage,
@@ -53,6 +82,11 @@ import {
   parseWebVtt,
 } from './timeline';
 
+export {
+  NATIVE_CAPTION_HIDDEN_ATTR,
+  NATIVE_CUE_SUPPRESSED_ATTR,
+  NATIVE_HTML5_HIDE_STYLE_ID,
+};
 export const SUBTITLE_OVERLAY_HOST_ID = `${BRAND.cssPrefix}-subtitle-overlay-host`;
 export const NATIVE_YT_HIDE_STYLE_ID = `${BRAND.cssPrefix}-yt-native-caption-suppress`;
 export const OVERLAY_OWNER_ATTR = `${BRAND.domAttrPrefix}-owner`;
@@ -144,9 +178,44 @@ export function createSubtitleIsolatedController(
   let pendingCaptionSyncTimer: ReturnType<typeof setTimeout> | null = null;
   let ownedOverlayHost: HTMLElement | null = null;
   let boundHtml5Video: HTMLVideoElement | null = null;
-  let activeHtml5VideoSrc = '';
+  let boundHtml5PlayerRoot: HTMLElement | null = null;
+  let activeHtml5VideoIdentity = '';
   let html5TrackLoadGen = 0;
   let detachHtml5Listeners: (() => void) | null = null;
+  let detachHtml5DocListeners: (() => void) | null = null;
+  let detachPickedTrackListener: (() => void) | null = null;
+  let activePickedTrack: TextTrack | null = null;
+  let html5OverlayState: 'OFF' | 'ON_IDLE' | 'ON_ACTIVE' = 'OFF';
+  let html5SuppressionApplied = false;
+  let suppressedVideoEl: HTMLVideoElement | null = null;
+  let lastAppliedStyleSig = '';
+  let lastPolledCueCount = -1;
+  let lastPolledLastEndTime = -1;
+  let lastSentPlayheadMs = -1;
+  let lastTrackPollAt = 0;
+  let lastOverlayOffsetPollAt = 0;
+  let lastPointerActivityAt = 0;
+  let pausedAfterPlay = false;
+  let cachedNativeCaptionEl: HTMLElement | null = null;
+  let hadPositiveNativeCaptionLayer = false;
+  let awaitingUiToggleCheck = false;
+  let missingLayerCueChangesAfterClick = 0;
+  let hostCaptionsHiddenByUi = false;
+  let arbitrationTimer: ReturnType<typeof setTimeout> | null = null;
+  let lastArbitrationAt = 0;
+  let dwellTimer: ReturnType<typeof setTimeout> | null = null;
+  let dwellVideo: HTMLVideoElement | null = null;
+  let uiClickRecheckTimer: ReturnType<typeof setTimeout> | null = null;
+  let missingLayerConfirmTimer: ReturnType<typeof setTimeout> | null = null;
+  let controlsFadeTimer: ReturnType<typeof setTimeout> | null = null;
+  let captionLayerRafToken = 0;
+  const videoIdentityMap = new WeakMap<HTMLVideoElement, number>();
+  let nextHtml5VideoSeq = 0;
+  const lastPlayingAtMap = new WeakMap<HTMLVideoElement, number>();
+  const engagedVideos = new WeakSet<HTMLVideoElement>();
+  const mutatedPositionMap = new Map<HTMLElement, string>();
+  const videoTranslationMemo = new Map<string, string>();
+  let lastMemoLangKey = '';
   let hadRuntimeIdAtStart = false;
   let destroyed = false;
   const stashedCapturesByVideoId = new Map<string, StashedCaptionCapture[]>();
@@ -183,9 +252,44 @@ export function createSubtitleIsolatedController(
   const scheduler = new SubtitleBatchScheduler({
     translateBatch: translateFn,
     onCuesUpdated: () => {
+      if (!isYoutube) {
+        recordCueTranslationsInMemo(videoTranslationMemo, scheduler.getCues());
+        if (boundHtml5Video) {
+          updateHtml5DispatchGate(boundHtml5Video);
+        }
+      }
       refreshActiveCueFromPlayhead();
     },
   });
+  if (!isYoutube) {
+    scheduler.setDispatchGate(false);
+  }
+
+  function isHtml5OverlayActive(): boolean {
+    return isYoutube || html5OverlayState === 'ON_ACTIVE';
+  }
+
+  function getHtml5VideoIdentity(video: HTMLVideoElement): string {
+    let id = videoIdentityMap.get(video);
+    if (id === undefined) {
+      nextHtml5VideoSeq += 1;
+      id = nextHtml5VideoSeq;
+      videoIdentityMap.set(video, id);
+    }
+    const src = video.currentSrc || video.getAttribute('src') || '';
+    return `html5#${id}|${src}`;
+  }
+
+  function restoreMutatedPositions(): void {
+    for (const [el, prevInlinePos] of mutatedPositionMap.entries()) {
+      if (prevInlinePos) {
+        el.style.position = prevInlinePos;
+      } else {
+        el.style.removeProperty('position');
+      }
+    }
+    mutatedPositionMap.clear();
+  }
 
   function isSubtitlesEnabledForSite(): boolean {
     const href = win.location?.href ?? '';
@@ -202,14 +306,34 @@ export function createSubtitleIsolatedController(
 
   function syncSchedulerConfig(): void {
     const resolved = resolveSubtitleLimitsFromConfig(config);
+    if (isYoutube) {
+      scheduler.configure({
+        fromLang: config.sourceLang || 'auto',
+        toLang: config.targetLang || 'zh-CN',
+        providerId: resolved.providerId,
+        preTranslate: Boolean(config.subtitles.preTranslate),
+        maxBatchCount: resolved.maxBatchCount,
+        maxCharsPerBatch: resolved.maxCharsPerBatch,
+        pageUrl: win.location?.href ?? 'https://www.youtube.com/',
+        videoTitle: doc.title || undefined,
+      });
+      return;
+    }
+    const nextMemoLangKey = `${config.targetLang || 'zh-CN'}|${resolved.providerId}`;
+    if (lastMemoLangKey && lastMemoLangKey !== nextMemoLangKey) {
+      videoTranslationMemo.clear();
+    }
+    lastMemoLangKey = nextMemoLangKey;
     scheduler.configure({
       fromLang: config.sourceLang || 'auto',
       toLang: config.targetLang || 'zh-CN',
       providerId: resolved.providerId,
-      preTranslate: Boolean(config.subtitles.preTranslate),
+      preTranslate: false,
+      immediateLookaheadMs: HTML5_IMMEDIATE_LOOKAHEAD_MS,
+      refillTriggerMs: HTML5_REFILL_TRIGGER_MS,
       maxBatchCount: resolved.maxBatchCount,
       maxCharsPerBatch: resolved.maxCharsPerBatch,
-      pageUrl: win.location?.href ?? 'https://www.youtube.com/',
+      pageUrl: win.location?.href ?? '',
       videoTitle: doc.title || undefined,
     });
   }
@@ -263,6 +387,167 @@ export function createSubtitleIsolatedController(
     (doc.head ?? doc.documentElement)?.appendChild(style);
   }
 
+  function ensureHtml5NativeSuppressStyle(): void {
+    if (isYoutube) return;
+    if (doc.getElementById(NATIVE_HTML5_HIDE_STYLE_ID)) return;
+    const style = doc.createElement('style');
+    style.id = NATIVE_HTML5_HIDE_STYLE_ID;
+    style.textContent = [
+      `video[${NATIVE_CUE_SUPPRESSED_ATTR}]::cue { color: transparent !important; background: transparent !important; text-shadow: none !important; outline: none !important; opacity: 0 !important; }`,
+      `video[${NATIVE_CUE_SUPPRESSED_ATTR}]::-webkit-media-text-track-display { opacity: 0 !important; }`,
+      `[${NATIVE_CAPTION_HIDDEN_ATTR}] { opacity: 0 !important; pointer-events: none !important; transition: none !important; }`,
+    ].join('\n');
+    (doc.head ?? doc.documentElement)?.appendChild(style);
+  }
+
+  function extractActiveTrackTexts(video: HTMLVideoElement): string[] {
+    const picked = pickCaptionTrack(video);
+    if (!picked) return [];
+
+    const activeList = (
+      picked as TextTrack & {
+        activeCues?: ArrayLike<{ text?: string }> | null;
+      }
+    ).activeCues;
+
+    if (activeList !== undefined && activeList !== null) {
+      const texts: string[] = [];
+      for (let i = 0; i < activeList.length; i += 1) {
+        const cleaned = sanitizeSubtitleMarkup(activeList[i]?.text ?? '');
+        if (cleaned) texts.push(cleaned);
+      }
+      return texts;
+    }
+
+    // Fallback when fake `TextTrack` in unit tests omits `.activeCues`
+    const cueList = picked.cues as unknown as
+      | ArrayLike<{ startTime: number; endTime: number; text?: string }>
+      | null
+      | undefined;
+    if (!cueList || typeof cueList.length !== 'number') return [];
+    const nowSec = Number(video.currentTime) || 0;
+    const texts: string[] = [];
+    for (let i = 0; i < cueList.length; i += 1) {
+      const c = cueList[i];
+      if (!c) continue;
+      if (nowSec >= Number(c.startTime) && nowSec < Number(c.endTime)) {
+        const cleaned = sanitizeSubtitleMarkup(c.text ?? '');
+        if (cleaned) texts.push(cleaned);
+      }
+    }
+    return texts;
+  }
+
+  function syncNativeCaptionLayerSuppression(
+    video: HTMLVideoElement | null,
+    options: { forceScan?: boolean } = {},
+  ): HTMLElement | null {
+    if (isYoutube || !video || !video.isConnected) return null;
+    const playerRoot =
+      boundHtml5PlayerRoot?.isConnected
+        ? boundHtml5PlayerRoot
+        : resolveHtml5PlayerRoot(video);
+    if (!playerRoot) return null;
+
+    // P2-1 fast path: skip TreeWalker when cached caption layer is still mounted, marked, and non-empty
+    if (
+      !options.forceScan &&
+      !awaitingUiToggleCheck &&
+      !hostCaptionsHiddenByUi &&
+      html5OverlayState === 'ON_ACTIVE' &&
+      cachedNativeCaptionEl?.isConnected &&
+      cachedNativeCaptionEl.hasAttribute(NATIVE_CAPTION_HIDDEN_ATTR) &&
+      Boolean(cachedNativeCaptionEl.textContent?.trim())
+    ) {
+      return cachedNativeCaptionEl;
+    }
+
+    const activeTexts = extractActiveTrackTexts(video);
+    if (activeTexts.length === 0) {
+      return cachedNativeCaptionEl;
+    }
+
+    const found = findNativeCaptionLayer(
+      playerRoot,
+      activeTexts,
+      ownedOverlayHost ?? doc.getElementById(SUBTITLE_OVERLAY_HOST_ID),
+    );
+
+    if (found) {
+      hadPositiveNativeCaptionLayer = true;
+      missingLayerCueChangesAfterClick = 0;
+      awaitingUiToggleCheck = false;
+      if (missingLayerConfirmTimer !== null) {
+        clearTimeout(missingLayerConfirmTimer);
+        missingLayerConfirmTimer = null;
+      }
+      if (hostCaptionsHiddenByUi) {
+        hostCaptionsHiddenByUi = false;
+        evaluateHtml5State(false);
+        return found;
+      }
+      if (html5OverlayState === 'ON_ACTIVE') {
+        if (cachedNativeCaptionEl && cachedNativeCaptionEl !== found) {
+          cachedNativeCaptionEl.removeAttribute(NATIVE_CAPTION_HIDDEN_ATTR);
+        }
+        cachedNativeCaptionEl = found;
+        found.setAttribute(NATIVE_CAPTION_HIDDEN_ATTR, '');
+        html5SuppressionApplied = true;
+      }
+      return found;
+    }
+
+    if (cachedNativeCaptionEl && !cachedNativeCaptionEl.isConnected) {
+      cachedNativeCaptionEl = null;
+    }
+
+    return null;
+  }
+
+  function setHtml5VideoCueSuppressedOnly(video: HTMLVideoElement | null): void {
+    if (isYoutube || !video || !video.isConnected) return;
+    if (
+      suppressedVideoEl === video &&
+      video.hasAttribute(NATIVE_CUE_SUPPRESSED_ATTR)
+    ) {
+      return;
+    }
+    ensureHtml5NativeSuppressStyle();
+    if (suppressedVideoEl && suppressedVideoEl !== video) {
+      suppressedVideoEl.removeAttribute(NATIVE_CUE_SUPPRESSED_ATTR);
+    }
+    video.setAttribute(NATIVE_CUE_SUPPRESSED_ATTR, '');
+    suppressedVideoEl = video;
+    html5SuppressionApplied = true;
+  }
+
+  function setHtml5NativeSuppression(
+    video: HTMLVideoElement | null,
+    suppress: boolean,
+  ): void {
+    if (isYoutube) return;
+    if (!suppress) {
+      // P2-2 O(1) guard: never scan DOM when nothing was suppressed
+      if (
+        !html5SuppressionApplied &&
+        !suppressedVideoEl &&
+        !cachedNativeCaptionEl
+      ) {
+        return;
+      }
+      video?.removeAttribute(NATIVE_CUE_SUPPRESSED_ATTR);
+      suppressedVideoEl?.removeAttribute(NATIVE_CUE_SUPPRESSED_ATTR);
+      cachedNativeCaptionEl?.removeAttribute(NATIVE_CAPTION_HIDDEN_ATTR);
+      suppressedVideoEl = null;
+      cachedNativeCaptionEl = null;
+      html5SuppressionApplied = false;
+      return;
+    }
+    if (!video || !video.isConnected) return;
+    setHtml5VideoCueSuppressedOnly(video);
+    syncNativeCaptionLayerSuppression(video);
+  }
+
   function findOverlayMountContainer(): HTMLElement | null {
     const fsEl = doc.fullscreenElement as HTMLElement | null;
     if (fsEl && (fsEl.tagName !== 'VIDEO' || fsEl.parentElement)) {
@@ -277,12 +562,43 @@ export function createSubtitleIsolatedController(
     }
 
     if (boundHtml5Video?.parentElement) {
-      const parent = boundHtml5Video.parentElement;
-      const computed = win.getComputedStyle?.(parent);
-      if (computed && computed.position === 'static') {
-        parent.style.position = 'relative';
+      const vRect = boundHtml5Video.getBoundingClientRect?.();
+      const hasLayoutRect = Boolean(vRect && vRect.width > 0 && vRect.height > 0);
+      let firstRectMatchedAncestor: HTMLElement | null = null;
+      let anc: HTMLElement | null = boundHtml5Video.parentElement;
+
+      for (let depth = 0; depth < 3 && anc; depth += 1) {
+        if (anc === doc.body || anc === doc.documentElement) break;
+        const aRect = anc.getBoundingClientRect?.();
+        const rectMatches =
+          !hasLayoutRect ||
+          Boolean(
+            aRect &&
+              vRect &&
+              Math.abs(aRect.width - vRect.width) <= 4 &&
+              Math.abs(aRect.height - vRect.height) <= 4 &&
+              Math.abs(aRect.top - vRect.top) <= 4 &&
+              Math.abs(aRect.left - vRect.left) <= 4,
+          );
+        if (rectMatches && !firstRectMatchedAncestor) {
+          firstRectMatchedAncestor = anc;
+        }
+        const computed = win.getComputedStyle?.(anc);
+        if (rectMatches && computed && computed.position && computed.position !== 'static') {
+          return anc;
+        }
+        anc = anc.parentElement;
       }
-      return parent;
+
+      const fallback = firstRectMatchedAncestor ?? boundHtml5Video.parentElement;
+      const computed = win.getComputedStyle?.(fallback);
+      if (computed && computed.position === 'static') {
+        if (!mutatedPositionMap.has(fallback)) {
+          mutatedPositionMap.set(fallback, fallback.style.position);
+        }
+        fallback.style.position = 'relative';
+      }
+      return fallback;
     }
 
     return null;
@@ -335,10 +651,82 @@ export function createSubtitleIsolatedController(
     return fallbackVisibleBottom;
   }
 
+  function syncHtml5OverlayTypographyAndOffset(
+    container: HTMLElement,
+    wrapper: HTMLElement,
+    cueForStyle?: MarginActiveCueState,
+  ): void {
+    const isFs = Boolean(doc.fullscreenElement);
+    const vRect = boundHtml5Video
+      ? resolveEffectiveVideoRect(boundHtml5Video)
+      : null;
+    const playerHeight =
+      container.getBoundingClientRect?.().height ||
+      container.clientHeight ||
+      vRect?.height ||
+      0;
+
+    const styleSource = cueForStyle ?? activeCueState;
+    const origPct = clampFontSizePercent(styleSource.sourceScalePercent, 100);
+    const transPct = clampFontSizePercent(
+      styleSource.translationScalePercent ?? styleSource.fontSizePercent,
+      70,
+    );
+    const targetLang = normalizeSubtitleTargetLang(
+      styleSource.targetLang || config.targetLang || 'zh-CN',
+    );
+    const scaleMult = styleSource.nativeTheme?.fontScaleMultiplier ?? 1;
+
+    const typo = computeHtml5CaptionTypography({
+      heightPx: playerHeight,
+      fullscreen: isFs,
+      origPct,
+      transPct,
+      targetLang,
+      scaleMult,
+      bgOpacityPercent: styleSource.bgOpacityPercent,
+    });
+
+    const recentPointer =
+      lastPointerActivityAt > 0 &&
+      Date.now() - lastPointerActivityAt <= HTML5_CONTROLS_AUTOHIDE_IDLE_MS;
+    const bottomPx = computeHtml5BottomOffset({
+      container,
+      playerRoot: resolveHtml5PlayerRoot(boundHtml5Video),
+      video: boundHtml5Video,
+      heightPx: playerHeight,
+      fullscreen: isFs,
+      paused: Boolean(boundHtml5Video?.paused),
+      recentPointerActivity: recentPointer,
+      getComputedStyleFn: win.getComputedStyle
+        ? (el) => win.getComputedStyle(el)
+        : undefined,
+    });
+
+    const cjkTail = resolveSubtitleCjkFallbackForLang(targetLang);
+    wrapper.style.setProperty('--margin-sub-trans-px', `${typo.transPx}px`);
+    wrapper.style.setProperty('--margin-sub-orig-px', `${typo.origPx}px`);
+    wrapper.style.setProperty('--margin-cap-pad-y', `${typo.padY}px`);
+    wrapper.style.setProperty('--margin-cap-pad-x', `${typo.padX}px`);
+    wrapper.style.setProperty('--margin-cap-radius', `${typo.radius}px`);
+    wrapper.style.setProperty('--margin-cap-bg', typo.capBg);
+    wrapper.style.setProperty(
+      '--margin-html5-trans-font-family',
+      `Chirp, system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, ${cjkTail}`,
+    );
+    wrapper.style.setProperty('--margin-sub-bottom-px', `${bottomPx}px`);
+  }
+
   function syncOverlayBaseFontSize(
     container: HTMLElement,
     wrapper: HTMLElement,
+    cueForStyle?: MarginActiveCueState,
   ): void {
+    if (!isYoutube) {
+      syncHtml5OverlayTypographyAndOffset(container, wrapper, cueForStyle);
+      return;
+    }
+
     const playerHeight =
       container.clientHeight ||
       container.getBoundingClientRect?.().height ||
@@ -352,6 +740,16 @@ export function createSubtitleIsolatedController(
     const bottomPx = computeOverlayBottomOffsetPx(container, playerHeight);
     wrapper.style.setProperty('--margin-sub-base-px', `${basePx}px`);
     wrapper.style.setProperty('--margin-sub-bottom-px', `${bottomPx}px`);
+  }
+
+  function syncHtml5OverlayLayout(): void {
+    if (destroyed || isYoutube) return;
+    const host = doc.getElementById(SUBTITLE_OVERLAY_HOST_ID);
+    const wrapper = host?.shadowRoot?.getElementById('margin-sub-wrap');
+    const container = host?.parentElement;
+    if (wrapper && container) {
+      syncHtml5OverlayTypographyAndOffset(container, wrapper, activeCueState);
+    }
   }
 
   function ensurePlayerResizeObserver(container: HTMLElement): void {
@@ -393,7 +791,25 @@ export function createSubtitleIsolatedController(
     }
   }
 
-  function ensureOverlayShadowRoot(): ShadowRoot | null {
+  function buildHtml5StyleSignature(
+    cue: MarginActiveCueState,
+    isFs: boolean,
+  ): string {
+    const origPct = clampFontSizePercent(cue.sourceScalePercent, 100);
+    const transPct = clampFontSizePercent(
+      cue.translationScalePercent ?? cue.fontSizePercent,
+      70,
+    );
+    const lang = normalizeSubtitleTargetLang(
+      cue.targetLang || config.targetLang || 'zh-CN',
+    );
+    const mult = cue.nativeTheme?.fontScaleMultiplier ?? 1;
+    return `${isFs ? 1 : 0}|${origPct}|${transPct}|${lang}|${cue.bgOpacityPercent ?? ''}|${mult}`;
+  }
+
+  function ensureOverlayShadowRoot(
+    cueForStyle?: MarginActiveCueState,
+  ): ShadowRoot | null {
     const container = findOverlayMountContainer();
     if (!container) return null;
 
@@ -402,7 +818,9 @@ export function createSubtitleIsolatedController(
       host.remove();
       host = null;
     }
+    let createdNewHost = false;
     if (!host) {
+      createdNewHost = true;
       host = doc.createElement('div');
       host.id = SUBTITLE_OVERLAY_HOST_ID;
       host.setAttribute(`${BRAND.domAttrPrefix}-injected`, 'subtitle-overlay');
@@ -413,6 +831,8 @@ export function createSubtitleIsolatedController(
 
       const wrapper = doc.createElement('div');
       wrapper.id = 'margin-sub-wrap';
+      wrapper.dataset.surface = isYoutube ? 'youtube' : 'html5';
+      wrapper.dataset.mode = config.subtitles.displayMode;
       wrapper.dataset.position = config.subtitles.position;
       wrapper.dataset.stylePreset = normalizeSubtitleStylePreset(
         config.subtitles.stylePreset,
@@ -442,17 +862,28 @@ export function createSubtitleIsolatedController(
     host.setAttribute(OVERLAY_OWNER_ATTR, instanceId);
     ownedOverlayHost = host;
 
+    let didReparent = false;
     if (host.parentElement !== container) {
       container.appendChild(host);
+      didReparent = true;
     }
 
     ensurePlayerResizeObserver(container);
+    const isFullscreen = Boolean(doc.fullscreenElement);
     const wrapper = host.shadowRoot?.getElementById('margin-sub-wrap');
     if (wrapper) {
-      syncOverlayBaseFontSize(container, wrapper);
+      if (isYoutube) {
+        syncOverlayBaseFontSize(container, wrapper);
+      } else if (createdNewHost || didReparent) {
+        const effectiveCue = cueForStyle ?? activeCueState;
+        syncHtml5OverlayTypographyAndOffset(container, wrapper, effectiveCue);
+        lastAppliedStyleSig = buildHtml5StyleSignature(
+          effectiveCue,
+          isFullscreen,
+        );
+      }
     }
 
-    const isFullscreen = Boolean(doc.fullscreenElement);
     host.toggleAttribute('data-fullscreen', isFullscreen);
     host.setAttribute('data-display-mode', 'night');
 
@@ -460,12 +891,26 @@ export function createSubtitleIsolatedController(
   }
 
   function removeOverlayHost(options: { contextInvalidated?: boolean } = {}): void {
+    // P2-2 fast skip on HTML5 when no overlay or suppression is mounted
+    if (
+      !isYoutube &&
+      !ownedOverlayHost &&
+      !playerResizeObserver &&
+      !html5SuppressionApplied &&
+      !suppressedVideoEl &&
+      !cachedNativeCaptionEl &&
+      !doc.getElementById(SUBTITLE_OVERLAY_HOST_ID)
+    ) {
+      return;
+    }
+
     playerResizeObserver?.disconnect();
     playerResizeObserver = null;
     observedPlayerContainer = null;
     playerClassObserver?.disconnect();
     playerClassObserver = null;
     observedClassContainer = null;
+    lastAppliedStyleSig = '';
 
     const ownedOwner = ownedOverlayHost?.getAttribute(OVERLAY_OWNER_ATTR) ?? '';
     if (
@@ -493,29 +938,46 @@ export function createSubtitleIsolatedController(
         remainingOwner !== instanceId,
     );
     if (!hasOtherMountedOwner) {
-      setNativeYoutubeCaptionSuppression(false);
+      if (isYoutube) {
+        setNativeYoutubeCaptionSuppression(false);
+      } else {
+        setHtml5NativeSuppression(boundHtml5Video, false);
+      }
     }
   }
 
   function applyOverlayDom(cue: MarginActiveCueState): void {
-    if (!isSubtitlesEnabledForSite() || scheduler.getCues().length === 0) {
+    if (
+      !isSubtitlesEnabledForSite() ||
+      !isHtml5OverlayActive() ||
+      scheduler.getCues().length === 0
+    ) {
       renderedCueState = cue;
       removeOverlayHost();
       return;
     }
 
-    const shadow = ensureOverlayShadowRoot();
+    const shadow = ensureOverlayShadowRoot(cue);
     const wrapper = shadow?.getElementById('margin-sub-wrap');
     const origEl = shadow?.getElementById('margin-sub-original');
     const transEl = shadow?.getElementById('margin-sub-translated');
     if (!shadow || !wrapper || !origEl || !transEl) {
       renderedCueState = normalizeActiveCueState(buildConfiguredCueDefaults());
-      setNativeYoutubeCaptionSuppression(false);
+      if (isYoutube) {
+        setNativeYoutubeCaptionSuppression(false);
+      } else {
+        setHtml5NativeSuppression(boundHtml5Video, false);
+      }
       return;
     }
 
     renderedCueState = cue;
-    setNativeYoutubeCaptionSuppression(true);
+    if (isYoutube) {
+      setNativeYoutubeCaptionSuppression(true);
+    } else {
+      // P2-1: set only the `<video>` attribute here; TreeWalker runs strictly on ON_ACTIVE entry, cuechange & click recheck
+      setHtml5VideoCueSuppressedOnly(boundHtml5Video);
+    }
 
     const origPct = clampFontSizePercent(cue.sourceScalePercent, 100);
     const transPct = clampFontSizePercent(
@@ -523,12 +985,27 @@ export function createSubtitleIsolatedController(
       70,
     );
     const preset = normalizeSubtitleStylePreset(cue.stylePreset);
+    const isFs = Boolean(doc.fullscreenElement);
     wrapper.style.setProperty('--margin-sub-orig-scale', (origPct / 100).toFixed(3));
     wrapper.style.setProperty('--margin-sub-trans-scale', (transPct / 100).toFixed(3));
     applyNativeThemeVariablesToElement(wrapper, cue);
+    wrapper.dataset.surface = isYoutube ? 'youtube' : 'html5';
+    wrapper.dataset.mode = cue.mode;
     wrapper.dataset.stylePreset = preset;
     wrapper.dataset.position = cue.position;
-    wrapper.toggleAttribute('data-fullscreen', Boolean(doc.fullscreenElement));
+    wrapper.toggleAttribute('data-fullscreen', isFs);
+
+    if (!isYoutube && ownedOverlayHost?.parentElement) {
+      const nextStyleSig = buildHtml5StyleSignature(cue, isFs);
+      if (nextStyleSig !== lastAppliedStyleSig) {
+        syncHtml5OverlayTypographyAndOffset(
+          ownedOverlayHost.parentElement,
+          wrapper,
+          cue,
+        );
+        lastAppliedStyleSig = nextStyleSig;
+      }
+    }
 
     const { originalLine, translatedLine } = resolveRenderedCueLines(cue);
 
@@ -626,12 +1103,21 @@ export function createSubtitleIsolatedController(
   }
 
   function refreshActiveCueFromPlayhead(): void {
-    if (!isSubtitlesEnabledForSite()) {
+    if (!isSubtitlesEnabledForSite() || !isHtml5OverlayActive()) {
       cancelClearTimer();
       removeOverlayHost();
-      const empty = normalizeActiveCueState(buildConfiguredCueDefaults());
-      activeCueState = empty;
-      broadcastActiveCue(empty);
+      if (
+        isYoutube ||
+        activeCueState.original ||
+        activeCueState.translated ||
+        renderedCueState.original ||
+        renderedCueState.translated
+      ) {
+        const empty = normalizeActiveCueState(buildConfiguredCueDefaults());
+        activeCueState = empty;
+        renderedCueState = empty;
+        broadcastActiveCue(empty);
+      }
       return;
     }
 
@@ -919,114 +1405,339 @@ export function createSubtitleIsolatedController(
     }
   }
 
-  async function tryLoadHtml5VideoTracks(video: HTMLVideoElement): Promise<void> {
-    if (destroyed || isYoutube || !isSubtitlesEnabledForSite()) return;
-    const loadGen = ++html5TrackLoadGen;
+  function scheduleTwoRafs(callback: () => void): void {
+    const token = captionLayerRafToken;
+    const raf =
+      win.requestAnimationFrame?.bind(win) ??
+      ((cb: FrameRequestCallback) => setTimeout(() => cb(Date.now()), 16));
+    raf(() => {
+      if (destroyed || captionLayerRafToken !== token) return;
+      raf(() => {
+        if (destroyed || captionLayerRafToken !== token) return;
+        callback();
+      });
+    });
+  }
 
-    const videoSrcId =
-      video.currentSrc ||
-      video.getAttribute('src') ||
-      win.location?.href ||
-      'video';
-
-    if (activeHtml5VideoSrc && activeHtml5VideoSrc !== videoSrcId) {
-      currentVideoKey = '';
-      currentPlayheadMs = Math.max(0, Math.round((video.currentTime || 0) * 1000));
-      scheduler.loadCues('', [], currentPlayheadMs);
-      refreshActiveCueFromPlayhead();
+  function clearHtml5BoundTimers(): void {
+    if (dwellTimer !== null) {
+      clearTimeout(dwellTimer);
+      dwellTimer = null;
     }
-    activeHtml5VideoSrc = videoSrcId;
+    dwellVideo = null;
+    if (uiClickRecheckTimer !== null) {
+      clearTimeout(uiClickRecheckTimer);
+      uiClickRecheckTimer = null;
+    }
+    if (missingLayerConfirmTimer !== null) {
+      clearTimeout(missingLayerConfirmTimer);
+      missingLayerConfirmTimer = null;
+    }
+    if (controlsFadeTimer !== null) {
+      clearTimeout(controlsFadeTimer);
+      controlsFadeTimer = null;
+    }
+    captionLayerRafToken += 1;
+  }
 
+  function unbindHtml5Video(): void {
+    html5TrackLoadGen += 1;
+    clearHtml5BoundTimers();
+    detachPickedTrackListener?.();
+    detachPickedTrackListener = null;
+    activePickedTrack = null;
+    detachHtml5Listeners?.();
+    detachHtml5Listeners = null;
+
+    const prevVideo = boundHtml5Video;
+    if (prevVideo && !prevVideo.isConnected) {
+      engagedVideos.delete(prevVideo);
+    }
+    boundHtml5Video = null;
+    boundHtml5PlayerRoot = null;
+    activeHtml5VideoIdentity = '';
+    currentVideoKey = '';
+    html5OverlayState = 'OFF';
+    lastPolledCueCount = -1;
+    lastPolledLastEndTime = -1;
+    lastSentPlayheadMs = -1;
+    pausedAfterPlay = false;
+    hadPositiveNativeCaptionLayer = false;
+    awaitingUiToggleCheck = false;
+    missingLayerCueChangesAfterClick = 0;
+    hostCaptionsHiddenByUi = false;
+    videoTranslationMemo.clear();
+
+    setHtml5NativeSuppression(prevVideo, false);
+    restoreMutatedPositions();
+    scheduler.setDispatchGate(false);
+    scheduler.cancelAll();
+    scheduler.loadCues('', [], 0);
+    cancelClearTimer();
+    removeOverlayHost();
+    const empty = normalizeActiveCueState(buildConfiguredCueDefaults());
+    activeCueState = empty;
+    renderedCueState = empty;
+  }
+
+  function isImmediateVideoEngaged(video: HTMLVideoElement): boolean {
+    if (engagedVideos.has(video)) return true;
+    const volumeOk = video.volume === undefined || Number(video.volume) > 0;
+    if (!video.muted && volumeOk) {
+      engagedVideos.add(video);
+      return true;
+    }
+    const fsEl = doc.fullscreenElement;
+    if (fsEl && (fsEl === video || fsEl.contains(video))) {
+      engagedVideos.add(video);
+      return true;
+    }
+    const pipWin = (
+      win as Window & {
+        documentPictureInPicture?: { window?: Window | null };
+      }
+    ).documentPictureInPicture?.window;
+    if ((pipWin && !pipWin.closed) || doc.pictureInPictureElement === video) {
+      engagedVideos.add(video);
+      return true;
+    }
+    return false;
+  }
+
+  function resolveHtml5EngageDwellMs(video: HTMLVideoElement): number {
+    const pathname = win.location?.pathname ?? '';
+    if (!/\/status\/[^/?#]+/.test(pathname)) {
+      return HTML5_ENGAGE_DWELL_MS;
+    }
+    const vp = resolveViewportSize(doc);
+    const allVideos = Array.from(doc.querySelectorAll('video'));
+    let maxArea = 0;
+    let targetArea = 0;
+    for (const candidate of allVideos) {
+      if (!candidate.isConnected) continue;
+      const rect = resolveEffectiveVideoRect(candidate, vp);
+      const ratio = computeVisibleRatio(rect, vp);
+      const visArea = rect.width * rect.height * ratio;
+      if (candidate === video) targetArea = visArea;
+      if (visArea > maxArea) maxArea = visArea;
+    }
+    return targetArea > 0 && targetArea >= maxArea
+      ? HTML5_STATUS_DWELL_MS
+      : HTML5_ENGAGE_DWELL_MS;
+  }
+
+  function updateHtml5DispatchGate(video: HTMLVideoElement): void {
+    if (
+      html5OverlayState !== 'ON_ACTIVE' ||
+      doc.hidden ||
+      !isSubtitlesEnabledForSite()
+    ) {
+      scheduler.setDispatchGate(false);
+      return;
+    }
+    const ratio = computeVisibleRatio(video);
+    if (ratio < 0.5) {
+      scheduler.setDispatchGate(false);
+      return;
+    }
+    if (!video.paused) {
+      scheduler.setDispatchGate(true);
+      return;
+    }
+    // Allow translating the currently active cue on an unpaused-yet `showing` track (e.g. paused lecture load / track switch)
+    if (!pausedAfterPlay && pickCaptionTrack(video)?.mode === 'showing') {
+      const cues = scheduler.getCues();
+      const idx = findActiveCueIndex(cues, currentPlayheadMs);
+      const needsActiveCue = idx >= 0 && !cues[idx]?.trans;
+      scheduler.setDispatchGate(needsActiveCue);
+      return;
+    }
+    scheduler.setDispatchGate(false);
+  }
+
+  function attachPickedTrackCueListener(
+    video: HTMLVideoElement,
+    track: TextTrack,
+  ): void {
+    if (activePickedTrack === track) return;
+    detachPickedTrackListener?.();
+    detachPickedTrackListener = null;
+    activePickedTrack = track;
+    lastPolledCueCount = -1;
+    lastPolledLastEndTime = -1;
+
+    if (typeof track.addEventListener !== 'function') return;
+    const onCueChange = () => {
+      if (destroyed || boundHtml5Video !== video || activePickedTrack !== track) {
+        return;
+      }
+      currentPlayheadMs = Math.max(0, Math.round((video.currentTime || 0) * 1000));
+      void ingestHtml5VideoTracks(video, false);
+      refreshActiveCueFromPlayhead();
+      if (html5OverlayState === 'ON_ACTIVE') {
+        syncNativeCaptionLayerSuppression(video);
+      }
+      scheduleTwoRafs(() => {
+        if (destroyed || boundHtml5Video !== video || activePickedTrack !== track) {
+          return;
+        }
+        const foundAtRaf = syncNativeCaptionLayerSuppression(video, {
+          forceScan: awaitingUiToggleCheck || hostCaptionsHiddenByUi,
+        });
+        // P2-5: require BOTH 2xrAF AND a +250ms confirmation check to fail before counting a missing layer
+        if (
+          !foundAtRaf &&
+          awaitingUiToggleCheck &&
+          hadPositiveNativeCaptionLayer &&
+          extractActiveTrackTexts(video).length > 0
+        ) {
+          if (missingLayerConfirmTimer !== null) {
+            clearTimeout(missingLayerConfirmTimer);
+          }
+          const checkGen = html5TrackLoadGen;
+          missingLayerConfirmTimer = setTimeout(() => {
+            missingLayerConfirmTimer = null;
+            if (
+              destroyed ||
+              checkGen !== html5TrackLoadGen ||
+              boundHtml5Video !== video ||
+              activePickedTrack !== track ||
+              !awaitingUiToggleCheck ||
+              !hadPositiveNativeCaptionLayer
+            ) {
+              return;
+            }
+            if (extractActiveTrackTexts(video).length === 0) return;
+            const foundAfterDelay = syncNativeCaptionLayerSuppression(video, {
+              forceScan: true,
+            });
+            if (!foundAfterDelay) {
+              missingLayerCueChangesAfterClick += 1;
+              if (missingLayerCueChangesAfterClick >= 2) {
+                hostCaptionsHiddenByUi = true;
+                awaitingUiToggleCheck = false;
+                missingLayerCueChangesAfterClick = 0;
+                evaluateHtml5State(false);
+              }
+            }
+          }, 250);
+        }
+      });
+    };
+    track.addEventListener('cuechange', onCueChange);
+    detachPickedTrackListener = () => {
+      track.removeEventListener?.('cuechange', onCueChange);
+    };
+  }
+
+  async function ingestHtml5VideoTracks(
+    video: HTMLVideoElement,
+    forceCheck = false,
+  ): Promise<void> {
+    if (destroyed || isYoutube || boundHtml5Video !== video || !isSubtitlesEnabledForSite()) {
+      return;
+    }
+    const picked = pickCaptionTrack(video);
+    if (!picked) {
+      detachPickedTrackListener?.();
+      detachPickedTrackListener = null;
+      activePickedTrack = null;
+      return;
+    }
+
+    attachPickedTrackCueListener(video, picked);
+
+    const videoIdentity = getHtml5VideoIdentity(video);
+    const trackIdentity = buildHtml5TrackIdentity(video, picked);
+    const key = `html5:${videoIdentity}::${trackIdentity}`;
+
+    const cueList = picked.cues as unknown as
+      | ArrayLike<{ startTime: number; endTime: number; text?: string }>
+      | null
+      | undefined;
+    const cueCount = cueList && typeof cueList.length === 'number' ? cueList.length : 0;
+    const lastEndTime =
+      cueCount > 0 ? Number(cueList![cueCount - 1]?.endTime ?? -1) : -1;
+
+    if (cueCount > 0) {
+      if (
+        !forceCheck &&
+        currentVideoKey === key &&
+        cueCount === lastPolledCueCount &&
+        lastEndTime === lastPolledLastEndTime &&
+        scheduler.getCues().length > 0
+      ) {
+        return;
+      }
+      lastPolledCueCount = cueCount;
+      lastPolledLastEndTime = lastEndTime;
+
+      const extracted = extractTextTrackCues(cueList);
+      if (extracted.length === 0) return;
+
+      if (currentVideoKey !== key) {
+        currentVideoKey = key;
+        currentPlayheadMs = Math.max(0, Math.round((video.currentTime || 0) * 1000));
+        lastSentPlayheadMs = currentPlayheadMs;
+        syncSchedulerConfig();
+        const normalized = mergeHtml5Cues([], extracted, videoTranslationMemo).cues;
+        scheduler.loadCues(key, normalized, currentPlayheadMs);
+        updateHtml5DispatchGate(video);
+        refreshActiveCueFromPlayhead();
+        return;
+      }
+
+      const existing = scheduler.getCues();
+      const merged = mergeHtml5Cues(existing, extracted, videoTranslationMemo);
+      for (const upd of merged.durationUpdates) {
+        scheduler.updateCueDuration(upd.index, upd.dDurationMs);
+      }
+
+      if (merged.kind === 'append') {
+        scheduler.appendCues(merged.appended);
+        updateHtml5DispatchGate(video);
+        refreshActiveCueFromPlayhead();
+      } else if (merged.kind === 'rebuild') {
+        currentPlayheadMs = Math.max(0, Math.round((video.currentTime || 0) * 1000));
+        lastSentPlayheadMs = currentPlayheadMs;
+        syncSchedulerConfig();
+        scheduler.loadCues(key, merged.cues, currentPlayheadMs);
+        updateHtml5DispatchGate(video);
+        refreshActiveCueFromPlayhead();
+      } else if (merged.durationUpdates.length > 0) {
+        refreshActiveCueFromPlayhead();
+      }
+      return;
+    }
+
+    // Transient empty `cues` on an already-loaded active track -> noop (keep existing cues)
+    if (currentVideoKey === key && scheduler.getCues().length > 0) {
+      return;
+    }
+
+    // Fallback: fetch `<track src="...vtt">` ONLY for the active showing/hidden track when `cues` is empty/null
     const trackEls = Array.from(
       video.querySelectorAll<HTMLTrackElement>(
         'track[kind="subtitles"], track[kind="captions"], track:not([kind])',
       ),
     );
-    const defaultTrackEl = trackEls.find((el) => el.default);
+    const matchedTrackEl =
+      trackEls.find(
+        (el) =>
+          (picked.language && el.srclang === picked.language) ||
+          (picked.label && el.label === picked.label),
+      ) ??
+      trackEls.find((el) => el.default) ??
+      (trackEls.length === 1 ? trackEls[0] : undefined);
 
-    // 1. Check populated TextTrackCueList first, preferring `showing` over `hidden` without forcing unrelated `disabled` tracks
-    const textTracks = Array.from(video.textTracks ?? []).filter(
-      (t) => t.kind === 'subtitles' || t.kind === 'captions',
-    );
-    const showingTracks = textTracks.filter((t) => t.mode === 'showing');
-    const hiddenTracks = textTracks.filter((t) => t.mode === 'hidden');
+    if (!matchedTrackEl?.src) return;
 
-    let candidateTracks: TextTrack[];
-    if (showingTracks.length > 0) {
-      candidateTracks = showingTracks;
-    } else if (hiddenTracks.length > 0) {
-      candidateTracks = hiddenTracks;
-    } else if (textTracks.length > 0) {
-      const fallbackDisabled =
-        (defaultTrackEl
-          ? textTracks.find(
-              (t) =>
-                (defaultTrackEl.srclang &&
-                  t.language === defaultTrackEl.srclang) ||
-                (defaultTrackEl.label && t.label === defaultTrackEl.label),
-            )
-          : undefined) ?? textTracks[0];
-      if (fallbackDisabled && fallbackDisabled.mode === 'disabled') {
-        fallbackDisabled.mode = 'hidden';
-      }
-      candidateTracks = fallbackDisabled ? [fallbackDisabled] : [];
-    } else {
-      candidateTracks = [];
-    }
+    const vttKey = `html5-vtt:${videoIdentity}::${matchedTrackEl.src}::${matchedTrackEl.srclang || ''}::${matchedTrackEl.label || ''}`;
+    if (currentVideoKey === vttKey && scheduler.getCues().length > 0) return;
 
-    for (const track of candidateTracks) {
-      const extracted = extractTextTrackCues(
-        track.cues as unknown as ArrayLike<{
-          startTime: number;
-          endTime: number;
-          text?: string;
-        }>,
-      );
-      if (extracted.length > 0) {
-        const trackIdx = textTracks.indexOf(track);
-        const trackIdentity = [
-          (track as TextTrack & { id?: string }).id || '',
-          track.language || '',
-          track.label || '',
-          track.kind || '',
-          String(trackIdx),
-        ].join('|');
-        const fp = buildSourceTrackFingerprint(
-          videoSrcId,
-          track.language || 'auto',
-          extracted,
-        );
-        const key = `html5:${videoSrcId}::${trackIdentity}::${fp}`;
-        if (currentVideoKey !== key || scheduler.getCues().length === 0) {
-          currentVideoKey = key;
-          currentPlayheadMs = Math.max(0, Math.round((video.currentTime || 0) * 1000));
-          syncSchedulerConfig();
-          scheduler.loadCues(key, extracted, currentPlayheadMs);
-          refreshActiveCueFromPlayhead();
-        }
-        return;
-      }
-    }
-
-    // 2. Fallback: fetch `<track src="...vtt">` directly (preferring active `showing` track match, then `default`)
-    const activeShowing = showingTracks[0];
-    const primaryTrackEl =
-      (activeShowing
-        ? trackEls.find(
-            (el) =>
-              (activeShowing.language && el.srclang === activeShowing.language) ||
-              (activeShowing.label && el.label === activeShowing.label),
-          )
-        : undefined) ??
-      defaultTrackEl ??
-      trackEls[0];
-    if (!primaryTrackEl?.src) return;
-
-    const key = `html5-vtt:${videoSrcId}::${primaryTrackEl.src}::${primaryTrackEl.srclang || ''}::${primaryTrackEl.label || ''}`;
-    if (currentVideoKey === key && scheduler.getCues().length > 0) return;
-
+    const loadGen = ++html5TrackLoadGen;
     try {
-      const res = await win.fetch(primaryTrackEl.src, { credentials: 'same-origin' });
+      const res = await win.fetch(matchedTrackEl.src, { credentials: 'same-origin' });
       if (!res.ok) return;
       const vttText = await res.text();
       const parsed = parseWebVtt(vttText);
@@ -1035,37 +1746,183 @@ export function createSubtitleIsolatedController(
         destroyed ||
         loadGen !== html5TrackLoadGen ||
         boundHtml5Video !== video ||
+        pickCaptionTrack(video) !== picked ||
         !isSubtitlesEnabledForSite()
       ) {
         return;
       }
 
-      currentVideoKey = key;
+      const durationSec = Number(video.duration);
+      const durationMs =
+        Number.isFinite(durationSec) && durationSec > 0
+          ? durationSec * 1000
+          : undefined;
+      const rebased = rebaseSmpteBroadcastOffset(parsed, durationMs);
+
+      currentVideoKey = vttKey;
       currentPlayheadMs = Math.max(0, Math.round((video.currentTime || 0) * 1000));
       syncSchedulerConfig();
-      scheduler.loadCues(key, parsed, currentPlayheadMs);
+      scheduler.loadCues(vttKey, rebased, currentPlayheadMs);
+      updateHtml5DispatchGate(video);
       refreshActiveCueFromPlayhead();
     } catch {
       // Ignore cross-origin track fetch blocks
     }
   }
 
-  function bindGenericHtml5Video(): void {
-    if (destroyed || isYoutube || !isSubtitlesEnabledForSite()) return;
-    const candidate = Array.from(doc.querySelectorAll('video')).find(
-      (v) =>
-        v.querySelector('track') !== null || (v.textTracks?.length ?? 0) > 0,
-    );
-    if (!candidate || candidate === boundHtml5Video) return;
+  function evaluateHtml5State(forceTrackCheck = false): void {
+    if (destroyed || isYoutube) return;
+    if (!isSubtitlesEnabledForSite()) {
+      if (boundHtml5Video) unbindHtml5Video();
+      return;
+    }
+    const video = boundHtml5Video;
+    if (!video || !video.isConnected) {
+      if (video) unbindHtml5Video();
+      return;
+    }
 
-    detachHtml5Listeners?.();
+    const nextIdentity = getHtml5VideoIdentity(video);
+    if (activeHtml5VideoIdentity && activeHtml5VideoIdentity !== nextIdentity) {
+      currentVideoKey = '';
+      lastPolledCueCount = -1;
+      lastPolledLastEndTime = -1;
+      lastSentPlayheadMs = -1;
+      pausedAfterPlay = false;
+      hostCaptionsHiddenByUi = false;
+      awaitingUiToggleCheck = false;
+      missingLayerCueChangesAfterClick = 0;
+      videoTranslationMemo.clear();
+      scheduler.setDispatchGate(false);
+      scheduler.cancelAll();
+      scheduler.loadCues(
+        '',
+        [],
+        Math.max(0, Math.round((video.currentTime || 0) * 1000)),
+      );
+    }
+    activeHtml5VideoIdentity = nextIdentity;
+
+    const rawHostOn = isHostCaptionsOn(video);
+    if (!rawHostOn) {
+      hostCaptionsHiddenByUi = false;
+    }
+    const ccOn = rawHostOn && !hostCaptionsHiddenByUi;
+
+    if (!ccOn) {
+      if (dwellTimer !== null) {
+        clearTimeout(dwellTimer);
+        dwellTimer = null;
+        dwellVideo = null;
+      }
+      if (!rawHostOn) {
+        detachPickedTrackListener?.();
+        detachPickedTrackListener = null;
+        activePickedTrack = null;
+      } else {
+        // P2-5: while `hostCaptionsHiddenByUi` is set on a `hidden` track, keep cuechange listener
+        // attached so a CC-ON click made during a gap between cues recovers on the next cue!
+        const picked = pickCaptionTrack(video);
+        if (picked) {
+          attachPickedTrackCueListener(video, picked);
+        }
+      }
+      html5OverlayState = 'OFF';
+      scheduler.setDispatchGate(false);
+      scheduler.cancelAll();
+      setHtml5NativeSuppression(video, false);
+      refreshActiveCueFromPlayhead();
+      return;
+    }
+
+    currentPlayheadMs = Math.max(0, Math.round((video.currentTime || 0) * 1000));
+    void ingestHtml5VideoTracks(video, forceTrackCheck);
+
+    const engaged = isImmediateVideoEngaged(video);
+    const vp = resolveViewportSize(doc);
+    const ratio = computeVisibleRatio(video, vp);
+    const playingVis = isHtml5VideoPlayingVisible(video, vp);
+
+    if (!engaged) {
+      if (playingVis && !doc.hidden) {
+        if (dwellTimer === null || dwellVideo !== video) {
+          if (dwellTimer !== null) clearTimeout(dwellTimer);
+          dwellVideo = video;
+          const dwellMs = resolveHtml5EngageDwellMs(video);
+          dwellTimer = setTimeout(() => {
+            dwellTimer = null;
+            dwellVideo = null;
+            if (
+              !destroyed &&
+              boundHtml5Video === video &&
+              !doc.hidden &&
+              isHostCaptionsOn(video) &&
+              !hostCaptionsHiddenByUi &&
+              isHtml5VideoPlayingVisible(video)
+            ) {
+              engagedVideos.add(video);
+              evaluateHtml5State(false);
+            }
+          }, dwellMs);
+        }
+      } else if (dwellTimer !== null) {
+        clearTimeout(dwellTimer);
+        dwellTimer = null;
+        dwellVideo = null;
+      }
+    } else if (dwellTimer !== null) {
+      clearTimeout(dwellTimer);
+      dwellTimer = null;
+      dwellVideo = null;
+    }
+
+    if (!engaged || ratio < 0.25 || doc.hidden) {
+      html5OverlayState = 'ON_IDLE';
+      scheduler.setDispatchGate(false);
+      setHtml5NativeSuppression(video, false);
+      refreshActiveCueFromPlayhead();
+      return;
+    }
+
+    const wasActive = html5OverlayState === 'ON_ACTIVE';
+    html5OverlayState = 'ON_ACTIVE';
+    // P2-3: do NOT call `scheduler.updatePlayhead` unconditionally here (delta===0 would trigger seek retries at 2 Hz);
+    // `updateHtml5DispatchGate` already calls `pump()`, and playhead ticks/seeks call `updatePlayhead` on real movement.
+    updateHtml5DispatchGate(video);
+    refreshActiveCueFromPlayhead();
+    if (!wasActive && scheduler.getCues().length > 0) {
+      setHtml5NativeSuppression(video, true);
+    }
+  }
+
+  function bindHtml5Video(candidate: HTMLVideoElement): void {
+    if (destroyed || isYoutube || !isSubtitlesEnabledForSite()) return;
+    if (candidate === boundHtml5Video) {
+      evaluateHtml5State(false);
+      return;
+    }
+
+    if (boundHtml5Video) {
+      unbindHtml5Video();
+    }
+
     html5TrackLoadGen += 1;
     boundHtml5Video = candidate;
-    activeHtml5VideoSrc = '';
+    boundHtml5PlayerRoot = resolveHtml5PlayerRoot(candidate);
+    activeHtml5VideoIdentity = getHtml5VideoIdentity(candidate);
+    pausedAfterPlay = false;
 
     const onSync = (seek = false) => {
+      if (destroyed || boundHtml5Video !== candidate) return;
       currentPlayheadMs = Math.max(0, Math.round((candidate.currentTime || 0) * 1000));
-      if (isSubtitlesEnabledForSite()) {
+      if (seek) {
+        evaluateHtml5State(true);
+      }
+      if (
+        isSubtitlesEnabledForSite() &&
+        (seek || currentPlayheadMs !== lastSentPlayheadMs)
+      ) {
+        lastSentPlayheadMs = currentPlayheadMs;
         scheduler.updatePlayhead(
           currentPlayheadMs,
           seek ? { seek: true } : undefined,
@@ -1076,39 +1933,341 @@ export function createSubtitleIsolatedController(
 
     const onPlaybackTick = () => onSync(false);
     const onExplicitSeek = () => onSync(true);
-    const onTrackReady = () => {
-      void tryLoadHtml5VideoTracks(candidate);
+    const onTrackChange = () => {
+      if (destroyed || boundHtml5Video !== candidate) return;
+      hostCaptionsHiddenByUi = false;
+      awaitingUiToggleCheck = false;
+      missingLayerCueChangesAfterClick = 0;
+      evaluateHtml5State(true);
     };
     const onMetadataLoaded = () => {
-      onSync(false);
-      onTrackReady();
+      if (destroyed || boundHtml5Video !== candidate) return;
+      evaluateHtml5State(true);
     };
 
-    const playbackEvents = ['timeupdate', 'play'];
+    const playerRoot = boundHtml5PlayerRoot;
+    const onPointerControlActivity = () => {
+      if (destroyed || boundHtml5Video !== candidate) return;
+      lastPointerActivityAt = Date.now();
+      syncHtml5OverlayLayout();
+      if (controlsFadeTimer !== null) {
+        clearTimeout(controlsFadeTimer);
+      }
+      controlsFadeTimer = setTimeout(() => {
+        controlsFadeTimer = null;
+        syncHtml5OverlayLayout();
+      }, 350);
+    };
+
     const seekEvents = ['seeking', 'seeked'];
-    for (const evt of playbackEvents) {
-      candidate.addEventListener(evt, onPlaybackTick);
-    }
+    candidate.addEventListener('timeupdate', onPlaybackTick);
     for (const evt of seekEvents) {
       candidate.addEventListener(evt, onExplicitSeek);
     }
     candidate.addEventListener('loadedmetadata', onMetadataLoaded);
-    candidate.textTracks?.addEventListener?.('change', onTrackReady);
-    candidate.textTracks?.addEventListener?.('addtrack', onTrackReady);
+    candidate.textTracks?.addEventListener?.('change', onTrackChange);
+    candidate.textTracks?.addEventListener?.('addtrack', onTrackChange);
+    candidate.textTracks?.addEventListener?.('removetrack', onTrackChange);
+    if (playerRoot) {
+      playerRoot.addEventListener('pointermove', onPointerControlActivity, {
+        passive: true,
+      });
+      playerRoot.addEventListener('pointerenter', onPointerControlActivity, {
+        passive: true,
+      });
+      playerRoot.addEventListener('pointerleave', onPointerControlActivity, {
+        passive: true,
+      });
+    }
 
     detachHtml5Listeners = () => {
-      for (const evt of playbackEvents) {
-        candidate.removeEventListener(evt, onPlaybackTick);
-      }
+      candidate.removeEventListener('timeupdate', onPlaybackTick);
       for (const evt of seekEvents) {
         candidate.removeEventListener(evt, onExplicitSeek);
       }
       candidate.removeEventListener('loadedmetadata', onMetadataLoaded);
-      candidate.textTracks?.removeEventListener?.('change', onTrackReady);
-      candidate.textTracks?.removeEventListener?.('addtrack', onTrackReady);
+      candidate.textTracks?.removeEventListener?.('change', onTrackChange);
+      candidate.textTracks?.removeEventListener?.('addtrack', onTrackChange);
+      candidate.textTracks?.removeEventListener?.('removetrack', onTrackChange);
+      if (playerRoot) {
+        playerRoot.removeEventListener('pointermove', onPointerControlActivity);
+        playerRoot.removeEventListener('pointerenter', onPointerControlActivity);
+        playerRoot.removeEventListener('pointerleave', onPointerControlActivity);
+      }
     };
 
-    void tryLoadHtml5VideoTracks(candidate);
+    evaluateHtml5State(true);
+  }
+
+  function runHtml5Arbitration(): void {
+    if (destroyed || isYoutube) return;
+    lastArbitrationAt = Date.now();
+    if (!isSubtitlesEnabledForSite()) {
+      if (boundHtml5Video) unbindHtml5Video();
+      return;
+    }
+
+    const candidates = Array.from(doc.querySelectorAll('video'));
+    const vp = resolveViewportSize(doc);
+    let selected = selectActiveHtml5Video({
+      candidates,
+      current: boundHtml5Video,
+      viewport: vp,
+      lastPlayingAt: lastPlayingAtMap,
+    });
+
+    // Fallback when no video is playing yet: bind a visible engaged or unmuted `showing` video
+    if (!selected) {
+      let bestFallback: HTMLVideoElement | null = null;
+      let bestArea = 0;
+      for (const v of candidates) {
+        if (!v.isConnected) continue;
+        const ratio = computeVisibleRatio(v, vp);
+        if (ratio < 0.5) continue;
+        const isUnmutedShowing =
+          !v.muted &&
+          (v.volume === undefined || Number(v.volume) > 0) &&
+          pickCaptionTrack(v)?.mode === 'showing';
+        if (!engagedVideos.has(v) && !isUnmutedShowing) continue;
+        const rect = resolveEffectiveVideoRect(v, vp);
+        const visArea = rect.width * rect.height * ratio;
+        if (visArea > bestArea) {
+          bestArea = visArea;
+          bestFallback = v;
+        }
+      }
+      selected = bestFallback;
+    }
+
+    if (selected !== boundHtml5Video) {
+      if (!selected) {
+        unbindHtml5Video();
+      } else {
+        bindHtml5Video(selected);
+      }
+      return;
+    }
+
+    if (boundHtml5Video) {
+      evaluateHtml5State(false);
+    }
+  }
+
+  function scheduleArbitration(immediate = false): void {
+    if (destroyed || isYoutube) return;
+    if (immediate) {
+      if (arbitrationTimer !== null) {
+        clearTimeout(arbitrationTimer);
+        arbitrationTimer = null;
+      }
+      runHtml5Arbitration();
+      return;
+    }
+    const elapsed = Date.now() - lastArbitrationAt;
+    if (elapsed >= HTML5_ARBITRATION_THROTTLE_MS && arbitrationTimer === null) {
+      runHtml5Arbitration();
+      return;
+    }
+    if (arbitrationTimer === null) {
+      const delay = Math.max(
+        16,
+        HTML5_ARBITRATION_THROTTLE_MS - Math.max(0, elapsed),
+      );
+      arbitrationTimer = setTimeout(() => {
+        arbitrationTimer = null;
+        runHtml5Arbitration();
+      }, delay);
+    }
+  }
+
+  function findEnclosingHtml5Video(
+    target: EventTarget | null,
+    eventType: string,
+  ): HTMLVideoElement | null {
+    if (!target || typeof (target as Node).nodeType !== 'number') return null;
+    const el =
+      (target as Node).nodeType === 1
+        ? (target as Element)
+        : (target as Node).parentElement;
+    if (!el) return null;
+
+    // P2-4: purely structural O(1) ancestor/cached-root check — ZERO querySelectorAll('video') or getBoundingClientRect
+    const direct = el.closest?.('video, [data-testid="videoPlayer"]');
+    if (direct) {
+      return direct.tagName === 'VIDEO'
+        ? (direct as HTMLVideoElement)
+        : direct.querySelector('video');
+    }
+
+    if (
+      boundHtml5Video?.isConnected &&
+      boundHtml5PlayerRoot?.isConnected &&
+      boundHtml5PlayerRoot.contains(el)
+    ) {
+      return boundHtml5Video;
+    }
+
+    if (eventType === 'keydown') {
+      return null;
+    }
+
+    const nearParent = el.parentElement;
+    if (
+      nearParent &&
+      nearParent !== doc.body &&
+      nearParent !== doc.documentElement
+    ) {
+      const siblingVideo = nearParent.querySelector(':scope > video');
+      if (siblingVideo) return siblingVideo as HTMLVideoElement;
+    }
+    return null;
+  }
+
+  function attachHtml5DocumentListeners(): void {
+    if (isYoutube || detachHtml5DocListeners) return;
+
+    const onMediaCapture = (event: Event) => {
+      if (destroyed) return;
+      const target = event.target;
+      if (event.type === 'load') {
+        if (
+          target &&
+          (target as Element).tagName === 'TRACK' &&
+          boundHtml5Video &&
+          boundHtml5Video.contains(target as Node)
+        ) {
+          evaluateHtml5State(true);
+        }
+        return;
+      }
+      if (!target || (target as Element).tagName !== 'VIDEO') {
+        return;
+      }
+      const video = target as HTMLVideoElement;
+      if (event.type === 'playing') {
+        lastPlayingAtMap.set(video, Date.now());
+        if (video === boundHtml5Video) {
+          pausedAfterPlay = false;
+        }
+      } else if (event.type === 'play') {
+        if (video === boundHtml5Video) {
+          pausedAfterPlay = false;
+          evaluateHtml5State(false);
+          syncHtml5OverlayLayout();
+        }
+      } else if (event.type === 'pause' || event.type === 'ended') {
+        if (video === boundHtml5Video) {
+          pausedAfterPlay = true;
+          evaluateHtml5State(false);
+          syncHtml5OverlayLayout();
+        }
+      } else if (event.type === 'volumechange') {
+        if (!video.muted && (video.volume === undefined || Number(video.volume) > 0)) {
+          engagedVideos.add(video);
+          if (video === boundHtml5Video) {
+            evaluateHtml5State(false);
+          }
+        }
+      } else if (event.type === 'emptied') {
+        if (video === boundHtml5Video) {
+          currentVideoKey = '';
+          lastPolledCueCount = -1;
+          lastPolledLastEndTime = -1;
+          lastSentPlayheadMs = -1;
+          pausedAfterPlay = false;
+          videoTranslationMemo.clear();
+          scheduler.setDispatchGate(false);
+          scheduler.cancelAll();
+          scheduler.loadCues('', [], 0);
+          evaluateHtml5State(true);
+        }
+      }
+      scheduleArbitration(false);
+    };
+
+    const onViewportChange = () => {
+      if (destroyed) return;
+      scheduleArbitration(false);
+    };
+
+    const onVisibilityChange = () => {
+      if (destroyed) return;
+      evaluateHtml5State(false);
+      scheduleArbitration(false);
+    };
+
+    const onPlayerInteraction = (event: Event) => {
+      if (destroyed) return;
+      const video = findEnclosingHtml5Video(event.target, event.type);
+      if (!video) return;
+      lastPointerActivityAt = Date.now();
+      engagedVideos.add(video);
+
+      if (video !== boundHtml5Video) {
+        scheduleArbitration(true);
+      } else {
+        evaluateHtml5State(false);
+        syncHtml5OverlayLayout();
+      }
+
+      if (event.type === 'click' || event.type === 'keydown') {
+        if (video === boundHtml5Video && hadPositiveNativeCaptionLayer) {
+          awaitingUiToggleCheck = true;
+          missingLayerCueChangesAfterClick = 0;
+        }
+        scheduleTwoRafs(() => {
+          if (destroyed || boundHtml5Video !== video) return;
+          evaluateHtml5State(true);
+          syncNativeCaptionLayerSuppression(video, { forceScan: true });
+          syncHtml5OverlayLayout();
+        });
+        if (uiClickRecheckTimer !== null) {
+          clearTimeout(uiClickRecheckTimer);
+        }
+        uiClickRecheckTimer = setTimeout(() => {
+          uiClickRecheckTimer = null;
+          if (destroyed || boundHtml5Video !== video) return;
+          evaluateHtml5State(true);
+          syncNativeCaptionLayerSuppression(video, { forceScan: true });
+          syncHtml5OverlayLayout();
+        }, 300);
+      }
+    };
+
+    const mediaEvents = [
+      'play',
+      'playing',
+      'pause',
+      'ended',
+      'emptied',
+      'loadedmetadata',
+      'volumechange',
+      'load',
+    ];
+    for (const evt of mediaEvents) {
+      doc.addEventListener(evt, onMediaCapture, true);
+    }
+    doc.addEventListener('scroll', onViewportChange, {
+      capture: true,
+      passive: true,
+    });
+    win.addEventListener('resize', onViewportChange, { passive: true });
+    doc.addEventListener('visibilitychange', onVisibilityChange);
+    doc.addEventListener('pointerdown', onPlayerInteraction, true);
+    doc.addEventListener('click', onPlayerInteraction, true);
+    doc.addEventListener('keydown', onPlayerInteraction, true);
+
+    detachHtml5DocListeners = () => {
+      for (const evt of mediaEvents) {
+        doc.removeEventListener(evt, onMediaCapture, true);
+      }
+      doc.removeEventListener('scroll', onViewportChange, true);
+      win.removeEventListener('resize', onViewportChange);
+      doc.removeEventListener('visibilitychange', onVisibilityChange);
+      doc.removeEventListener('pointerdown', onPlayerInteraction, true);
+      doc.removeEventListener('click', onPlayerInteraction, true);
+      doc.removeEventListener('keydown', onPlayerInteraction, true);
+    };
   }
 
   function tickActiveVideoPlayhead(): void {
@@ -1124,9 +2283,40 @@ export function createSubtitleIsolatedController(
       }
     }
     if (!isSubtitlesEnabledForSite()) return;
-    const video = isYoutube
-      ? doc.querySelector<HTMLVideoElement>('video.html5-main-video')
-      : boundHtml5Video;
+
+    if (!isYoutube) {
+      const video = boundHtml5Video;
+      if (!video) return;
+      if (!video.isConnected) {
+        unbindHtml5Video();
+        scheduleArbitration(false);
+        return;
+      }
+      const now = Date.now();
+      if (now - lastTrackPollAt >= HTML5_TRACK_POLL_MS) {
+        lastTrackPollAt = now;
+        if (hostCaptionsHiddenByUi) {
+          syncNativeCaptionLayerSuppression(video, { forceScan: true });
+        }
+        evaluateHtml5State(false);
+      }
+      const wrapper = ownedOverlayHost?.shadowRoot?.getElementById('margin-sub-wrap');
+      if (wrapper && !wrapper.hidden && now - lastOverlayOffsetPollAt >= 250) {
+        lastOverlayOffsetPollAt = now;
+        syncHtml5OverlayLayout();
+      }
+      if (video.paused) return;
+      const nextMs = Math.max(0, Math.round((video.currentTime || 0) * 1000));
+      if (Math.abs(nextMs - currentPlayheadMs) >= 40) {
+        currentPlayheadMs = nextMs;
+        lastSentPlayheadMs = nextMs;
+        scheduler.updatePlayhead(currentPlayheadMs);
+        refreshActiveCueFromPlayhead();
+      }
+      return;
+    }
+
+    const video = doc.querySelector<HTMLVideoElement>('video.html5-main-video');
     if (!video || video.paused) return;
 
     const nextMs = Math.max(0, Math.round((video.currentTime || 0) * 1000));
@@ -1142,6 +2332,19 @@ export function createSubtitleIsolatedController(
     if (!isExtensionContextValid(hadRuntimeIdAtStart)) {
       destroy({ contextInvalidated: true });
       return;
+    }
+    if (!isYoutube) {
+      const fsEl = doc.fullscreenElement;
+      if (fsEl) {
+        const fsVideo =
+          fsEl.tagName === 'VIDEO'
+            ? (fsEl as HTMLVideoElement)
+            : fsEl.querySelector('video');
+        if (fsVideo) {
+          engagedVideos.add(fsVideo);
+        }
+      }
+      scheduleArbitration(true);
     }
     applyOverlayDom(activeCueState);
   }
@@ -1287,11 +2490,15 @@ export function createSubtitleIsolatedController(
         syncSchedulerConfig();
       } else {
         html5TrackLoadGen += 1;
-        scheduler.cancelAll();
+        if (!isYoutube) {
+          unbindHtml5Video();
+        } else {
+          scheduler.cancelAll();
+        }
       }
       broadcastSubtitleConfig();
-      if (!isYoutube) {
-        bindGenericHtml5Video();
+      if (!isYoutube && isSubtitlesEnabledForSite()) {
+        scheduleArbitration(true);
       }
       refreshActiveCueFromPlayhead();
     });
@@ -1299,15 +2506,16 @@ export function createSubtitleIsolatedController(
     playheadPollTimer = setInterval(tickActiveVideoPlayhead, 100);
 
     if (!isYoutube) {
+      attachHtml5DocumentListeners();
       const startHtml5Scan = () => {
         if (destroyed) return;
-        bindGenericHtml5Video();
+        scheduleArbitration(true);
         if (!domObserver && doc.documentElement) {
           domObserver = new MutationObserver(() => {
-            if (!boundHtml5Video?.isConnected) {
-              boundHtml5Video = null;
+            if (boundHtml5Video && !boundHtml5Video.isConnected) {
+              unbindHtml5Video();
             }
-            bindGenericHtml5Video();
+            scheduleArbitration(false);
           });
           domObserver.observe(doc.documentElement, {
             childList: true,
@@ -1329,6 +2537,11 @@ export function createSubtitleIsolatedController(
     destroyed = true;
     html5TrackLoadGen += 1;
     cancelClearTimer();
+    if (arbitrationTimer !== null) {
+      clearTimeout(arbitrationTimer);
+      arbitrationTimer = null;
+    }
+    clearHtml5BoundTimers();
     if (playheadPollTimer !== null) {
       clearInterval(playheadPollTimer);
       playheadPollTimer = null;
@@ -1358,11 +2571,29 @@ export function createSubtitleIsolatedController(
     unsubConfig = null;
     domObserver?.disconnect();
     domObserver = null;
-    detachHtml5Listeners?.();
-    detachHtml5Listeners = null;
-    boundHtml5Video = null;
-    scheduler.cancelAll();
+    detachHtml5DocListeners?.();
+    detachHtml5DocListeners = null;
+    if (!isYoutube) {
+      unbindHtml5Video();
+    } else {
+      detachHtml5Listeners?.();
+      detachHtml5Listeners = null;
+      boundHtml5Video = null;
+      scheduler.cancelAll();
+    }
     removeOverlayHost(cleanupOptions);
+    if (!isYoutube) {
+      const remainingHost = doc.getElementById(SUBTITLE_OVERLAY_HOST_ID);
+      const remainingOwner = remainingHost?.getAttribute(OVERLAY_OWNER_ATTR) ?? '';
+      const hasOtherMountedOwner = Boolean(
+        remainingHost?.isConnected &&
+          remainingOwner &&
+          remainingOwner !== instanceId,
+      );
+      if (!hasOtherMountedOwner) {
+        doc.getElementById(NATIVE_HTML5_HIDE_STYLE_ID)?.remove();
+      }
+    }
 
     if (isYoutube) {
       postToYoutubeMain({
@@ -1545,6 +2776,80 @@ function buildInPlayerOverlayCss(): string {
       color: rgba(236, 228, 210, 0.90);
     }
     #margin-sub-wrap[data-style-preset="warm-paper"] .margin-sub-translated {
+      color: #fbfaf6;
+    }
+    #margin-sub-wrap[data-surface="html5"] {
+      left: 0;
+      right: 0;
+    }
+    #margin-sub-wrap[data-surface="html5"][data-position="top"] {
+      top: 12px;
+    }
+    #margin-sub-wrap[data-surface="html5"][data-fullscreen][data-position="top"] {
+      top: 46px;
+    }
+    #margin-sub-wrap[data-surface="html5"][data-style-preset="youtube-native"] {
+      width: fit-content;
+      max-width: min(88%, 46em);
+      margin-inline: auto;
+      padding: var(--margin-cap-pad-y, 4px) var(--margin-cap-pad-x, 10px);
+      border-radius: var(--margin-cap-radius, 10px);
+      background: var(--margin-cap-bg, rgba(17, 17, 20, 0.66));
+      -webkit-backdrop-filter: blur(8px) saturate(140%);
+      backdrop-filter: blur(8px) saturate(140%);
+      box-shadow: 0 4px 14px rgba(0, 0, 0, 0.28), inset 0 0 0 0.5px rgba(255, 255, 255, 0.08);
+      gap: 2px;
+      font-family: Chirp, system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    }
+    #margin-sub-wrap[data-surface="html5"] .margin-sub-line {
+      max-width: 100%;
+      line-height: 1.34;
+      text-wrap: balance;
+    }
+    #margin-sub-wrap[data-surface="html5"][data-style-preset="youtube-native"] .margin-sub-seg {
+      background: transparent;
+      padding: 0;
+      border-radius: 0;
+      box-decoration-break: slice;
+      -webkit-box-decoration-break: slice;
+      text-shadow: 0 1px 1.5px rgba(0, 0, 0, 0.45);
+    }
+    #margin-sub-wrap[data-surface="html5"] .margin-sub-original,
+    #margin-sub-wrap[data-surface="html5"] .margin-sub-line--orig {
+      font-size: var(--margin-sub-orig-px, 12.5px);
+      font-weight: 400;
+      color: rgba(255, 255, 255, 0.74);
+    }
+    #margin-sub-wrap[data-surface="html5"][data-style-preset="youtube-native"] .margin-sub-original,
+    #margin-sub-wrap[data-surface="html5"][data-style-preset="youtube-native"] .margin-sub-line--orig {
+      font-family: Chirp, system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    }
+    #margin-sub-wrap[data-surface="html5"][data-style-preset="youtube-native"] .margin-sub-original .margin-sub-seg {
+      color: rgba(255, 255, 255, 0.74);
+    }
+    #margin-sub-wrap[data-surface="html5"] .margin-sub-translated,
+    #margin-sub-wrap[data-surface="html5"] .margin-sub-line--trans,
+    #margin-sub-wrap[data-surface="html5"][data-style-preset="youtube-native"] .margin-sub-translated,
+    #margin-sub-wrap[data-surface="html5"][data-style-preset="youtube-native"] .margin-sub-line--trans {
+      font-size: var(--margin-sub-trans-px, 14px);
+      font-weight: 500;
+      letter-spacing: 0.01em;
+      font-family: var(--margin-html5-trans-font-family, var(--margin-sub-trans-font-family));
+    }
+    #margin-sub-wrap[data-surface="html5"][data-mode="source-only"] .margin-sub-original,
+    #margin-sub-wrap[data-surface="html5"][data-mode="source-only"] .margin-sub-line--orig,
+    #margin-sub-wrap[data-surface="html5"][data-mode="source-only"][data-style-preset="youtube-native"] .margin-sub-original .margin-sub-seg {
+      font-size: var(--margin-sub-trans-px, 14px);
+      color: rgba(255, 255, 255, 0.97);
+    }
+    #margin-sub-wrap[data-surface="html5"][data-style-preset="warm-paper"] {
+      max-width: min(88%, 46em);
+      margin-inline: auto;
+    }
+    #margin-sub-wrap[data-surface="html5"][data-style-preset="warm-paper"] .margin-sub-original {
+      color: rgba(236, 228, 210, 0.90);
+    }
+    #margin-sub-wrap[data-surface="html5"][data-style-preset="warm-paper"] .margin-sub-translated {
       color: #fbfaf6;
     }
   `;
